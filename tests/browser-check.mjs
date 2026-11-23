@@ -4,7 +4,7 @@
  * HEADLESS=0 CHROME_BIN=/path/to/chrome node tests/browser-check.mjs
  * Screenshots/report are internal QA artifacts, not product assets.
  */
-import { mkdtemp, mkdir, cp, readFile, writeFile, rm, access } from 'node:fs/promises';
+import { mkdtemp, mkdir, cp, readFile, writeFile, rm, access, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -305,13 +305,72 @@ try {
     assert.match(await app.locator('.growth-stats').innerText(),/19,740/);
     await app.screenshot({ animations: 'disabled',path:path.join(output,'automatic-score.png'),fullPage:true});
   });
-  await run('Backup export is available from the real settings UI',async()=>{
-    await app.getByTestId('nav-settings').click();
-    const downloadEvent=app.waitForEvent('download');
-    await app.getByTestId('export-data').click();
-    const download=await downloadEvent;
-    assert.match(download.suggestedFilename(),/^uchikomi-.*\.json$/);
-    await app.getByRole('button',{name:'閉じる',exact:true}).click();
+  await run('A backup larger than 30 MiB round-trips through settings into an empty database',async()=>{
+    const original=await app.evaluate(()=>window.UchiQA.exportData());
+    // Compare every field without sending large images to Node or an assertion diff.
+    const snapshot=async()=>{
+      const data=await window.UchiQA.getData();
+      for(const key of ['phrases','attempts','sessions'])data[key].sort((a,b)=>a.id.localeCompare(b.id));
+      const json=JSON.stringify(data,(_key,value)=>value&&typeof value==='object'&&!Array.isArray(value)
+        ?Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b))):value);
+      const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(json));
+      return {sha256:Array.from(new Uint8Array(digest),byte=>byte.toString(16).padStart(2,'0')).join(''),
+        phrases:data.phrases.length,attempts:data.attempts.length,sessions:data.sessions.length,
+        phraseImages:data.phrases.filter(p=>p.screenshot).length,
+        scoreEvidence:data.sessions.filter(s=>s.scoreEvidence).length,
+        reviewEvidence:data.sessions.filter(s=>s.scoreReview?.evidence).length};
+    };
+    let download;
+    try {
+      const fixture=await app.evaluate(async()=>{
+        const data=await window.UchiQA.getData(),at=Date.now();
+        const canvas=document.createElement('canvas');canvas.width=canvas.height=512;
+        const ctx=canvas.getContext('2d'),pixels=ctx.createImageData(512,512);let seed=123456789;
+        for(let i=0;i<pixels.data.length;i++){
+          seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;
+          pixels.data[i]=i%4===3?255:seed&255;
+        }
+        ctx.putImageData(pixels,0,0);
+        const screenshot=canvas.toDataURL('image/png'),image=new Image();image.src=screenshot;await image.decode();
+        if(image.naturalWidth!==512||screenshot.length>=3000000)throw new Error('Invalid backup image fixture');
+        const count=Math.ceil(31*1024*1024/screenshot.length);
+        for(let i=0;i<count;i++)data.phrases.push({id:`qa-backup-image-${i}`,text:`バックアップ画像 ${i}`,reading:'がぞう',roman:'gazou',
+          source:'capture',confidence:100,verified:true,capturedAt:at+i,lastSeenAt:at+i,seenCount:1,screenshot});
+        const scored=data.sessions.find(s=>s.id==='qa-auto-score');
+        if(!scored)throw new Error('Missing automatic score fixture');
+        scored.scoreEvidence=screenshot;
+        data.sessions.push({id:'qa-backup-review',startedAt:at,source:'capture',scoreType:'profit',course:10000,mode:'accuracy',
+          phraseCount:0,correctKeys:0,mistakes:0,durationMs:0,
+          scoreReview:{score:18000,scoreType:'profit',confidence:60,observedAt:at,reason:'画像を確認',evidence:screenshot}});
+        await window.UchiQA.importData({...data,version:1});
+        return {addedImages:count,imageCharacters:screenshot.length};
+      });
+      const expected=await app.evaluate(snapshot);
+      assert.equal(expected.phrases,original.phrases.length+fixture.addedImages);
+      assert.equal(expected.attempts,original.attempts.length);assert.equal(expected.sessions,original.sessions.length+1);
+      assert.ok(expected.scoreEvidence>0&&expected.reviewEvidence>0);
+      await app.getByTestId('nav-settings').click();
+      const downloadEvent=app.waitForEvent('download');
+      await app.getByTestId('export-data').click();
+      download=await downloadEvent;
+      assert.match(download.suggestedFilename(),/^uchikomi-.*\.json$/);
+      const file=await download.path();assert.ok(file);
+      const {size}=await stat(file);assert.ok(size>30*1024*1024,'Backup must exceed the former 30 MiB limit');
+      const empty=await app.evaluate(async()=>{
+        await window.UchiQA.clearData();const data=await window.UchiQA.getData();
+        return [data.phrases.length,data.attempts.length,data.sessions.length];
+      });
+      assert.deepEqual(empty,[0,0,0]);
+      await app.getByTestId('import-file').setInputFiles(file);
+      await app.getByRole('dialog').waitFor({state:'hidden',timeout:60000});
+      await app.getByRole('status').filter({hasText:'バックアップを読み込みました'}).waitFor();
+      assert.deepEqual(await app.evaluate(snapshot),expected,'Backup restore changed records, images or score evidence');
+      report.backupRoundTrip={bytes:size,...fixture,...expected};
+    } finally {
+      // Playwright owns the download in a temporary directory; never put it in qa/.
+      if(download)await download.delete();
+      await app.evaluate(async value=>{await window.UchiQA.clearData();await window.UchiQA.importData(value);},original);
+    }
   });
   await run('360px side panel renders without horizontal overflow', async () => {
     const panel = await context.newPage();

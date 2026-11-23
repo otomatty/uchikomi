@@ -60,6 +60,27 @@ test('export/import roundtrip restores a partial practice with its initial sessi
   const backup=await exportData();await clearData();await importData(JSON.parse(JSON.stringify(backup)));
   const roundtrip=await exportData();assert.deepEqual(roundtrip.phrases,backup.phrases);assert.deepEqual(roundtrip.attempts,backup.attempts);assert.deepEqual(roundtrip.sessions,backup.sessions);assert.deepEqual(roundtrip.settings,backup.settings);
 });
+test('exports validate standalone restore compatibility and preserve all records and images',async()=>{
+  const screenshot='data:image/png;base64,AA==',evidence='data:image/png;base64,AQ==';
+  await savePhrase({...phrase(),screenshot,tags:Array.from({length:20},(_,i)=>`tag-${i}`)});
+  // Individual attempt saves can precede their session, but a standalone backup
+  // of that intermediate state could not be restored into an empty profile.
+  await saveAttempt(attempt());const withoutSession=await getData();
+  await assert.rejects(exportData(),/参照する語句・セッション/);
+  assert.deepEqual(await getData(),withoutSession);
+  await saveSession({...session(),source:'capture'});
+  await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+2000,scoreEvidence:evidence});
+  const original=await getData(),backup=await exportData();
+  assert.equal(backup.version,1);assert.equal(backup.phrases[0].screenshot,screenshot);assert.equal(backup.sessions[0].scoreEvidence,evidence);
+  await clearData();await importData(JSON.parse(JSON.stringify(backup)));
+  assert.deepEqual(await getData(),original);
+  // Two individually valid captures can merge beyond the restore format's tag
+  // limit. Export must reject the unsupported snapshot instead of dropping tags.
+  await savePhrase({...phrase('repeat'),tags:['one-more']});
+  const unsupported=await getData();assert.equal(unsupported.phrases[0].tags?.length,21);
+  await assert.rejects(exportData(),/タグ/);
+  assert.deepEqual(await getData(),unsupported);
+});
 test('malformed import and dangling references do not partially overwrite existing records',async()=>{
   await seed();const before=await getData();
   await assert.rejects(importData({version:1,...before,phrases:[{...phrase('new'),text:'New phrase'}],attempts:[attempt('newAttempt','missing')],sessions:[session('newSession')],settings:{...DEFAULT_SETTINGS,targetScore:99999}}));

@@ -5,6 +5,7 @@ import { isAllowedGameUrl, isCalibration, isCaptureStroke } from './helpers';
 
 const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
 const ORIGIN = chrome.runtime.getURL('');
+const STOP_ERROR = '最後の記録を保存できませんでした。保存済みの履歴を確認してください。';
 let status: CaptureStatus = { ...EMPTY_CAPTURE };
 let stateLoaded = false;
 let creating: Promise<void> | null = null;
@@ -64,11 +65,11 @@ async function findGameTab(requireActive = false): Promise<chrome.tabs.Tab | nul
   const tabs = await chrome.tabs.query({ url: ['https://sushida.net/*', 'https://www.sushida.net/*'] });
   return tabs.find(tab => /\/play(?:\.html|\/)/.test(tab.url ?? '')) ?? tabs[0] ?? null;
 }
-function conciseError(error: unknown): string {
+function conciseError(error: unknown, fallback = '記録を開始できませんでした。寿司打のタブで再試行してください。'): string {
   const message = error instanceof Error ? error.message : String(error);
   if (/invoked|activeTab|not been granted|permission|not allowed|Cannot capture|active tab/i.test(message)) return '寿司打のタブで拡張アイコンを押してから記録してください。';
   if (/Could not establish connection|Receiving end does not exist/i.test(message)) return '寿司打を再読み込みして、もう一度記録してください。';
-  return message.length < 180 ? message : '記録を開始できませんでした。寿司打のタブで再試行してください。';
+  return message.length < 180 ? message : fallback;
 }
 async function startCapture() {
   if (transitioning) return { ok: false, error: '記録の準備中です。' };
@@ -123,7 +124,8 @@ async function stopCapture(message?: string) {
     }
     if (await hasOffscreen()) {
       await publish({ ...status, state: 'stopping', message: '最後のお題を保存しています' });
-      const stopped = await offscreen<{ status?: CaptureStatus; sessionId?: string }>('UCHI_OFF_STOP');
+      const stopped = await offscreen<{ ok?: boolean; error?: string; status?: CaptureStatus; sessionId?: string }>('UCHI_OFF_STOP');
+      if (stopped?.ok !== true) throw new Error(typeof stopped?.error === 'string' && stopped.error.trim() ? stopped.error : STOP_ERROR);
       finalWarning = stopped?.status?.message;
       stoppedSessionId = stopped?.sessionId ?? stoppedSessionId;
       stoppedStatus = stopped?.status;
@@ -135,7 +137,7 @@ async function stopCapture(message?: string) {
     return { ok: true, status, sessionId: stoppedSessionId };
   } catch (error) {
     await chrome.offscreen.closeDocument().catch(() => {});
-    await publish({ ...EMPTY_CAPTURE, state: 'error', message: conciseError(error) });
+    await publish({ ...EMPTY_CAPTURE, state: 'error', message: conciseError(error, STOP_ERROR) });
     return { ok: false, error: status.message, status };
   } finally { transitioning = false; }
 }

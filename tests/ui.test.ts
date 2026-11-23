@@ -162,6 +162,26 @@ test('the actual import form rejects malformed JSON without changing records',as
   assert.equal((await db.getData()).phrases.length,1);assert.match(query('[role="dialog"] [role="alert"]').textContent??'',/バックアップ/);
 });
 
+test('the actual import form restores a backup larger than 30 MiB without dropping image evidence',async()=>{
+  const backup=await db.exportData();
+  // Generated data-URL payloads exercise file size and schema retention here;
+  // the Chrome regression also covers decoding actual PNGs and UI downloads.
+  const screenshot='data:image/png;base64,'+'A'.repeat(2700000);
+  backup.phrases=Array.from({length:12},(_,i)=>({...phrase(`ui-large-${i}`,`大容量テスト${i}`),screenshot}));
+  const file=new browserWindow.File([JSON.stringify(backup)],'large-backup.json',{type:'application/json'});
+  assert.ok(file.size>30*1024*1024);
+  await mount();await click(query('[data-testid="nav-settings"]'));
+  const transfer=new browserWindow.DataTransfer();transfer.items.add(file);
+  await act(async()=>{const el=query<HTMLInputElement>('[data-testid="import-file"]');el.files=transfer.files as unknown as FileList;el.dispatchEvent(new browserWindow.Event('change',{bubbles:true}));await delay(20);});
+  await settled(()=>!document.querySelector('[role="dialog"]'),'Large backup was not restored',10000);
+  const restored=await db.getData();
+  const metadata=(phrases:Phrase[])=>phrases.map(({screenshot:_image,...p})=>p).sort((a,b)=>a.id.localeCompare(b.id));
+  assert.deepEqual(metadata(restored.phrases),metadata(backup.phrases));
+  assert.ok(restored.phrases.every(p=>p.screenshot===screenshot),'All image payloads must survive unchanged');
+  assert.deepEqual(restored.settings,backup.settings);
+  assert.equal(restored.attempts.length,0);assert.equal(restored.sessions.length,0);
+});
+
 test('correct but slow letter combinations show the personal baseline and lead to five real-word repetitions',async()=>{
   const pair=phrase('ui-slow-pair'),photo=phrase('ui-fast-photo','テスト用の写真','しゃしん','syasinn');
   await db.savePhrase(pair);await db.savePhrase(photo);await db.updateSettings({sessionLength:5});

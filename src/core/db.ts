@@ -144,7 +144,17 @@ export async function updateSettings(patch:Partial<Settings>):Promise<Settings> 
   let value:Settings;try{value=validateSettings({...DEFAULT_SETTINGS,...existing,...patch});}catch(error){tx.abort();await done.catch(()=>{});throw error;}
   store.put(value,'main');await done;notify();return value;
 }
-export async function exportData():Promise<AppData&{version:1;exportedAt:number}>{return {...await getData(),version:1,exportedAt:Date.now()};}
+export async function exportData():Promise<AppData&{version:1;exportedAt:number}> {
+  const backup={...await getData(),version:1 as const,exportedAt:Date.now()};
+  // Use the restore validator before reporting success, including its record
+  // and nested-field limits. Keep the original snapshot and every image intact.
+  const validated=validateImport(backup);
+  const phraseIds=new Set(validated.phrases.map(p=>p.id)),sessionIds=new Set(validated.sessions.map(s=>s.id));
+  // A full backup must restore into an empty profile, without relying on records
+  // that happen to exist in the destination of an otherwise valid merge import.
+  if(validated.attempts.some(a=>!phraseIds.has(a.phraseId)||!sessionIds.has(a.sessionId)))throw new Error('参照する語句・セッションが見つからないため、バックアップを書き出せません。');
+  return backup;
+}
 export async function clearData():Promise<void> {
   const database=await db(),tx=database.transaction([...STORE_NAMES],'readwrite'),done=complete(tx);for(const name of STORE_NAMES)tx.objectStore(name).clear();await done;notify();
 }

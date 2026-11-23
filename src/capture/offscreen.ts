@@ -1,5 +1,5 @@
 import { createWorker, PSM, type Worker as OcrWorker } from 'tesseract.js';
-import { getData, saveAttempt, saveAutomaticScore, savePhrase, saveSession } from '../core/db';
+import { saveAttempt, savePhrase, saveSession } from '../core/db';
 import type { Calibration, CaptureStatus, KeyStroke, Phrase, Rect, Session, Settings } from '../core/types';
 import { EMPTY_CAPTURE } from '../core/types';
 import { isCalibration, MAX_CANDIDATES, MAX_KEY_BUFFER, normalizeJapanese, normalizeOcrRoman, pixelRect, preprocessOcrPixels, SAMPLE_MS, signatureDistance, unionRects, validJapanese, validRoman } from './helpers';
@@ -8,6 +8,7 @@ import { resolveOcrReading } from './ocr-reading';
 import { detectResultRegions, findAmountRect, preprocessResultPixels } from './auto-result';
 import { parseResultScore, StableScoreReader, type NumericScoreText, type ParsedScore } from './score-parser';
 import { createCompletionBoundary, replayCapturedPhrase, type CompletionBoundary } from './key-boundary';
+import { saveCaptureScore } from './score-persistence';
 
 interface CaptureGame {
   session: Session; writes: Promise<void>; observedPrompt: boolean; resultSeen: boolean; scoreSaved: boolean;
@@ -401,29 +402,13 @@ async function acceptScore(game: CaptureGame, parsed: ParsedScore, at: number, e
     scoreObservedAt: at, scoreEvidence: evidence, scoreTotal: parsed.total, scoreProfit: parsed.profit,
     scoreModeSource: parsed.modeSource,
   };
-  const saved = await saveAutomaticScore(game.session.id, patch);
-  if (saved) {
-    Object.assign(game.session, patch, { scoreSource: 'ocr' as const });
-    delete game.session.scoreReview;
-  } else {
-    // A duplicate is already saved, or a user has corrected this score. The
-    // database is authoritative and the automatic result must not overwrite it.
-    const existing = (await getData()).sessions.find(item => item.id === game.session.id);
-    if (!existing || existing.score === undefined) return;
-    // Counters may have advanced while IndexedDB was being read. Refresh only
-    // score fields, never roll the live game's counters/timing back to a stale
-    // snapshot that would later be persisted again during stop().
-    for (const field of ['score', 'scoreType', 'scoreSource', 'scoreConfidence', 'scoreObservedAt', 'scoreEvidence', 'scoreModeSource', 'scoreTotal', 'scoreProfit', 'scoreReview'] as const) {
-      const target = game.session as unknown as Record<string, unknown>;
-      if (existing[field] === undefined) delete target[field];
-      else target[field] = existing[field];
-    }
-  }
+  const result = await saveCaptureScore(game.session, patch);
+  if (!result) return;
   game.scoreSaved = true;
   announce({
-    latestScore: { sessionId: game.session.id, score: game.session.score!, scoreType: game.session.scoreType, confidence: game.session.scoreConfidence },
+    latestScore: result.latestScore,
     ...(game === activeGame ? { scoreState: 'saved' as const, scoreReviewSessionId: undefined } : {}),
-    message: captureWarning ?? (game === activeGame ? (saved ? 'スコアを自動記録しました' : '保存済みのスコアを確認しました') : status.message),
+    message: captureWarning ?? (game === activeGame ? (result.saved ? 'スコアを自動記録しました' : '保存済みのスコアを確認しました') : status.message),
   });
 }
 async function recognizeResult(candidate: ResultCandidate) {
