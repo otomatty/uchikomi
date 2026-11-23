@@ -4,6 +4,7 @@ import { normalizeRoman } from './romaji';
 import { isErrorTerminatedAttempt } from './analytics';
 import { compatibleAttemptWithPhrase, compatiblePhraseAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
 import { MAX_ACTIVITY_DAYS, MAX_ACTIVITY_KEYS, MAX_ACTIVITY_MS, MAX_ACTIVITY_PHRASES, mergeDailyActivity, validTrainingDate } from './activity';
+import { isReplayShortcut, type ReplayShortcut } from './shortcuts';
 const DB_NAME='uchikomi-v1', VERSION=3;
 const STORE_NAMES=['phrases','attempts','sessions','settings','phraseAliases'] as const;
 let database:Promise<IDBDatabase>|undefined;
@@ -70,13 +71,13 @@ export async function getData():Promise<AppData> {
   const [phrases,attempts,sessions,settings]=await Promise.all([
     request<Phrase[]>(tx.objectStore('phrases').getAll()),request<Attempt[]>(tx.objectStore('attempts').getAll()),request<Session[]>(tx.objectStore('sessions').getAll()),request<Settings|undefined>(tx.objectStore('settings').get('main')),
   ]);await done;
-  return {phrases:phrases.sort((a,b)=>b.lastSeenAt-a.lastSeenAt),attempts:attempts.sort((a,b)=>a.startedAt-b.startedAt),sessions:sessions.sort((a,b)=>a.startedAt-b.startedAt),settings:{...DEFAULT_SETTINGS,...settings}};
+  return {phrases:phrases.sort((a,b)=>b.lastSeenAt-a.lastSeenAt),attempts:attempts.sort((a,b)=>a.startedAt-b.startedAt),sessions:sessions.sort((a,b)=>a.startedAt-b.startedAt),settings:{...DEFAULT_SETTINGS,...settings,replayShortcut:validateReplayShortcut(settings?.replayShortcut)}};
 }
 /** Auto-discovery reads only preferences, never the growing image/history stores. */
 export async function getSettings():Promise<Settings> {
   const database=await db(),tx=database.transaction('settings','readonly'),done=complete(tx);
   const settings=await request<Settings|undefined>(tx.objectStore('settings').get('main'));await done;
-  return {...DEFAULT_SETTINGS,...settings};
+  return {...DEFAULT_SETTINGS,...settings,replayShortcut:validateReplayShortcut(settings?.replayShortcut)};
 }
 interface Consolidation {phrases:Phrase[];bySource:Map<string,Phrase>;}
 async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<string,Phrase>,changedIds?:ReadonlySet<string>,replacedAttemptIds?:ReadonlySet<string>):Promise<Consolidation> {
@@ -437,10 +438,15 @@ function validateRect(value:unknown):Rect {
   const r=object(value,'読取範囲');const result={x:number(r.x,'範囲 X',0,1),y:number(r.y,'範囲 Y',0,1),width:number(r.width,'幅',0.005,1),height:number(r.height,'高さ',0.005,1)};
   if(result.x+result.width>1.001||result.y+result.height>1.001)throw new Error('読取範囲が画面の外にあります。');return result;
 }
+function validateReplayShortcut(value:unknown):ReplayShortcut {
+  if(value===undefined)return 'Escape';
+  if(!isReplayShortcut(value))throw new Error('再プレイのキーを確認してください。');
+  return value;
+}
 function validateSettings(value:unknown):Settings {
   const s=object(value,'設定');const targetDate=text(s.targetDate,'目標日',10);
   if(!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)||!Number.isFinite(Date.parse(targetDate))||new Date(`${targetDate}T00:00:00Z`).toISOString().slice(0,10)!==targetDate)throw new Error('目標日を確認してください。');
-  const result:Settings={targetScore:number(s.targetScore,'目標スコア',1,10000000),baselineScore:number(s.baselineScore,'開始時のスコア',-10000,10000000),targetDate,scoreType:scoreType(s.scoreType),sessionLength:Math.round(number(s.sessionLength,'復習語句数',1,100)),includeUnverified:bool(s.includeUnverified,'未確認語句の設定'),autoRecord:s.autoRecord===undefined?true:bool(s.autoRecord,'自動記録の設定')};
+  const result:Settings={targetScore:number(s.targetScore,'目標スコア',1,10000000),baselineScore:number(s.baselineScore,'開始時のスコア',-10000,10000000),targetDate,scoreType:scoreType(s.scoreType),sessionLength:Math.round(number(s.sessionLength,'復習語句数',1,100)),includeUnverified:bool(s.includeUnverified,'未確認語句の設定'),autoRecord:s.autoRecord===undefined?true:bool(s.autoRecord,'自動記録の設定'),replayShortcut:validateReplayShortcut(s.replayShortcut)};
   if(s.calibration!==undefined){const c=object(s.calibration,'読取範囲');const calibration:Calibration={japanese:validateRect(c.japanese),roman:validateRect(c.roman),updatedAt:number(c.updatedAt,'設定時刻')};if(c.reading!==undefined)calibration.reading=validateRect(c.reading);if(c.viewport!==undefined){const v=object(c.viewport,'画面サイズ');calibration.viewport={width:number(v.width,'画面の幅',1,20000),height:number(v.height,'画面の高さ',1,20000)};}result.calibration=calibration;}
   return result;
 }

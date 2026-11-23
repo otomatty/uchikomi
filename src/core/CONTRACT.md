@@ -36,6 +36,7 @@ UCHI_STATUS -> {ok:true,status:CaptureStatus}
 UCHI_START -> {ok:true,status} or {ok:false,error}; explicit manual tabCapture fallback for the active Sushi-da tab, subject to Chrome's user-invocation requirement.
 UCHI_STOP -> {ok:true,status,sessionId?}; persists autoRecord:false, stops media and saves queued records. Does not restart on navigation/visibility changes.
 UCHI_RESUME -> {ok:true,status}; persists autoRecord:true and probes permitted game tabs. A visible canvas starts itself; no tabCapture permission is requested.
+UCHI_REPLAY_SETTINGS_CHANGED -> {ok:true}; trusted extension UI only. Reads the saved shortcut and awaits delivery to the current content owner, without starting or stopping recording.
 UCHI_FRAME -> {ok:true,frame:FrameSnapshot} (snapshot for calibration, recording active)
 UCHI_CALIBRATE {calibration} -> {ok:true}
 UCHI_OPEN_GAME -> {ok:true} activates/opens official https://sushida.net/play.html
@@ -51,6 +52,16 @@ The permitted content script selects the largest visible game canvas and uses th
 `UCHI_CANVAS_READY {documentToken}` returns `{ok:true,sessionId? ,paused?,busy?}`. The background binds the session to sender tab/frame/document IDs and the per-document token. `UCHI_CANVAS_FRAME {sessionId,documentToken,frame:{dataUrl,width,height,at,sequence}}` is forwarded as `UCHI_OFF_CANVAS_FRAME`; `{ok:true,dropped:true}` acknowledges stale/concurrent frames without reprocessing them. `UCHI_CANVAS_END {sessionId,documentToken,reason}` stops that owner only. Keys, focus gaps and view changes carry the same ownership identity. `UCHI_CANVAS_PROBE` permits rediscovery; `UCHI_CAPTURE_DISABLE` stops the producer and flushes keys. Manual fallback observers retain their key subscription when the tab is temporarily hidden, while excluding hidden/out-of-focus input.
 
 `CaptureStatus.source?:'canvas'|'tab'` describes the active path. Optional `frameId`, `documentId` and `documentToken` belong to the background's owner record; offscreen status updates cannot replace them or revive an old capture. Startup cancellation waits for its transition before draining/closing the offscreen document. Late frames, decoded images and worker notifications cannot attach to a newer session. More than 300 ms without a frame breaks the typing boundary. A repeated or stopped image cannot serve as another independent result-score observation.
+
+## Keyboard replay
+
+`Settings.replayShortcut` accepts `'Escape' | 'Shift+Enter' | 'F2'`. Missing legacy settings default to `'Escape'`; malformed explicit values reject the entire settings/import write. `core/shortcuts.ts` provides the shared options, validation, labels and modifier-exact event matching. Default/native Escape is never cancelled or synthesized. The game shows that key below its replay button. Selecting a custom key does not disable the native key.
+
+The content observer intercepts only the selected custom shortcut from a trusted, nonrepeated, noncomposing physical key while the game canvas is visible and focused. `UCHI_CAPTURE_REPLAY {sessionId,documentToken,shortcut,at}` passes through background owner, active-tab, setting and freshness checks to `UCHI_OFF_REPLAY {sessionId}`. Offscreen checks an actual current result frame before and after awaiting OCR and persistence; a saved-score status alone is insufficient. Frames older than one second, a changed game/result, missing result evidence, failed writes, duplicate in-flight requests or an eight-second deadline cannot grant replay. A single score observation may be persisted for review, never promoted to a confirmed score by a replay request.
+
+On an approved reply, content rechecks its capture generation, settings, input/focus/viewport revisions and current canvas, then emits one Escape keydown/keyup pair. Synthetic events remain untrusted, are not captured as typing, and hold the key for one render interval before releasing it. A later real action, IME start, focus/visibility change or document change cancels a pending request. Both layers suppress immediate repeat grants. A manual tabCapture owner uses the document token returned by the frame with a visible game canvas; a replacement canvas in that same document breaks continuity and rebinds without losing the capture subscription.
+
+The shortcut never creates a Session directly. A detected next prompt starts the next game's Session through the normal recording lifecycle. The independent browser fixture tests this DOM event path; acceptance of synthetic Escape by the current official Unity build remains unverified. No `commands`, debugger permission, game-variable access or fixed-position mouse action is used.
 
 ## Detailed keys and personal speed
 

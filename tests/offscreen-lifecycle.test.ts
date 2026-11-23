@@ -24,6 +24,8 @@ interface FixtureOptions {
   scene?: { prompt: boolean; receipt: boolean; variant?: number };
   clock?: () => number;
   decode?: () => Promise<void>;
+  saveSession?: typeof db.saveSession;
+  controlReplayTimeout?: boolean;
 }
 
 async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt?: boolean, options: FixtureOptions = {}) {
@@ -33,8 +35,16 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
   let listener: ((message: any, sender: any, reply: (result: any) => void) => unknown) | undefined;
   const states: any[] = [], images: any[] = [];
   const intervals = new Map<unknown, { callback: () => void; delay: number }>();
+  const replayTimeouts = new Map<unknown, () => void>();
+  const videoCallbacks = new Map<number, (now: number, metadata: { presentedFrames: number }) => void>();
+  let videoCallbackId = 0, presentedFrames = 0;
   let stoppedTracks = 0, mediaCalls = 0;
-  const video = { muted: false, playsInline: false, readyState: 0, videoWidth: 0, videoHeight: 0, srcObject: null, async play() {} };
+  const video = {
+    muted: false, playsInline: false, readyState: 0, videoWidth: 0, videoHeight: 0, srcObject: null, async play() {},
+    requestVideoFrameCallback(callback: (now: number, metadata: { presentedFrames: number }) => void) { videoCallbacks.set(++videoCallbackId, callback); return videoCallbackId; },
+    cancelVideoFrameCallback(id: number) { videoCallbacks.delete(id); },
+    getVideoPlaybackQuality() { return { totalVideoFrames: presentedFrames }; },
+  };
   const track = { stop() { stoppedTracks++; }, addEventListener() {} };
   const stream = { getTracks: () => [track], getVideoTracks: () => [track] };
   const context = {
@@ -45,7 +55,11 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
       constructor() { images.push(this); }
       async decode() { await options.decode?.(); }
     },
-    setTimeout, clearTimeout,
+    setTimeout(callback: () => void, delay: number) {
+      if (options.controlReplayTimeout && delay === 8000) { const id = {}; replayTimeouts.set(id, callback); return id; }
+      return setTimeout(callback, delay);
+    },
+    clearTimeout(id: ReturnType<typeof setTimeout>) { if (!replayTimeouts.delete(id)) clearTimeout(id); },
     setInterval(callback: () => void, delay: number) { const id = {}; intervals.set(id, { callback, delay }); return id; },
     clearInterval(id: unknown) { intervals.delete(id); },
     document: {
@@ -80,7 +94,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     } },
     require(name: string) {
       if (name === './ocr-worker') return { startOcrWorkers: startWorkers };
-      if (name === '../core/db') return db;
+      if (name === '../core/db') return options.saveSession ? { ...db, saveSession: options.saveSession } : db;
       if (name === 'tesseract.js') return { PSM: { SINGLE_LINE: '7' } };
       if ((receipt !== undefined || options.scene) && name === './auto-region') return { detectPromptRegions: () => {
         if (!options.scene?.prompt) return null;
@@ -110,8 +124,14 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     assert.ok(keepAlive === true || replied, `${type} must reply or keep its channel open`);
   });
   return {
-    request, states, intervals, images, evaluate: (code: string) => vm.runInContext(code, runtime),
+    request, states, intervals, images, replayTimeouts, evaluate: (code: string) => vm.runInContext(code, runtime),
     stoppedTracks: () => stoppedTracks, mediaCalls: () => mediaCalls,
+    presentTabFrame(notify = true) {
+      video.readyState = 2; video.videoWidth = 1280; video.videoHeight = 800; presentedFrames++;
+      if (notify) for (const [id, callback] of [...videoCallbacks]) {
+        videoCallbacks.delete(id); callback(0, { presentedFrames });
+      }
+    },
     async start(extra: object = {}) {
       const result = await request('UCHI_OFF_START', {
         streamId: 'test-stream', tabId: 1, sessionId: 'startup-test', startedAt: options.clock?.() ?? Date.now(), settings: DEFAULT_SETTINGS, ...extra,
@@ -346,11 +366,11 @@ test('a missing canvas interval breaks a real stable prompt handoff and reacquir
   assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
 });
 
-async function resultFixture() {
+async function resultFixture(options: Pick<FixtureOptions, 'saveSession' | 'controlReplayTimeout'> = {}) {
   let now = 1700000000000, sequence = 0;
-  const scene = { prompt: true, receipt: false };
+  const scene = { prompt: true, receipt: false, variant: 0 };
   const ready = deferred<any[]>();
-  const app = await fixture(() => ready.promise, undefined, { scene, clock: () => now });
+  const app = await fixture(() => ready.promise, undefined, { ...options, scene, clock: () => now });
   await app.start(canvasStart);
   const send = async (delay = 80) => {
     now += delay;
@@ -366,7 +386,7 @@ async function resultFixture() {
   await send(240);
   assert.equal(app.evaluate('activeGame.lastResult.parsed.score'), 29740);
   assert.equal((await db.getData()).sessions[0].score, undefined);
-  return { app, send, get now() { return now; }, advance(delay: number) { now += delay; } };
+  return { app, scene, send, get now() { return now; }, advance(delay: number) { now += delay; } };
 }
 
 test('one canvas receipt cannot become two observations from timers, repeat delivery or stop', async () => {
@@ -403,6 +423,184 @@ test('a canvas frame gap requires two fresh receipt observations before saving',
   for (let i = 0; i < 15; i++) await run.send();
   assert.equal((await db.getData()).sessions[0].score, 29740);
   assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+const replay = (app: Awaited<ReturnType<typeof fixture>>, sessionId = 'startup-test') => app.request('UCHI_OFF_REPLAY', { sessionId });
+
+async function blockedResultFixture() {
+  let now = 1700000000000, sequence = 0, line = 0;
+  const scene = { prompt: true, receipt: false, variant: 0 };
+  const ready = deferred<any[]>(), entered = deferred<void>(), released = deferred<void>();
+  const app = await fixture(() => ready.promise, undefined, { scene, clock: () => now, controlReplayTimeout: true });
+  await app.start(canvasStart);
+  const send = async (delay = 80) => {
+    now += delay;
+    assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, ++sequence) })).ok, true);
+  };
+  await send();
+  ready.resolve([
+    { async setParameters() {}, async terminate() {}, async recognize() {
+      const index = line++;
+      if (!index) { entered.resolve(); await released.promise; }
+      return { data: { text: receiptLines[index % 4], confidence: 96 } };
+    } },
+    { async setParameters() {}, async terminate() {}, async recognize() { throw new Error('No numeric crop in this fixture'); } },
+  ]);
+  await new Promise(resolve => setImmediate(resolve));
+  scene.prompt = false; scene.receipt = true;
+  await send(240); await entered.promise;
+  return { app, scene, send, release: () => released.resolve(), advance(delay: number) { now += delay; } };
+}
+
+test('replay stores a single receipt for review before approving and starts no game until the next prompt', async () => {
+  const run = await resultFixture(), app = run.app;
+  const approved = await replay(app);
+  assert.equal(approved.ok, true); assert.equal(approved.ready, true);
+  let data = await db.getData();
+  assert.equal(data.sessions.length, 1);
+  assert.equal(data.sessions[0].score, undefined, 'replay never manufactures a second score observation');
+  assert.equal(data.sessions[0].scoreReview?.score, 29740);
+  assert.match(data.sessions[0].scoreReview?.reason ?? '', /2回/);
+  assert.equal((await replay(app)).ready, false, 'success has a brief per-game repeat guard');
+  assert.equal(app.evaluate('status.activeSessionId'), 'startup-test');
+  run.scene.prompt = true; run.scene.receipt = false;
+  await run.send(240);
+  data = await db.getData(); assert.equal(data.sessions.length, 2);
+  assert.notEqual(app.evaluate('status.activeSessionId'), 'startup-test');
+  assert.equal(data.sessions[1].scoreReview, undefined);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('replay checks the real current result and freshness even after the score was saved', async () => {
+  const run = await resultFixture();
+  for (let i = 0; i < 15; i++) await run.send();
+  assert.equal((await db.getData()).sessions[0].score, 29740);
+  assert.equal((await replay(run.app, 'another-capture')).ready, false);
+  run.scene.receipt = false; await run.send();
+  assert.equal((await replay(run.app)).ready, false, 'saved status alone cannot authorize a non-result image');
+  run.scene.receipt = true; await run.send(); run.advance(1001);
+  assert.equal((await replay(run.app)).ready, false, 'a frozen receipt cannot authorize replay');
+  await run.send();
+  assert.equal((await replay(run.app)).ready, true, 'a new actual receipt frame restores availability');
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  assert.equal((await replay(run.app)).ready, false);
+});
+
+test('replay refuses menu and prompt frames before any game result exists', async () => {
+  let now = 1700000000000;
+  const scene = { prompt: false, receipt: false };
+  const app = await fixture(() => new Promise(() => {}), undefined, { scene, clock: () => now });
+  await app.start(canvasStart);
+  assert.equal((await replay(app)).ready, false);
+  now += 80; await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 1) });
+  assert.equal((await replay(app)).ready, false);
+  scene.prompt = true; now += 240;
+  await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 2) });
+  assert.equal((await replay(app)).ready, false);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('replay drains already running OCR and persistence before approving and rejects parallel presses', async () => {
+  const run = await blockedResultFixture();
+  const first = replay(run.app);
+  assert.equal((await replay(run.app)).ready, false);
+  assert.equal((await db.getData()).sessions[0].scoreReview, undefined);
+  run.release();
+  assert.equal((await first).ready, true);
+  const data = await db.getData();
+  assert.equal(data.sessions.length, 1); assert.equal(data.sessions[0].score, undefined);
+  assert.equal(data.sessions[0].scoreReview?.score, 29740);
+  assert.equal(run.app.replayTimeouts.size, 0);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('stop cancels a waiting replay immediately and cannot return a late approval after OCR finishes', async () => {
+  const run = await blockedResultFixture();
+  const waiting = replay(run.app), stopping = run.app.request('UCHI_OFF_STOP');
+  assert.equal((await waiting).ready, false, 'cancel does not wait for the blocked OCR worker');
+  assert.equal((await replay(run.app)).ready, false);
+  run.release(); assert.equal((await stopping).ok, true);
+  assert.equal(run.app.evaluate('lastReplayGrant'), null);
+  assert.equal((await db.getData()).sessions[0].scoreReview?.score, 29740, 'normal stop still retains the pending result');
+});
+
+test('a newly observed game cancels a pending replay without attaching its old receipt to the new session', async () => {
+  const run = await blockedResultFixture(), waiting = replay(run.app);
+  run.scene.prompt = true; run.scene.receipt = false;
+  await run.send(240);
+  assert.equal((await waiting).ready, false);
+  const newId = run.app.evaluate('status.activeSessionId'); assert.notEqual(newId, 'startup-test');
+  run.release(); await run.app.evaluate('processQueue()');
+  const sessions = (await db.getData()).sessions;
+  assert.equal(sessions.length, 2);
+  assert.equal(sessions.find(session => session.id === 'startup-test')?.scoreReview?.score, 29740);
+  assert.equal(sessions.find(session => session.id === newId)?.scoreReview, undefined);
+  assert.equal(run.app.evaluate('lastReplayGrant'), null);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('replay rechecks receipt pixels, result geometry and frame age after a slow OCR wait', async () => {
+  for (const change of ['amount', 'disappeared', 'stale'] as const) {
+    await db.clearData();
+    const run = await blockedResultFixture(), waiting = replay(run.app);
+    if (change === 'stale') run.advance(1001);
+    else {
+      if (change === 'amount') run.scene.variant = 1;
+      else run.scene.receipt = false;
+      await run.send();
+    }
+    run.release();
+    assert.equal((await waiting).ready, false, change);
+    assert.equal(run.app.evaluate('lastReplayGrant'), null);
+    assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  }
+});
+
+test('a timed-out replay releases its lock and never grants approval when the old OCR eventually finishes', async () => {
+  const run = await blockedResultFixture(), waiting = replay(run.app);
+  assert.equal(run.app.replayTimeouts.size, 1);
+  run.advance(8000); for (const callback of run.app.replayTimeouts.values()) callback();
+  assert.equal((await waiting).ready, false);
+  assert.equal(run.app.replayTimeouts.size, 0);
+  run.release(); await run.app.evaluate('processQueue()');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.app.evaluate('lastReplayGrant'), null);
+  assert.equal((await db.getData()).sessions[0].scoreReview, undefined);
+  await run.send(); await run.app.evaluate('processQueue()');
+  assert.equal((await replay(run.app)).ready, true, 'a later physical request may retry with a fresh actual frame');
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('a failed review save blocks replay, while a later successful durable save allows retry', async () => {
+  let fail = true;
+  const run = await resultFixture({ saveSession: async session => {
+    if (fail && session.scoreReview) throw new Error('Storage temporarily unavailable');
+    await db.saveSession(session);
+  } });
+  const blocked = await replay(run.app);
+  assert.equal(blocked.ready, false); assert.match(blocked.reason, /保存/);
+  assert.equal((await db.getData()).sessions[0].scoreReview, undefined);
+  fail = false;
+  assert.equal((await replay(run.app)).ready, true);
+  assert.equal((await db.getData()).sessions[0].scoreReview?.score, 29740);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('tab replay freshness follows actual presented or decoded frames rather than its sampling timer', async () => {
+  let now = 1700000000000;
+  const scene = { prompt: true, receipt: false }, ready = deferred<any[]>();
+  const app = await fixture(() => ready.promise, undefined, { scene, clock: () => now });
+  await app.start();
+  const sample = () => { for (const timer of app.intervals.values()) if (timer.delay === 80) timer.callback(); };
+  app.presentTabFrame(); sample();
+  ready.resolve(receiptWorkers()); await new Promise(resolve => setImmediate(resolve));
+  scene.prompt = false; scene.receipt = true; now += 240;
+  app.presentTabFrame(); sample(); await app.evaluate('processQueue()');
+  now += 1001; sample(); await app.evaluate('processQueue()');
+  assert.equal((await replay(app)).ready, false, 'sampling the same decoded frame does not refresh its age');
+  app.presentTabFrame(false); sample(); await app.evaluate('processQueue()');
+  assert.equal((await replay(app)).ready, true, 'a new decoded frame also works when presentation callbacks are suspended');
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
 });
 
 

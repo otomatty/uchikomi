@@ -18,6 +18,7 @@ define('BroadcastChannel', class { postMessage() {} close() {} });
 define('IS_REACT_ACT_ENVIRONMENT', true);
 
 const messages: string[] = [];
+const replayUpdates: string[] = [];
 const listeners = new Set<(message: unknown) => void>();
 let status: CaptureStatus = { state: 'idle', phraseCount: 0 };
 const publish = (patch: Partial<CaptureStatus>) => {
@@ -34,6 +35,7 @@ define('chrome', {
       if (message.type === 'UCHI_RESUME') { await db.updateSettings({ autoRecord: true }); publish({ state: 'idle' }); }
       if (message.type === 'UCHI_AUTO_REGION') publish({ regionState: 'searching', region: undefined, regionConfidence: undefined });
       if (message.type === 'UCHI_STOP') { await db.updateSettings({ autoRecord: false }); publish({ state: 'idle' }); }
+      if (message.type === 'UCHI_REPLAY_SETTINGS_CHANGED') replayUpdates.push((await db.getSettings()).replayShortcut);
       return { ok: true, status, sessionId: status.activeSessionId||status.sessionId };
     },
   },
@@ -123,4 +125,56 @@ test('pause exposes a resume control and resuming preserves all saved records', 
   assert.deepEqual((await db.getData()).sessions, saved);
   assert.ok(messages.includes('UCHI_RESUME'));
   assert.equal(messages.includes('UCHI_START'), false);
+});
+
+test('settings saves the selected replay key before notifying live capture and keeps the choice when reopened', async () => {
+  const sessions = (await db.getData()).sessions;
+  const openSettings = async () => {
+    const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
+    await act(async () => { open.click(); await delay(0); });
+    await settle(() => Boolean(document.querySelector('[role="dialog"]')));
+    const select = document.querySelector<HTMLSelectElement>('[data-testid="replay-shortcut"]'); assert.ok(select);
+    return select;
+  };
+  const saveSettings = async () => {
+    const save = document.querySelector<HTMLButtonElement>('[role="dialog"] button[type="submit"]'); assert.ok(save);
+    await act(async () => { save.click(); await delay(0); });
+    await settle(() => !document.querySelector('[role="dialog"]'));
+  };
+  let select = await openSettings();
+  assert.equal(select.value, 'Escape');
+  assert.equal(select.getAttribute('aria-label'), '再プレイのキー');
+  assert.deepEqual([...select.options].map(option => [option.value, option.textContent]), [['Escape', 'Esc（標準）'], ['Shift+Enter', 'Shift + Enter'], ['F2', 'F2']]);
+  assert.match(document.querySelector('#replay-shortcut-hint')?.textContent ?? '', /寿司打の結果画面で使えます。Escはいつでも使えます。/);
+  for (const replayShortcut of ['Shift+Enter', 'F2']) {
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(browser.HTMLSelectElement.prototype, 'value')!.set!.call(select, replayShortcut);
+      select.dispatchEvent(new browser.Event('change', { bubbles: true })); await delay(0);
+    });
+    await saveSettings();
+    assert.equal((await db.getSettings()).replayShortcut, replayShortcut);
+    assert.equal(replayUpdates.at(-1), replayShortcut, 'the background notification observes the committed setting');
+    select = await openSettings(); assert.equal(select.value, replayShortcut);
+  }
+  const updates = replayUpdates.length;
+  await saveSettings();
+  assert.equal(replayUpdates.length, updates, 'an unchanged save does not notify again');
+  assert.deepEqual((await db.getData()).sessions, sessions);
+});
+
+test('restoring an older backup through settings informs live capture that native Escape is selected again', async () => {
+  assert.equal((await db.getSettings()).replayShortcut, 'F2');
+  const backup = await db.exportData(), { replayShortcut: _, ...settings } = backup.settings;
+  const file = new browser.File([JSON.stringify({ ...backup, settings })], 'legacy-shortcuts.json', { type: 'application/json' });
+  const transfer = new browser.DataTransfer(); transfer.items.add(file);
+  const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
+  await act(async () => { open.click(); await delay(0); });
+  const upload = document.querySelector<HTMLInputElement>('[data-testid="import-file"]'); assert.ok(upload);
+  const updates = replayUpdates.length;
+  await act(async () => { upload.files = transfer.files as unknown as FileList; upload.dispatchEvent(new browser.Event('change', { bubbles: true })); await delay(0); });
+  await settle(() => !document.querySelector('[role="dialog"]'));
+  assert.equal((await db.getSettings()).replayShortcut, 'Escape');
+  assert.equal(replayUpdates.length, updates + 1);
+  assert.equal(replayUpdates.at(-1), 'Escape');
+  assert.deepEqual((await db.getData()).sessions, backup.sessions);
 });

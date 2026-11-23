@@ -52,12 +52,15 @@ try {
         export * from ${JSON.stringify(path.join(root, 'src/core/db.ts'))};
         export { buildAttempt } from ${JSON.stringify(path.join(root, 'src/core/analytics.ts'))};
         import { detectPromptRegions } from ${JSON.stringify(path.join(root, 'src/capture/auto-region.ts'))};
-        export async function detectPromptFromImage(dataUrl) {
+        import { detectResultRegions } from ${JSON.stringify(path.join(root, 'src/capture/auto-result.ts'))};
+        async function imageFrame(dataUrl) {
           const image=new Image(); image.src=dataUrl; await image.decode();
           const canvas=document.createElement('canvas'); canvas.width=image.naturalWidth; canvas.height=image.naturalHeight;
           const ctx=canvas.getContext('2d'); ctx.drawImage(image,0,0);
-          return detectPromptRegions(ctx.getImageData(0,0,canvas.width,canvas.height));
+          return ctx.getImageData(0,0,canvas.width,canvas.height);
         }
+        export async function detectPromptFromImage(dataUrl) { return detectPromptRegions(await imageFrame(dataUrl)); }
+        export async function detectResultFromImage(dataUrl) { return detectResultRegions(await imageFrame(dataUrl)); }
         export { createMatcher } from ${JSON.stringify(path.join(root, 'src/core/romaji.ts'))};
         import { createWorker } from 'tesseract.js';
         export async function ocrSmoke() {
@@ -152,6 +155,7 @@ try {
     assert.equal(data.phrases.length, 0); assert.equal(data.attempts.length, 0); assert.equal(data.sessions.length, 0);
     assert.equal(data.settings.targetScore, 30000); assert.equal(data.settings.targetDate, '2026-12-25');
     assert.equal(data.settings.autoRecord, true, 'Automatic recording must be enabled by default');
+    assert.equal(data.settings.replayShortcut, 'Escape', 'Replay must default to the unchanged game Escape key');
     assert.ok((await app.locator('body').innerText()).includes('UCHIKOMI'));
     // The original screenshot/layout fixtures are not live capture tests. Keep
     // their data unchanged; a separate WebGL check below exercises the default.
@@ -624,7 +628,7 @@ try {
     try {
       await panel.setViewportSize({ width: 360, height: 900 });
       await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
-      await panel.getByTestId('nav-growth').click();
+      await panel.getByRole('navigation', { name: 'パネルナビゲーション' }).getByRole('button', { name: '成長', exact: true }).click();
       const small = panel.getByTestId('daily-training');
       await small.locator('input[type=date]').fill(fixtures.end);
       await panel.waitForFunction(() => document.querySelector('[data-testid="daily-keys"]')?.textContent === '1,560打鍵');
@@ -652,7 +656,7 @@ try {
     const actualPractice = saved.sessions.find(session => session.id === report.measuredPractice.sessionId);
     assert.deepEqual(actualPractice.activity, report.measuredPractice.activity, 'Measured practice must survive backup round-trip, DB upgrade and reload');
   });
-  await run('Opening a live WebGL game automatically records, pauses on hide, and respects manual pause', async () => {
+  await run('Live WebGL recording respects visibility and manual pause, and replay shortcuts only act on results', async () => {
     let game, panel;
     let observedTabId;
     const result = report.automaticCanvas = { preserveDrawingBuffer: false, phases: {}, diagnostics: {} };
@@ -678,6 +682,8 @@ try {
         .catch(error => ({ error: String(error.message || error) }));
       if (game && !game.isClosed()) details.fixture = await game.evaluate(() => ({
         ready: window.canvasFixture?.ready, frames: window.canvasFixture?.frames, visible: !document.hidden,
+        state: window.canvasFixture?.state, round: window.canvasFixture?.round,
+        keyboardEvents: window.canvasFixture?.keyboardEvents,
         width: document.querySelector('canvas')?.width, height: document.querySelector('canvas')?.height,
         trackProcessorAvailable: typeof MediaStreamTrackProcessor === 'function',
       })).catch(error => ({ error: String(error.message || error) }));
@@ -690,6 +696,7 @@ try {
         details.snapshot = { ok: true, ...metadata, imageCharacters: dataUrl.length };
         await writeFile(path.join(output, `automatic-${label}-ingested.jpg`), Buffer.from(dataUrl.split(',')[1], 'base64'));
         details.snapshotRegions = await app.evaluate(image => window.UchiQA.detectPromptFromImage(image), dataUrl);
+        details.snapshotResultRegions = await app.evaluate(image => window.UchiQA.detectResultFromImage(image), dataUrl);
       }
     };
     const poll = async (label, read, accept, timeout = 45000) => {
@@ -717,7 +724,7 @@ try {
       await panel.setViewportSize({ width: 360, height: 900 });
       await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
       await panel.getByTestId('capture-card').waitFor();
-      await app.evaluate(() => window.UchiQA.updateSettings({ autoRecord: true }));
+      await app.evaluate(() => window.UchiQA.updateSettings({ autoRecord: true, replayShortcut: 'Escape' }));
       activeFixture = canvasFixture;
       game = await context.newPage();
       await game.goto('https://sushida.net/play.html');
@@ -815,6 +822,123 @@ try {
       assert.equal(await game.evaluate(() => document.hidden), false);
       result.openedWithoutCaptureAction = true;
       result.manualPauseSurvivedVisibilityAndReload = true;
+
+      // Real key operations reach the production content/background/offscreen
+      // path. Only fixture rendering and settings persistence are controlled;
+      // no replay request or product message listener is invoked by the test.
+      const replay = result.replay = { fixtureOnly: true, cases: {}, nativeEscapeUnchanged: false };
+      const fixtureState = () => game.evaluate(() => ({ state: window.canvasFixture.state,
+        round: window.canvasFixture.round, frames: window.canvasFixture.frames,
+        keyboardEvents: window.canvasFixture.keyboardEvents, visible: !document.hidden }));
+      const escapeEvents = state => state.keyboardEvents.filter(event => event.key === 'Escape');
+      const setShortcut = async shortcut => {
+        const saved = await app.evaluate(async value => {
+          // This is the same public settings notification emitted by the UI.
+          // Using the hidden app keeps the active capture alive while settings
+          // propagation is tested, instead of refreshing the content script.
+          await window.UchiQA.updateSettings({ replayShortcut: value });
+          const reply = await chrome.runtime.sendMessage({ type: 'UCHI_REPLAY_SETTINGS_CHANGED' });
+          return { reply, shortcut: (await window.UchiQA.getSettings()).replayShortcut };
+        }, shortcut);
+        assert.equal(saved.reply?.ok, true, 'Replay settings notification must reach the content script');
+        assert.equal(saved.shortcut, shortcut);
+        assert.equal((await fixtureState()).visible, true, 'Changing replay settings must not hide the game');
+      };
+      const playing = (label, captureId, previousId) => poll(label, readStatus, state =>
+        state.state === 'recording' && state.source === 'canvas' && state.sessionId === captureId &&
+        state.activeSessionId && state.activeSessionId !== previousId && state.scoreState === 'watching');
+      const noReplay = async (label, key, expectedState) => {
+        const before = await fixtureState(), sessionBefore = (await readStatus()).activeSessionId;
+        assert.equal(before.state, expectedState);
+        await game.keyboard.press(key);
+        // Allow the actual runtime roundtrip to reject the action, so the
+        // assertion cannot pass merely because its asynchronous reply is late.
+        await game.waitForTimeout(1200);
+        const after = await fixtureState();
+        assert.equal(after.state, before.state, `${label}: the fixture changed screens`);
+        assert.equal(after.round, before.round, `${label}: an unintended replay occurred`);
+        assert.deepEqual(escapeEvents(after), escapeEvents(before), `${label}: an Escape was synthesized`);
+        assert.equal((await readStatus()).activeSessionId, sessionBefore, `${label}: a new game was created`);
+        return { key, screen: after.state, round: after.round, noSyntheticEscape: true };
+      };
+      const savedResult = async (label, gameId) => {
+        const shown = await game.evaluate(() => window.canvasFixture.showResult());
+        const saved = await poll(`${label}: result total saved through live OCR`, readStatus, state =>
+          state.activeSessionId === gameId && state.scoreState === 'saved' &&
+          state.latestScore?.sessionId === gameId && state.latestScore.score === 29740, 90000);
+        const persisted = await app.evaluate(async id => (await window.UchiQA.getData()).sessions.find(value => value.id === id), gameId);
+        assert.equal(persisted?.score, 29740); assert.equal(persisted.scoreTotal, 29740);
+        assert.equal(persisted.scoreType, 'total'); assert.equal(persisted.scoreSource, 'ocr');
+        await poll(`${label}: fresh result frames after score persistence`, readStatus,
+          state => state.activeSessionId === gameId && state.lastFrameAt > saved.lastFrameAt);
+        return { round: shown.round, sessionId: gameId, score: persisted.score, scoreSource: persisted.scoreSource };
+      };
+      const replayWith = async (label, key, expectedTrusted, previous) => {
+        const before = await fixtureState(); assert.equal(before.state, 'result');
+        const previousEscapeCount = escapeEvents(before).length;
+        await game.keyboard.press(key);
+        const after = await poll(`${label}: one Escape completes a fixture replay`, fixtureState, state =>
+          state.round === before.round + 1 && state.state === 'prompt' &&
+          escapeEvents(state).slice(previousEscapeCount).some(event => event.type === 'keyup'), 15000);
+        const events = escapeEvents(after).slice(previousEscapeCount);
+        assert.equal(events.filter(event => event.type === 'keydown').length, 1, `${label}: duplicate Escape keydown`);
+        assert.equal(events.filter(event => event.type === 'keyup').length, 1, `${label}: duplicate Escape keyup`);
+        assert.ok(events.every(event => event.trusted === expectedTrusted), `${label}: wrong trusted/synthetic event path`);
+        assert.ok(events.every(event => event.code === 'Escape'), `${label}: Escape code was not forwarded`);
+        const next = await playing(`${label}: a new captured session begins on the next prompt`, previous.sessionId, previous.activeSessionId);
+        assert.notEqual(next.activeSessionId, previous.activeSessionId);
+        assert.equal(next.sessionId, previous.sessionId, 'Replay must keep the same ongoing canvas capture');
+        return { key, fromRound: before.round, toRound: after.round,
+          fromSession: previous.activeSessionId, toSession: next.activeSessionId, events, next };
+      };
+
+      let current = await playing('The resumed capture observes a real prompt before replay testing', resumed.sessionId);
+      await game.locator('#game').click();
+      const resultImage = await game.evaluate(() => window.canvasFixture.resultImage());
+      await writeFile(path.join(output, 'replay-result-source.png'), Buffer.from(resultImage.split(',')[1], 'base64'));
+      replay.resultRegions = await app.evaluate(image => window.UchiQA.detectResultFromImage(image), resultImage);
+      assert.ok(replay.resultRegions?.confidence >= .9, 'The independent receipt must pass the production region detector');
+
+      await setShortcut('Shift+Enter');
+      replay.cases.shiftDuringPlay = await noReplay('Shift+Enter during a prompt', 'Shift+Enter', 'prompt');
+      replay.cases.shiftResult = await savedResult('Shift+Enter', current.activeSessionId);
+      await game.screenshot({ path: path.join(output, 'replay-result-webgl.png') });
+      replay.cases.shiftReplay = await replayWith('Dynamic Shift+Enter mapping', 'Shift+Enter', false, current);
+      current = replay.cases.shiftReplay.next;
+
+      // Exercise the actual settings form as well as dynamic propagation. Its
+      // focus change intentionally stops capture, then a reload tests that the
+      // new content script obtains F2 from persisted settings on discovery.
+      await app.bringToFront();
+      await game.waitForFunction(() => document.hidden, null, { polling: 100 });
+      await poll('Settings UI hides and stops the game capture', readStatus, state => state.state === 'idle');
+      await app.getByTestId('nav-settings').click();
+      const settingsDialog = app.getByRole('dialog'), shortcutSelect = settingsDialog.getByTestId('replay-shortcut');
+      assert.deepEqual(await shortcutSelect.locator('option').evaluateAll(options => options.map(option => option.value)),
+        ['Escape', 'Shift+Enter', 'F2']);
+      assert.equal(await shortcutSelect.inputValue(), 'Shift+Enter');
+      await shortcutSelect.selectOption('F2');
+      await settingsDialog.getByRole('button', { name: '保存する', exact: true }).click();
+      await settingsDialog.waitFor({ state: 'hidden' });
+      assert.equal(await app.evaluate(async () => (await window.UchiQA.getSettings()).replayShortcut), 'F2');
+      await game.reload(); await game.bringToFront();
+      await game.waitForFunction(() => window.canvasFixture?.ready && window.canvasFixture.frames > 2 && !document.hidden);
+      const reloaded = await waitRecording('Reloaded game automatically captures with persisted F2');
+      assert.notEqual(reloaded.sessionId, current.sessionId);
+      current = await playing('Reloaded game observes its first prompt', reloaded.sessionId);
+      await game.locator('#game').click();
+      replay.cases.f2DuringPlay = await noReplay('F2 during a prompt', 'F2', 'prompt');
+      replay.cases.f2Result = await savedResult('F2 after reload', current.activeSessionId);
+      replay.cases.previousShortcut = await noReplay('Old Shift+Enter mapping after selecting F2', 'Shift+Enter', 'result');
+      replay.cases.f2Replay = await replayWith('Persisted F2 mapping', 'F2', false, current);
+      current = replay.cases.f2Replay.next;
+
+      await setShortcut('Escape');
+      replay.cases.nativeResult = await savedResult('Unchanged native Escape', current.activeSessionId);
+      replay.cases.nativeReplay = await replayWith('Unchanged native Escape', 'Escape', true, current);
+      replay.nativeEscapeUnchanged = true;
+      replay.customMappingUpdatedWithoutReload = true;
+      replay.f2SettingSurvivedReload = true;
     } catch (error) {
       await diagnose('failure').catch(diagnosticError => { result.diagnosticError = String(diagnosticError.message || diagnosticError); });
       result.failureStatus = await send('UCHI_STATUS').catch(e => ({ error: String(e.message || e) }));

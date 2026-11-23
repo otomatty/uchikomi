@@ -1,3 +1,5 @@
+import type { ReplayShortcut } from './shortcuts';
+
 export type Source = 'capture' | 'practice' | 'manual' | 'demo';
 export interface KeyStroke { key: string; code?: string; at: number; repeat?: boolean; }
 export interface StrokeSample { pattern: string; intervalMs: number; error: boolean; at: number; }
@@ -37,7 +39,7 @@ export interface Rect { x:number; y:number; width:number; height:number; }
 export interface Calibration { japanese:Rect; reading?:Rect; roman:Rect; viewport?:{width:number;height:number}; updatedAt:number; }
 export interface Settings {
  targetScore:number; baselineScore:number; targetDate:string; scoreType:'total';
- sessionLength:number; includeUnverified:boolean; autoRecord:boolean; calibration?:Calibration;
+ sessionLength:number; includeUnverified:boolean; autoRecord:boolean; replayShortcut:ReplayShortcut; calibration?:Calibration;
 }
 export interface PatternStat {
  pattern:string; count:number; errors:number; errorRate:number; medianMs:number; p90Ms:number;
@@ -59,5 +61,5 @@ export interface CaptureStatus {
 }
 export interface AppData { phrases:Phrase[]; attempts:Attempt[]; sessions:Session[]; settings:Settings; }
 export interface FrameSnapshot { dataUrl:string; width:number; height:number; at:number; }
-export const DEFAULT_SETTINGS:Settings={targetScore:30000,baselineScore:18000,targetDate:'2026-12-25',scoreType:'total',sessionLength:10,includeUnverified:false,autoRecord:true};
+export const DEFAULT_SETTINGS:Settings={targetScore:30000,baselineScore:18000,targetDate:'2026-12-25',scoreType:'total',sessionLength:10,includeUnverified:false,autoRecord:true,replayShortcut:'Escape'};
 export const EMPTY_CAPTURE:CaptureStatus={state:'idle',phraseCount:0};

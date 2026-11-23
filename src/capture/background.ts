@@ -2,6 +2,7 @@ import { getSettings, updateSettings } from '../core/db';
 import type { CaptureStatus, Calibration } from '../core/types';
 import { EMPTY_CAPTURE } from '../core/types';
 import { isAllowedGameUrl, isCalibration, isCaptureStroke } from './helpers';
+import { isReplayShortcut } from '../core/shortcuts';
 
 const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
 const ORIGIN = chrome.runtime.getURL('');
@@ -14,6 +15,7 @@ let transitionDone: Promise<void> | null = null;
 let cancelStart = false;
 let stopping: Promise<any> | null = null;
 let forwardingFrame: { sessionId: string; sequence: number } | null = null;
+let preparingReplay: object | null = null;
 
 function beginTransition() {
   transitioning = true;
@@ -130,13 +132,14 @@ async function startCapture() {
     await ensureOffscreen();
     const settings = await getSettings();
     if (cancelStart) return { ok: true, status };
-    let enabled: unknown;
-    try { enabled = await chrome.tabs.sendMessage(tab.id, { type: 'UCHI_CAPTURE_ENABLE', sessionId }); }
+    let enabled: { ok?: boolean; documentToken?: string } | undefined;
+    try { enabled = await chrome.tabs.sendMessage(tab.id, { type: 'UCHI_CAPTURE_ENABLE', sessionId, replayShortcut: settings.replayShortcut }); }
     catch {
       await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['content.js'] });
-      enabled = await chrome.tabs.sendMessage(tab.id, { type: 'UCHI_CAPTURE_ENABLE', sessionId });
+      enabled = await chrome.tabs.sendMessage(tab.id, { type: 'UCHI_CAPTURE_ENABLE', sessionId, replayShortcut: settings.replayShortcut });
     }
     if (!enabled) throw new Error('寿司打を再読み込みして、もう一度記録してください。');
+    if (typeof enabled.documentToken === 'string') status = { ...status, documentToken: enabled.documentToken };
     const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
     if (cancelStart) return { ok: true, status };
     const response = await offscreen<{ ok: boolean; status?: CaptureStatus; error?: string }>('UCHI_OFF_START', { source: 'tab', streamId, tabId: tab.id, sessionId, startedAt, settings });
@@ -165,7 +168,7 @@ async function startCanvas(sender: chrome.runtime.MessageSender, documentToken: 
     const previous = await currentStatus(true);
     if (['recording', 'starting'].includes(previous.state)) {
       return ownsCanvas(previous, sender, { documentToken }, false)
-        ? { ok: true, sessionId: previous.sessionId } : { ok: true, busy: true };
+        ? { ok: true, sessionId: previous.sessionId, replayShortcut: settings.replayShortcut } : { ok: true, busy: true };
     }
     const tab = await chrome.tabs.get(sender.tab!.id!).catch(() => null);
     if (!tab?.active || !isAllowedGameUrl(tab.url) || cancelStart) return { ok: true, busy: true };
@@ -181,7 +184,7 @@ async function startCanvas(sender: chrome.runtime.MessageSender, documentToken: 
     if (!response?.ok || !response.status) throw new Error(response?.error ?? '自動記録を開始できませんでした。');
     await chrome.storage.session.set({ gameTabId: tab.id });
     await publish(withOwner(response.status));
-    return cancelStart ? { ok: true, busy: true } : { ok: true, sessionId };
+    return cancelStart ? { ok: true, busy: true } : { ok: true, sessionId, replayShortcut: settings.replayShortcut };
   } catch (error) {
     const message = conciseError(error);
     // A competing page's failed preference/status read does not own the
@@ -255,6 +258,39 @@ async function resumeCapture() {
   await probeGameTabs(true);
   return { ok: true, status };
 }
+function ownsReplay(current: CaptureStatus, sender: chrome.runtime.MessageSender, message: { sessionId?: string; documentToken?: string }) {
+  if (current.source === 'canvas') return ownsCanvas(current, sender, message);
+  return current.source === 'tab' && current.tabId === sender.tab?.id && current.sessionId === message.sessionId &&
+    !!current.documentToken && current.documentToken === message.documentToken;
+}
+async function replayFromContent(message: { sessionId?: string; documentToken?: string; shortcut?: unknown; at?: unknown }, sender: chrome.runtime.MessageSender) {
+  if (!isReplayShortcut(message.shortcut) || message.shortcut === 'Escape' ||
+      typeof message.at !== 'number' || !Number.isFinite(message.at) || Math.abs(Date.now() - message.at) > 2000) return { ok: true, ready: false };
+  const current = await loadStatus();
+  if (preparingReplay || transitioning || stopping || current.state !== 'recording' || !ownsReplay(current, sender, message)) return { ok: true, ready: false };
+  const pending = {}; preparingReplay = pending;
+  try {
+    const settings = await getSettings();
+    if (settings.replayShortcut !== message.shortcut) return { ok: true, ready: false };
+    const tab = await chrome.tabs.get(sender.tab!.id!).catch(() => null);
+    if (!tab?.active || !isAllowedGameUrl(tab.url) || status.state !== 'recording' || !ownsReplay(status, sender, message)) return { ok: true, ready: false };
+    const result = await offscreen<{ ok?: boolean; ready?: boolean; error?: string; reason?: string }>('UCHI_OFF_REPLAY', { sessionId: message.sessionId });
+    // Saving/OCR may take time. A changed owner, paused capture or updated
+    // shortcut must invalidate the reply before any key reaches the game.
+    if (!result?.ok || !result.ready) return { ...result, ready: false };
+    if (stopping || transitioning || status.state !== 'recording' || !ownsReplay(status, sender, message) ||
+        (await getSettings()).replayShortcut !== message.shortcut) return { ok: true, ready: false };
+    return { ok: true, ready: true, sessionId: message.sessionId };
+  } finally { if (preparingReplay === pending) preparingReplay = null; }
+}
+async function refreshReplaySettings() {
+  const settings = await getSettings(), current = await loadStatus();
+  if (current.tabId && current.sessionId && ['starting', 'recording'].includes(current.state)) {
+    await chrome.tabs.sendMessage(current.tabId, { type: 'UCHI_REPLAY_SETTINGS', sessionId: current.sessionId,
+      documentToken: current.documentToken, replayShortcut: settings.replayShortcut }, contentTarget(current)).catch(() => {});
+  }
+  return { ok: true };
+}
 
 chrome.action.onClicked.addListener(tab => {
   // The open() call must stay in this user-gesture stack, before any await.
@@ -321,6 +357,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void task.then(sendResponse).catch(error => sendResponse({ ok: false, error: conciseError(error) }));
     return true;
   }
+  if (message.type === 'UCHI_CAPTURE_REPLAY') {
+    if (!sender.tab?.id || !isAllowedGameUrl(sender.url) || typeof message.documentToken !== 'string') return;
+    void replayFromContent(message, sender).then(sendResponse).catch(error => sendResponse({ ok: false, ready: false, error: conciseError(error, '記録を保存できないため、再プレイを待っています。') }));
+    return true;
+  }
   if (message.type === 'UCHI_CAPTURE_KEYS' || message.type === 'UCHI_CAPTURE_GAP' || message.type === 'UCHI_CAPTURE_VIEW_CHANGE') {
     if (!sender.tab?.id || !isAllowedGameUrl(sender.url)) return;
     void loadStatus().then(async current => {
@@ -341,6 +382,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'UCHI_START': task = startCapture(); break;
     case 'UCHI_STOP': task = pauseCapture(); break;
     case 'UCHI_RESUME': task = resumeCapture(); break;
+    case 'UCHI_REPLAY_SETTINGS_CHANGED': task = refreshReplaySettings(); break;
     case 'UCHI_FRAME': task = (async () => {
       if (!(await hasOffscreen())) return { ok: false, error: '記録を開始してから読み取り範囲を設定してください。' };
       return offscreen('UCHI_OFF_FRAME');

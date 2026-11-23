@@ -2,7 +2,7 @@
 import test, { beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import 'fake-indexeddb/auto';
-import { clearData, getSettings } from '../src/core/db';
+import { clearData, getSettings, updateSettings } from '../src/core/db';
 import type { CaptureStatus } from '../src/core/types';
 
 const nativeChrome = globalThis.chrome, nativeChannel = globalThis.BroadcastChannel;
@@ -21,7 +21,7 @@ async function harness() {
   let handler: (message: any, sender: any, reply: (value: any) => void) => unknown;
   let contexts = false, failContextRead = false, status: CaptureStatus = { state: 'idle', phraseCount: 0 };
   let live: CaptureStatus = { ...status }, closed = 0, mediaRequests = 0;
-  let creation: Promise<void> | undefined, frameReply: Promise<any> | undefined;
+  let creation: Promise<void> | undefined, frameReply: Promise<any> | undefined, replayReply: Promise<any> | undefined;
   const calls: any[] = [], contentMessages: any[] = [];
   const listeners: Record<string, (...args: any[]) => void> = {};
   const listener = (name: string) => ({ addListener(fn: (...args: any[]) => void) { listeners[name] = fn; } });
@@ -41,6 +41,7 @@ async function harness() {
         if (message.type === 'UCHI_OFF_STATUS') return { ok: true, status: live };
         if (message.type === 'UCHI_OFF_STOP') { live = { ...live, state: 'idle' }; return { ok: true, status: live }; }
         if (message.type === 'UCHI_OFF_CANVAS_FRAME' && frameReply) return frameReply;
+        if (message.type === 'UCHI_OFF_REPLAY') return replayReply ?? { ok: true, ready: true };
         return { ok: true };
       },
     },
@@ -53,7 +54,7 @@ async function harness() {
       onRemoved: listener('removed'), onUpdated: listener('updated'),
       async get(tabId: number) { return { id: tabId, active: tabId === 9, url: 'https://sushida.net/play.html' }; },
       async query() { return [{ id: 9, active: true, url: 'https://sushida.net/play.html' }]; },
-      async sendMessage(tabId: number, message: any, options: any) { contentMessages.push({ tabId, ...message, options }); return { ok: true }; },
+      async sendMessage(tabId: number, message: any, options: any) { contentMessages.push({ tabId, ...message, options }); return { ok: true, documentToken: token }; },
       async create() { return {}; },
     },
     scripting: { async executeScript() { return []; } },
@@ -74,11 +75,66 @@ async function harness() {
     state: () => status, closed: () => closed, mediaRequests: () => mediaRequests,
     blockCreation: (promise: Promise<void>) => { creation = promise; },
     blockFrames: (promise: Promise<any>) => { frameReply = promise; },
+    blockReplay: (promise: Promise<any>) => { replayReply = promise; },
     failNextContextRead: () => { failContextRead = true; },
     notify: (value: CaptureStatus) => send({ type: 'UCHI_OFF_STATE', status: value }, { id, url: origin + 'offscreen.html' }),
   };
 }
 const frame = (sequence = 1) => ({ width: 900, height: 560, at: Date.now(), sequence, dataUrl: 'data:image/jpeg;base64,AA==' });
+
+test('replay requires the selected custom key and the exact current owner, and settings notify that document', async () => {
+  const app = await harness(), started = await app.ready();
+  assert.equal(started.replayShortcut, 'Escape');
+  const replay = (extra: any = {}, from = app.sender) => app.content({ type: 'UCHI_CAPTURE_REPLAY', sessionId: started.sessionId,
+    shortcut: 'Shift+Enter', at: Date.now(), ...extra }, from);
+  assert.equal((await replay()).ready, false, 'Native Esc does not enable a custom key');
+  await updateSettings({ replayShortcut: 'Shift+Enter' });
+  assert.equal((await app.send({ type: 'UCHI_REPLAY_SETTINGS_CHANGED' })).ok, true);
+  const notice = app.contentMessages.at(-1);
+  assert.equal(notice.type, 'UCHI_REPLAY_SETTINGS'); assert.equal(notice.replayShortcut, 'Shift+Enter');
+  assert.equal(notice.documentToken, token); assert.equal(notice.options.documentId, 'actual-document');
+  for (const [extra, sender] of [
+    [{ shortcut: 'Escape' }, app.sender], [{ shortcut: 'F2' }, app.sender], [{ shortcut: 'Enter' }, app.sender],
+    [{ sessionId: 'previous-capture' }, app.sender], [{ documentToken: 'old-document-token' }, app.sender],
+    [{ at: Date.now() - 3000 }, app.sender], [{}, { ...app.sender, frameId: 2 }],
+    [{}, { ...app.sender, documentId: 'stale' }], [{}, { ...app.sender, tab: { id: 10, active: true } }],
+  ] as const) assert.equal((await replay(extra, sender as any)).ready, false);
+  assert.equal(app.calls.filter(call => call.type === 'UCHI_OFF_REPLAY').length, 0);
+  assert.equal(await replay({}, { ...app.sender, url: 'https://example.com/' }), undefined);
+  assert.deepEqual(await replay(), { ok: true, ready: true, sessionId: started.sessionId });
+  assert.equal(app.calls.filter(call => call.type === 'UCHI_OFF_REPLAY').length, 1);
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('a delayed replay cannot duplicate, survive a settings change or outlive a stopped recording', async () => {
+  await updateSettings({ replayShortcut: 'F2' });
+  const app = await harness(), started = await app.ready();
+  const replay = () => app.content({ type: 'UCHI_CAPTURE_REPLAY', sessionId: started.sessionId, shortcut: 'F2', at: Date.now() });
+  let allow!: (value: any) => void;
+  app.blockReplay(new Promise(resolve => { allow = resolve; }));
+  const first = replay(); await until(() => app.calls.some(call => call.type === 'UCHI_OFF_REPLAY'));
+  assert.equal((await replay()).ready, false, 'Only one saving/recognition request may be in flight');
+  await updateSettings({ replayShortcut: 'Escape' }); allow({ ok: true, ready: true });
+  assert.equal((await first).ready, false);
+  await updateSettings({ replayShortcut: 'F2' });
+  app.blockReplay(new Promise(resolve => { allow = resolve; }));
+  const second = replay(); await until(() => app.calls.filter(call => call.type === 'UCHI_OFF_REPLAY').length === 2);
+  await app.send({ type: 'UCHI_STOP' }); allow({ ok: true, ready: true });
+  assert.equal((await second).ready, false);
+  assert.equal(app.state().state, 'idle');
+});
+
+test('manual fallback binds replay to the responding content document token', async () => {
+  await updateSettings({ replayShortcut: 'F2' });
+  const app = await harness();
+  const started = await app.send({ type: 'UCHI_START' });
+  assert.equal(started.ok, true); assert.equal(app.state().source, 'tab');
+  assert.equal(app.state().documentToken, token);
+  const message = { type: 'UCHI_CAPTURE_REPLAY', sessionId: app.state().sessionId, shortcut: 'F2', at: Date.now() };
+  assert.equal((await app.content({ ...message, documentToken: 'another-frame-token' })).ready, false);
+  assert.equal((await app.content(message)).ready, true);
+  await app.send({ type: 'UCHI_STOP' });
+});
 
 test('a visible permitted canvas starts automatically once, without tabCapture or an action click', async () => {
   const app = await harness();

@@ -3,7 +3,7 @@ import { saveAttempt, savePhrase, saveSession } from '../core/db';
 import { TrainingActivity } from '../core/activity';
 import type { Calibration, CaptureStatus, KeyStroke, Phrase, Rect, Session, Settings } from '../core/types';
 import { EMPTY_CAPTURE } from '../core/types';
-import { isCalibration, MAX_CANDIDATES, MAX_KEY_BUFFER, normalizeJapanese, normalizeOcrRoman, pixelRect, preprocessOcrPixels, SAMPLE_MS, unionRects, validJapanese, validRoman } from './helpers';
+import { isCalibration, MAX_CANDIDATES, MAX_KEY_BUFFER, normalizeJapanese, normalizeOcrRoman, pixelRect, preprocessOcrPixels, SAMPLE_MS, signatureDistance, unionRects, validJapanese, validRoman } from './helpers';
 import { detectPromptRegions, type AutoRegions } from './auto-region';
 import { resolveOcrReading } from './ocr-reading';
 import { detectResultRegions, findAmountRect, preprocessResultPixels } from './auto-result';
@@ -17,6 +17,14 @@ interface CanvasFrame {
   dataUrl: string; width: number; height: number; at: number; sequence: number;
 }
 
+interface ReplayFrame {
+  source: 'canvas' | 'tab'; width: number; height: number; at: number;
+  panel: Rect; header: Uint8Array; total: Uint8Array;
+}
+interface ReplayRequest {
+  game: CaptureGame; captureId: string; token: number; initial: ReplayFrame;
+  cancelled: boolean; cancel(reason: string): void;
+}
 interface ActivityWindow { from: number; through: number; until?: number; }
 interface ActivityOccurrence { id: string; from: number; until?: number; counted?: boolean; }
 interface CaptureGame {
@@ -56,6 +64,10 @@ let lastCanvasSequence = -1;
 let pendingCanvasDecode: object | null = null;
 let lastCanvasResultSequence = -1;
 let lastCanvasResultFound = false;
+let lastTabFrameAt = 0, lastTabPresentation = -1, lastTabDecoded = -1;
+let tabFrameCallback: number | undefined;
+let replayRequest: ReplayRequest | null = null;
+let lastReplayGrant: { game: CaptureGame; at: number } | null = null;
 let calibration: Calibration | undefined;
 let settings: Settings | null = null;
 let jpWorker: OcrWorker | null = null;
@@ -98,6 +110,7 @@ const REGION_SCAN_MS = 240;
 const RESULT_SCAN_MS = 1200;
 const MAX_CANVAS_GAP_MS = 300;
 const MAX_CANVAS_DATA_LENGTH = 3_000_000;
+const REPLAY_MAX_FRAME_AGE_MS = 1000, REPLAY_DEADLINE_MS = 8000, REPLAY_COOLDOWN_MS = 1000;
 const ROMAN_CHARACTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.,-'/():;[]";
 
 function frameSurface() {
@@ -112,6 +125,7 @@ function announce(patch: Partial<CaptureStatus> = {}) {
   void chrome.runtime.sendMessage({ type: 'UCHI_OFF_STATE', status }).catch(() => {});
 }
 function makeGame(at: number, id: string = crypto.randomUUID()): CaptureGame {
+  replayRequest?.cancel('ゲームが切り替わりました。');
   const data: Session = {
     id, captureId: status.sessionId, startedAt: at, source: 'capture', scoreType: 'total',
     course: 10000, mode: 'accuracy', phraseCount: 0, correctKeys: 0, mistakes: 0, durationMs: 0, activity: [],
@@ -360,6 +374,10 @@ function candidateFromFrame(at: number, signature: Uint8Array, reliableBoundary:
 function sampleFrame(now = Date.now()) {
   const frame = frameSurface();
   if (stopped || status.state !== 'recording' || !frame.ready || !frame.width || !frame.height) return;
+  if (status.source === 'tab' && typeof video.getVideoPlaybackQuality === 'function') {
+    const decoded = video.getVideoPlaybackQuality().totalVideoFrames;
+    if (decoded > 0 && decoded > lastTabDecoded) { lastTabDecoded = decoded; lastTabFrameAt = now; }
+  }
   if (frame.width !== lastFrameWidth || frame.height !== lastFrameHeight) {
     if (lastFrameWidth && lastFrameHeight) resetAutoRegions(now);
     lastFrameWidth = frame.width; lastFrameHeight = frame.height;
@@ -625,6 +643,110 @@ async function initializeWorkers(token: number, signal: AbortSignal) {
   } catch (error) { dispose(); throw error; }
   finally { signal.removeEventListener('abort', dispose); }
 }
+function watchTabFrames(token: number) {
+  if (typeof video.requestVideoFrameCallback !== 'function') return;
+  const presented: VideoFrameRequestCallback = (_now, metadata) => {
+    if (stopped || token !== generation || status.source !== 'tab') return;
+    if (metadata.presentedFrames > lastTabPresentation) {
+      lastTabPresentation = metadata.presentedFrames;
+      lastTabFrameAt = Date.now();
+    }
+    tabFrameCallback = video.requestVideoFrameCallback(presented);
+  };
+  tabFrameCallback = video.requestVideoFrameCallback(presented);
+}
+function stopTabFrameWatch() {
+  if (tabFrameCallback !== undefined && typeof video.cancelVideoFrameCallback === 'function') video.cancelVideoFrameCallback(tabFrameCallback);
+  tabFrameCallback = undefined; lastTabFrameAt = 0; lastTabPresentation = lastTabDecoded = -1;
+}
+function inspectReplayFrame(): ReplayFrame | null {
+  const surface = frameSurface(), now = Date.now();
+  const at = status.source === 'canvas' ? lastCanvasAt : lastTabFrameAt;
+  if (!surface.ready || !surface.width || !surface.height || !at || now - at > REPLAY_MAX_FRAME_AGE_MS || at > now + 1000) return null;
+  const scale = Math.min(1, 1280 / Math.max(surface.width, surface.height));
+  regionCanvas.width = Math.max(1, Math.round(surface.width * scale));
+  regionCanvas.height = Math.max(1, Math.round(surface.height * scale));
+  regionContext.drawImage(surface.image, 0, 0, regionCanvas.width, regionCanvas.height);
+  const regions = detectResultRegions(regionContext.getImageData(0, 0, regionCanvas.width, regionCanvas.height));
+  if (!regions) return null;
+  // This is a permission check, never another score observation. In particular,
+  // inspecting a frozen receipt cannot supply the second OCR agreement.
+  return { source: status.source === 'canvas' ? 'canvas' : 'tab', width: surface.width, height: surface.height, at,
+    panel: regions.panel, header: imageSignature(regions.header).bytes, total: imageSignature(regions.total).bytes };
+}
+function replayStillCurrent(request: ReplayRequest): boolean {
+  return !request.cancelled && !stopped && generation === request.token && status.state === 'recording' &&
+    status.sessionId === request.captureId && activeGame === request.game && request.game.resultSeen;
+}
+function sameReplayResult(before: ReplayFrame, after: ReplayFrame): boolean {
+  return before.source === after.source && before.width === after.width && before.height === after.height && !panelMoved(before.panel, after.panel) &&
+    signatureDistance(before.header, after.header) < .01 && signatureDistance(before.total, after.total) < .01;
+}
+const replayUnavailable = (reason: string) => ({ ok: true as const, ready: false as const, reason });
+async function prepareReplay(message: { sessionId?: unknown }) {
+  if (replayRequest) return replayUnavailable('再プレイの準備中です。');
+  const game = activeGame, captureId = status.sessionId;
+  if (!captureId || message.sessionId !== captureId || stopped || status.state !== 'recording' || !game?.observedPrompt || !game.resultSeen) {
+    return replayUnavailable('結果画面を表示してから再試行してください。');
+  }
+  if (lastReplayGrant?.game === game && Date.now() - lastReplayGrant.at < REPLAY_COOLDOWN_MS) return replayUnavailable('再プレイの準備中です。');
+  let initial: ReplayFrame | null;
+  try { initial = inspectReplayFrame(); } catch { initial = null; }
+  if (!initial) return replayUnavailable('最新の結果画面を確認できませんでした。');
+  let cancel!: (reason: string) => void;
+  const cancelled = new Promise<ReturnType<typeof replayUnavailable>>(resolve => { cancel = reason => resolve(replayUnavailable(reason)); });
+  const request: ReplayRequest = { game, captureId, token: generation, initial, cancelled: false,
+    cancel(reason) { request.cancelled = true; cancel(reason); } };
+  replayRequest = request;
+  const timeout = setTimeout(() => request.cancel('保存の完了を待ってから、もう一度押してください。'), REPLAY_DEADLINE_MS);
+  const prepare = (async () => {
+    try {
+      await processQueue();
+      if (!replayStillCurrent(request)) return replayUnavailable('記録または画面が切り替わりました。');
+      await Promise.all([...pendingWrites]);
+      // The existing queue settles first; retry its latest cumulative snapshot
+      // so a previously failed save does not permanently disable a later retry.
+      await persistGame(game);
+      if (!replayStillCurrent(request)) return replayUnavailable('記録または画面が切り替わりました。');
+      if (!game.scoreSaved) {
+        const result = game.lastResult;
+        if (!result) return replayUnavailable('結果の読み取りが完了していません。');
+        // A single observed total is retained for review, never promoted to an
+        // automatically confirmed score merely because replay was requested.
+        await reviewScore(game, result.parsed, result.at, result.evidence,
+          result.parsed.kind === 'score' ? '再プレイ前に2回の一致を確認できなかったため、結果を確認してください' : undefined);
+      }
+      // Include OCR and final activity/phrase writes which arrived during the
+      // first wait or review save. A newer result job must also finish first.
+      let saved: Promise<void>;
+      do {
+        await processQueue();
+        await Promise.all([...pendingWrites]);
+        saved = game.writes; await saved;
+      } while (replayStillCurrent(request) && (processing || pendingWrites.size || saved !== game.writes));
+      if (!replayStillCurrent(request) || (!game.scoreSaved && !game.session.scoreReview)) return replayUnavailable('記録または画面が切り替わりました。');
+      const latest = inspectReplayFrame();
+      if (!latest || !sameReplayResult(initial, latest)) return replayUnavailable('結果画面が変わったため、再プレイを見送りました。');
+      return { ok: true as const, ready: true as const };
+    } catch {
+      return replayUnavailable('結果を保存できませんでした。保存済みの履歴を確認してください。');
+    }
+  })();
+  try {
+    const result = await Promise.race([prepare, cancelled]);
+    if (result.ready) {
+      if (!replayStillCurrent(request)) return replayUnavailable('記録または画面が切り替わりました。');
+      let latest: ReplayFrame | null;
+      try { latest = inspectReplayFrame(); } catch { latest = null; }
+      if (!latest || !sameReplayResult(initial, latest)) return replayUnavailable('結果画面が変わったため、再プレイを見送りました。');
+      lastReplayGrant = { game, at: Date.now() };
+    }
+    return result;
+  } finally {
+    clearTimeout(timeout); request.cancelled = true;
+    if (replayRequest === request) replayRequest = null;
+  }
+}
 async function receiveCanvasFrame(message: { sessionId?: unknown; frame?: Partial<CanvasFrame> }) {
   if (stopped || status.source !== 'canvas' || status.state !== 'recording' || message.sessionId !== status.sessionId) {
     return { ok: true, dropped: true };
@@ -681,6 +803,7 @@ async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; ta
   const source = message.source ?? 'tab';
   if (!['canvas', 'tab'].includes(source) || (source === 'tab' && !message.streamId)) return { ok: false, error: '画面の取得方法を確認できませんでした。' };
   const token = ++generation;
+  replayRequest?.cancel('記録が切り替わりました。'); lastReplayGrant = null; stopTabFrameWatch();
   stopped = false; stopTask = null;
   settings = message.settings;
   // Stored rectangles belong to an old viewport. Automatic detection is the
@@ -706,6 +829,7 @@ async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; ta
       stream = acquired; video.srcObject = stream;
       await video.play();
       if (stopped || token !== generation) return { ok: false, error: '記録の開始を中止しました。' };
+      watchTabFrames(token);
       stream.getVideoTracks().forEach(track => track.addEventListener('ended', () => {
         if (!stopped) {
           void stop().then(() => announce({ state: 'idle', message: captureWarning ?? '画面共有が終了しました。' }));
@@ -735,7 +859,7 @@ async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; ta
     return { ok: true, status };
   } catch (error) {
     if (stopped || token !== generation) return { ok: false, error: '記録の開始を中止しました。' };
-    stream?.getTracks().forEach(track => track.stop()); stream = null; video.srcObject = null;
+    stream?.getTracks().forEach(track => track.stop()); stream = null; video.srcObject = null; stopTabFrameWatch();
     const message = error instanceof Error ? error.message : '画面を取得できませんでした。';
     stopped = true;
     announce({ state: 'error', message });
@@ -748,6 +872,7 @@ function stop(): Promise<unknown> {
   return stopTask;
 }
 async function finishStop() {
+  replayRequest?.cancel('記録を終了しました。');
   if (stopped) return { ok: true, status };
   // Tab capture can sample its still-live video once before stopping. A canvas
   // frame was already observed on arrival and must not count as fresh evidence.
@@ -765,7 +890,7 @@ async function finishStop() {
   announce({ state: 'stopping', message: '最後のお題を保存しています' });
   // Stop the media tracks immediately; only already-cropped text awaits OCR.
   stream?.getTracks().forEach(track => track.stop()); stream = null;
-  video.srcObject = null;
+  video.srcObject = null; stopTabFrameWatch();
   pendingCanvasDecode = null; lastCanvasAt = 0; externalCanvas.width = externalCanvas.height = 1;
   // A Tesseract startup error can leave its underlying createWorker promise
   // pending forever. Abort our startup ownership and do not await that promise;
@@ -813,6 +938,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'UCHI_OFF_START': task = start(message); break;
     case 'UCHI_OFF_CANVAS_FRAME': task = receiveCanvasFrame(message); break;
     case 'UCHI_OFF_STOP': task = stop(); break;
+    case 'UCHI_OFF_REPLAY': task = prepareReplay(message); break;
     case 'UCHI_OFF_STATUS': sendResponse({ ok: true, status }); return;
     case 'UCHI_OFF_FRAME': sendResponse(snapshot()); return;
     case 'UCHI_OFF_KEYS':

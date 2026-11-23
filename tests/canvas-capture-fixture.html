@@ -69,6 +69,38 @@
         ctx.drawImage(line, Math.round((canvas.width - line.width) / 2), top);
       }
 
+      // An independently drawn receipt exercises the real result detector and
+      // OCR, not a fixture response injected into the extension. CI installs
+      // this font explicitly so Japanese glyphs do not depend on fallback.
+      const font = '"Noto Sans CJK JP", "Noto Sans JP", sans-serif';
+      await document.fonts.load(`32px ${font}`); await document.fonts.ready;
+      const receipt = document.createElement('canvas');
+      receipt.width = canvas.width; receipt.height = canvas.height;
+      const receiptCtx = receipt.getContext('2d');
+      receiptCtx.fillStyle = '#597763'; receiptCtx.fillRect(0, 0, 900, 560);
+      receiptCtx.fillStyle = '#fff'; receiptCtx.fillRect(100, 40, 700, 430);
+      receiptCtx.fillStyle = '#353535'; receiptCtx.fillRect(100, 68, 700, 63);
+      receiptCtx.textAlign = 'center'; receiptCtx.textBaseline = 'middle';
+      receiptCtx.fillStyle = '#fff'; receiptCtx.font = `bold 30px ${font}`;
+      receiptCtx.fillText('高級 10,000円コース [正確重視]', 450, 99);
+      const moneyLine = (amount, label, y, coloured = false) => {
+        receiptCtx.textAlign = 'left'; receiptCtx.textBaseline = 'alphabetic';
+        receiptCtx.fillStyle = '#111'; receiptCtx.font = `32px ${font}`;
+        receiptCtx.fillText(amount, 220, y);
+        receiptCtx.fillStyle = coloured ? '#5f8f0e' : '#111'; receiptCtx.font = `27px ${font}`;
+        receiptCtx.fillText(label, 370, y);
+      };
+      moneyLine('29,740', '円分のお寿司をゲット!', 186);
+      moneyLine('10,000', '円 払って…', 248);
+      receiptCtx.fillStyle = '#5f8f0e'; receiptCtx.fillRect(128, 278, 644, 70);
+      receiptCtx.fillStyle = '#fff'; receiptCtx.fillRect(134, 284, 632, 58);
+      moneyLine('19,740', '円分お得でした!', 326, true);
+      receiptCtx.fillStyle = '#42584b'; receiptCtx.font = `22px ${font}`;
+      receiptCtx.textAlign = 'center'; receiptCtx.fillText('独立したテスト用の結果画面', 450, 405);
+      receiptCtx.fillStyle = '#fff'; receiptCtx.fillRect(300, 486, 300, 48);
+      receiptCtx.fillStyle = '#24312e'; receiptCtx.font = `24px ${font}`;
+      receiptCtx.textBaseline = 'middle'; receiptCtx.fillText('もう一度（Escキー）', 450, 510);
+
       const gl = canvas.getContext('webgl', { preserveDrawingBuffer: false, alpha: false, antialias: false });
       if (!gl) throw new Error('The automatic capture fixture requires WebGL');
       const compile = (type, source) => {
@@ -104,11 +136,34 @@
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, surface);
       gl.uniform1i(gl.getUniformLocation(program, 'promptTexture'), 0);
       gl.viewport(0, 0, canvas.width, canvas.height);
-      let frames = 0;
+      let frames = 0, round = 1, state = 'prompt';
+      const keyboardEvents = [];
+      const setState = next => {
+        state = next;
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, next === 'result' ? receipt : surface);
+      };
+      // Model the game's documented Escape action using ordinary DOM events.
+      // Accepting synthetic events here verifies the extension's wiring only;
+      // it cannot prove the official Unity build accepts them.
+      for (const type of ['keydown', 'keyup']) window.addEventListener(type, event => {
+        if (!['Escape', 'Enter', 'F2'].includes(event.key)) return;
+        keyboardEvents.push({ type, key: event.key, code: event.code, keyCode: event.keyCode,
+          which: event.which, trusted: event.isTrusted, repeat: event.repeat, shift: event.shiftKey,
+          state, round, at: performance.timeOrigin + performance.now() });
+        if (type === 'keydown' && event.key === 'Escape' && !event.repeat && state === 'result') {
+          round++; setState('prompt');
+        }
+      });
       window.canvasFixture = {
         ready: true,
         contextAttributes: gl.getContextAttributes(),
         get frames() { return frames; },
+        get state() { return state; },
+        get round() { return round; },
+        get keyboardEvents() { return keyboardEvents.map(event => ({ ...event })); },
+        showResult() { setState('result'); return { round, state }; },
+        resultImage() { return receipt.toDataURL('image/png'); },
       };
       const draw = () => {
         gl.disable(gl.SCISSOR_TEST); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

@@ -30,6 +30,8 @@ test('manual keyboard capture excludes outside focus and resumes after tab visib
   });
   await import('../src/capture/content');
   const canvas = browser.document.querySelector('canvas')!;
+  canvas.width = 900; canvas.height = 560;
+  Object.defineProperty(canvas, 'getBoundingClientRect', { value: () => ({ x: 0, y: 0, left: 0, top: 0, right: 900, bottom: 560, width: 900, height: 560 }) });
   const button = browser.document.querySelector('button')!;
   const input = browser.document.querySelector('input')!;
   const editor = browser.document.querySelector('div')!;
