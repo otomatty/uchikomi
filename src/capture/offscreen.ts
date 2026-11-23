@@ -12,6 +12,10 @@ import { saveCaptureScore } from './score-persistence';
 import { closeObservedBoundary, PromptSignatureTracker, ResultFrameSequence } from './frame-lifecycle';
 import { startOcrWorkers } from './ocr-worker';
 
+interface CanvasFrame {
+  dataUrl: string; width: number; height: number; at: number; sequence: number;
+}
+
 interface CaptureGame {
   session: Session; writes: Promise<void>; observedPrompt: boolean; resultSeen: boolean; scoreSaved: boolean;
   reader: ResultFrameSequence; lastResult?: { parsed: ParsedScore; at: number; evidence: string };
@@ -35,6 +39,15 @@ let stream: MediaStream | null = null;
 const video = document.createElement('video');
 video.muted = true; video.playsInline = true;
 document.body.append(video);
+// Canvas recording receives only the game image from its owning content script.
+// Keep one decoded frame in memory; OCR persistence still uses cropped evidence.
+const externalCanvas = document.createElement('canvas');
+const externalContext = externalCanvas.getContext('2d', { willReadFrequently: true })!;
+let lastCanvasAt = 0;
+let lastCanvasSequence = -1;
+let pendingCanvasDecode: object | null = null;
+let lastCanvasResultSequence = -1;
+let lastCanvasResultFound = false;
 let calibration: Calibration | undefined;
 let settings: Settings | null = null;
 let jpWorker: OcrWorker | null = null;
@@ -64,8 +77,8 @@ let manualRegions = false;
 let detectedRegions: AutoRegions | null = null;
 let lastRegionScan = 0;
 let captureWarning: string | undefined;
-let lastVideoWidth = 0;
-let lastVideoHeight = 0;
+let lastFrameWidth = 0;
+let lastFrameHeight = 0;
 const detectCanvas = document.createElement('canvas');
 detectCanvas.width = 192; detectCanvas.height = 32;
 const detectContext = detectCanvas.getContext('2d', { willReadFrequently: true })!;
@@ -73,7 +86,15 @@ const regionCanvas = document.createElement('canvas');
 const regionContext = regionCanvas.getContext('2d', { willReadFrequently: true })!;
 const REGION_SCAN_MS = 240;
 const RESULT_SCAN_MS = 1200;
+const MAX_CANVAS_GAP_MS = 300;
+const MAX_CANVAS_DATA_LENGTH = 3_000_000;
 const ROMAN_CHARACTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.,-'/():;[]";
+
+function frameSurface() {
+  return status.source === 'canvas'
+    ? { image: externalCanvas, width: externalCanvas.width, height: externalCanvas.height, ready: lastCanvasAt > 0 }
+    : { image: video, width: video.videoWidth, height: video.videoHeight, ready: video.readyState >= 2 };
+}
 
 function announce(patch: Partial<CaptureStatus> = {}) {
   status = { ...status, ...patch };
@@ -100,7 +121,7 @@ function persistGame(game: CaptureGame): Promise<void> {
 function observePrompt(at: number) {
   if (!activeGame || activeGame.resultSeen) {
     const previous = activeGame;
-    makeGame(at);
+    makeGame(at, !games.length && status.source === 'canvas' ? status.sessionId : undefined);
     if (previous && !previous.scoreSaved && previous.lastResult) {
       const last = previous.lastResult;
       void reviewScore(previous, last.parsed, last.at, last.evidence,
@@ -110,14 +131,15 @@ function observePrompt(at: number) {
   activeGame!.observedPrompt = true;
 }
 function crop(rect: Rect, upscale = false): HTMLCanvasElement {
-  const area = pixelRect(rect, video.videoWidth, video.videoHeight);
+  const frame = frameSurface();
+  const area = pixelRect(rect, frame.width, frame.height);
   const scale = upscale ? Math.min(3, Math.max(2, 56 / area.height)) : 1;
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(area.width * scale));
   canvas.height = Math.max(1, Math.round(area.height * scale));
   const context = canvas.getContext('2d')!;
   context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(video, area.x, area.y, area.width, area.height, 0, 0, canvas.width, canvas.height);
+  context.drawImage(frame.image, area.x, area.y, area.width, area.height, 0, 0, canvas.width, canvas.height);
   return canvas;
 }
 function ocrCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
@@ -131,8 +153,9 @@ function ocrCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
   return output;
 }
 function imageSignature(rect: Rect): { bytes: Uint8Array; ink: number } {
-  const area = pixelRect(rect, video.videoWidth, video.videoHeight);
-  detectContext.drawImage(video, area.x, area.y, area.width, area.height, 0, 0, detectCanvas.width, detectCanvas.height);
+  const frame = frameSurface();
+  const area = pixelRect(rect, frame.width, frame.height);
+  detectContext.drawImage(frame.image, area.x, area.y, area.width, area.height, 0, 0, detectCanvas.width, detectCanvas.height);
   const image = detectContext.getImageData(0, 0, detectCanvas.width, detectCanvas.height).data;
   const bytes = new Uint8Array(detectCanvas.width * detectCanvas.height);
   let ink = 0;
@@ -203,24 +226,26 @@ function resetAutoRegions(at: number, publish = true, confirmedResult = false) {
   if (publish) announce({ regionState: 'searching', regionConfidence: undefined, region: undefined, message: captureWarning ?? (status.ocrReady ? 'お題を探しています' : '文字認識を準備しています') });
 }
 function panelMoved(previous: Rect, next: Rect): boolean {
-  const tolerance = Math.max(3, previous.height * video.videoHeight * .025);
-  return Math.abs(previous.x - next.x) * video.videoWidth > tolerance ||
-    Math.abs(previous.y - next.y) * video.videoHeight > tolerance ||
-    Math.abs(previous.width - next.width) * video.videoWidth > tolerance ||
-    Math.abs(previous.height - next.height) * video.videoHeight > tolerance;
+  const frame = frameSurface();
+  const tolerance = Math.max(3, previous.height * frame.height * .025);
+  return Math.abs(previous.x - next.x) * frame.width > tolerance ||
+    Math.abs(previous.y - next.y) * frame.height > tolerance ||
+    Math.abs(previous.width - next.width) * frame.width > tolerance ||
+    Math.abs(previous.height - next.height) * frame.height > tolerance;
 }
 function scanRegions(now: number) {
   if (manualRegions || now - lastRegionScan < REGION_SCAN_MS) return;
   lastRegionScan = now;
   // OCR still uses the original-resolution frame. Only the inexpensive frame
   // locator is reduced, keeping large displays from blocking the sample loop.
-  const scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));
-  const width = Math.max(1, Math.round(video.videoWidth * scale));
-  const height = Math.max(1, Math.round(video.videoHeight * scale));
+  const surface = frameSurface();
+  const scale = Math.min(1, 1280 / Math.max(surface.width, surface.height));
+  const width = Math.max(1, Math.round(surface.width * scale));
+  const height = Math.max(1, Math.round(surface.height * scale));
   if (regionCanvas.width !== width || regionCanvas.height !== height) {
     regionCanvas.width = width; regionCanvas.height = height;
   }
-  regionContext.drawImage(video, 0, 0, width, height);
+  regionContext.drawImage(surface.image, 0, 0, width, height);
   const frame = regionContext.getImageData(0, 0, width, height);
   const found = detectPromptRegions(frame);
   if (!found) {
@@ -238,7 +263,7 @@ function scanRegions(now: number) {
   detectedRegions = found;
   calibration = {
     japanese: found.japanese, reading: found.reading, roman: found.roman,
-    viewport: { width: video.videoWidth, height: video.videoHeight }, updatedAt: now,
+    viewport: { width: surface.width, height: surface.height }, updatedAt: now,
   };
   announce({ regionState: 'locked', regionConfidence: found.confidence, region: found.panel, message: captureWarning ?? (status.ocrReady ? 'お題を自動検出しました' : '文字認識を準備しています') });
 }
@@ -259,12 +284,12 @@ function candidateFromFrame(at: number, signature: Uint8Array, reliableBoundary:
     processed: false, finalized: false, reliableBoundary, observationReliable: false,
   };
 }
-function sampleFrame() {
-  if (stopped || status.state !== 'recording' || video.readyState < 2 || !video.videoWidth) return;
-  const now = Date.now();
-  if (video.videoWidth !== lastVideoWidth || video.videoHeight !== lastVideoHeight) {
-    if (lastVideoWidth && lastVideoHeight) resetAutoRegions(now);
-    lastVideoWidth = video.videoWidth; lastVideoHeight = video.videoHeight;
+function sampleFrame(now = Date.now()) {
+  const frame = frameSurface();
+  if (stopped || status.state !== 'recording' || !frame.ready || !frame.width || !frame.height) return;
+  if (frame.width !== lastFrameWidth || frame.height !== lastFrameHeight) {
+    if (lastFrameWidth && lastFrameHeight) resetAutoRegions(now);
+    lastFrameWidth = frame.width; lastFrameHeight = frame.height;
   }
   // A manual rectangle over an old receipt is not evidence of a new game.
   // Result detection already clears the override; this also covers a fresh
@@ -341,17 +366,25 @@ function collectResultFrame(now: number, force = false, observedFrame?: ImageDat
   const game = activeGame;
   // Starting a recording on an old result must not create another score. A
   // genuine prompt has to have been visible during this recording first.
-  if (!game?.observedPrompt || game.scoreSaved || !status.ocrReady || video.readyState < 2 || !video.videoWidth) return false;
+  const surface = frameSurface();
+  if (!game?.observedPrompt || game.scoreSaved || !status.ocrReady || !surface.ready || !surface.width) return false;
+  // One external image is one observation, even if multiple detection paths
+  // request a forced scan while handling that same frame.
+  if (status.source === 'canvas' && lastCanvasResultSequence === lastCanvasSequence) return lastCanvasResultFound;
   if (!force && now - lastResultScan < RESULT_SCAN_MS) return false;
   lastResultScan = now;
   if (!observedFrame) {
-    const scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));
-    regionCanvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-    regionCanvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-    regionContext.drawImage(video, 0, 0, regionCanvas.width, regionCanvas.height);
+    const scale = Math.min(1, 1280 / Math.max(surface.width, surface.height));
+    regionCanvas.width = Math.max(1, Math.round(surface.width * scale));
+    regionCanvas.height = Math.max(1, Math.round(surface.height * scale));
+    regionContext.drawImage(surface.image, 0, 0, regionCanvas.width, regionCanvas.height);
     observedFrame = regionContext.getImageData(0, 0, regionCanvas.width, regionCanvas.height);
   }
   const regions = detectResultRegions(observedFrame);
+  if (status.source === 'canvas') {
+    lastCanvasResultSequence = lastCanvasSequence;
+    lastCanvasResultFound = Boolean(regions);
+  }
   // A throttled call above is not a new observation. Only an actual missing
   // receipt scan resets agreement and invalidates queued pre-gap observations.
   const revision = game.reader.scanned(Boolean(regions), now);
@@ -518,8 +551,61 @@ async function initializeWorkers(token: number, signal: AbortSignal) {
   } catch (error) { dispose(); throw error; }
   finally { signal.removeEventListener('abort', dispose); }
 }
-async function start(message: { streamId: string; tabId: number; sessionId: string; startedAt: number; settings: Settings }) {
-  if (stream) return { ok: false, error: '記録はすでに開始しています。' };
+async function receiveCanvasFrame(message: { sessionId?: unknown; frame?: Partial<CanvasFrame> }) {
+  if (stopped || status.source !== 'canvas' || status.state !== 'recording' || message.sessionId !== status.sessionId) {
+    return { ok: true, dropped: true };
+  }
+  const frame = message.frame;
+  if (!frame || typeof frame.dataUrl !== 'string' || frame.dataUrl.length <= 23 || frame.dataUrl.length > MAX_CANVAS_DATA_LENGTH ||
+      !frame.dataUrl.startsWith('data:image/jpeg;base64,') ||
+      !Number.isInteger(frame.width) || !Number.isInteger(frame.height) ||
+      frame.width! < 1 || frame.width! > 1920 || frame.height! < 1 || frame.height! > 1440 ||
+      !Number.isSafeInteger(frame.sequence) || frame.sequence! < 0 || !Number.isFinite(frame.at)) {
+    return { ok: false, error: 'ゲーム画面を読み取れませんでした。' };
+  }
+  const at = frame.at!, sequence = frame.sequence!;
+  if (pendingCanvasDecode || sequence <= lastCanvasSequence || at <= lastCanvasAt ||
+      at < (status.startedAt ?? 0) || at > Date.now() + 1000) return { ok: true, dropped: true };
+  const token = generation, captureId = status.sessionId, decode = {};
+  pendingCanvasDecode = decode;
+  const image = new Image();
+  try {
+    image.src = frame.dataUrl;
+    await image.decode();
+    if (stopped || token !== generation || captureId !== status.sessionId || status.source !== 'canvas' ||
+        status.state !== 'recording' || pendingCanvasDecode !== decode || sequence <= lastCanvasSequence || at <= lastCanvasAt) {
+      return { ok: true, dropped: true };
+    }
+    if (image.naturalWidth !== frame.width || image.naturalHeight !== frame.height) {
+      return { ok: false, error: 'ゲーム画面の大きさを確認できませんでした。' };
+    }
+    if (lastCanvasAt && at - lastCanvasAt > MAX_CANVAS_GAP_MS) {
+      // Hidden, stalled or lost frames cannot establish a phrase boundary or
+      // count as an uninterrupted second observation of a result receipt.
+      resetAutoRegions(at);
+      activeGame?.reader.scanned(false, at);
+      lastResultScan = 0;
+    }
+    if (externalCanvas.width !== frame.width || externalCanvas.height !== frame.height) {
+      externalCanvas.width = frame.width!; externalCanvas.height = frame.height!;
+    }
+    externalContext.drawImage(image, 0, 0);
+    lastCanvasAt = at; lastCanvasSequence = sequence;
+    status = { ...status, lastFrameAt: at };
+    sampleFrame(at);
+    return { ok: true };
+  } catch (error) {
+    if (stopped || token !== generation || captureId !== status.sessionId) return { ok: true, dropped: true };
+    return { ok: false, error: error instanceof Error ? error.message : 'ゲーム画面を読み取れませんでした。' };
+  } finally {
+    image.src = '';
+    if (pendingCanvasDecode === decode) pendingCanvasDecode = null;
+  }
+}
+async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; tabId: number; sessionId: string; startedAt: number; settings: Settings }) {
+  if (stream || ['starting', 'recording', 'stopping'].includes(status.state)) return { ok: false, error: '記録はすでに開始しています。' };
+  const source = message.source ?? 'tab';
+  if (!['canvas', 'tab'].includes(source) || (source === 'tab' && !message.streamId)) return { ok: false, error: '画面の取得方法を確認できませんでした。' };
   const token = ++generation;
   stopped = false; stopTask = null;
   settings = message.settings;
@@ -529,24 +615,36 @@ async function start(message: { streamId: string; tabId: number; sessionId: stri
   keyBuffer = []; focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
   games = []; activeGame = null; session = null; lastResultScan = 0;
   promptSignatures.reset(); sequence = 0;
-  captureWarning = undefined; lastVideoWidth = lastVideoHeight = 0;
-  status = { state: 'starting', tabId: message.tabId, sessionId: message.sessionId, startedAt: message.startedAt, phraseCount: 0, ocrReady: false, regionState: 'searching', scoreState: 'watching' };
+  lastCanvasAt = 0; lastCanvasSequence = lastCanvasResultSequence = -1; lastCanvasResultFound = false;
+  pendingCanvasDecode = null; externalCanvas.width = externalCanvas.height = 1;
+  captureWarning = undefined; lastFrameWidth = lastFrameHeight = 0;
+  status = { state: 'starting', source, tabId: message.tabId, sessionId: message.sessionId, startedAt: message.startedAt, phraseCount: 0, ocrReady: false, regionState: 'searching', scoreState: 'watching' };
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: message.streamId, minFrameRate: 15, maxFrameRate: 30 } } as MediaTrackConstraints,
-    });
-    video.srcObject = stream;
-    await video.play();
-    stream.getVideoTracks().forEach(track => track.addEventListener('ended', () => {
-      if (!stopped) {
-        void stop().then(() => announce({ state: 'idle', message: captureWarning ?? '画面共有が終了しました。' }));
+    if (source === 'tab') {
+      const acquired = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: message.streamId, minFrameRate: 15, maxFrameRate: 30 } } as MediaTrackConstraints,
+      });
+      if (stopped || token !== generation) {
+        acquired.getTracks().forEach(track => track.stop());
+        return { ok: false, error: '記録の開始を中止しました。' };
       }
-    }, { once: true }));
-    const firstGame = makeGame(message.startedAt, message.sessionId);
-    await firstGame.writes;
+      stream = acquired; video.srcObject = stream;
+      await video.play();
+      if (stopped || token !== generation) return { ok: false, error: '記録の開始を中止しました。' };
+      stream.getVideoTracks().forEach(track => track.addEventListener('ended', () => {
+        if (!stopped) {
+          void stop().then(() => announce({ state: 'idle', message: captureWarning ?? '画面共有が終了しました。' }));
+        }
+      }, { once: true }));
+      const firstGame = makeGame(message.startedAt, message.sessionId);
+      await firstGame.writes;
+      if (stopped || token !== generation) return { ok: false, error: '記録の開始を中止しました。' };
+    }
     announce({ state: 'recording', message: '文字認識を準備しています' });
-    sampleTimer = setInterval(sampleFrame, SAMPLE_MS);
+    // External frames are sampled exactly once, on arrival with their capture
+    // timestamp. An interval would turn one stale image into repeated evidence.
+    if (source === 'tab') sampleTimer = setInterval(sampleFrame, SAMPLE_MS);
     heartbeat = setInterval(() => {
       if (status.startedAt && Date.now() - status.startedAt > 60 * 60 * 1000) { void stop(); return; }
       if (status.state === 'recording') announce();
@@ -561,8 +659,12 @@ async function start(message: { streamId: string; tabId: number; sessionId: stri
     }).finally(() => { if (initializationController === controller) initializationController = null; });
     return { ok: true, status };
   } catch (error) {
-    stream?.getTracks().forEach(track => track.stop()); stream = null;
-    return { ok: false, error: error instanceof Error ? error.message : '画面を取得できませんでした。' };
+    if (stopped || token !== generation) return { ok: false, error: '記録の開始を中止しました。' };
+    stream?.getTracks().forEach(track => track.stop()); stream = null; video.srcObject = null;
+    const message = error instanceof Error ? error.message : '画面を取得できませんでした。';
+    stopped = true;
+    announce({ state: 'error', message });
+    return { ok: false, error: message };
   }
 }
 function stop(): Promise<unknown> {
@@ -572,18 +674,21 @@ function stop(): Promise<unknown> {
 }
 async function finishStop() {
   if (stopped) return { ok: true, status };
-  // Capture the last visible receipt before stopping its video track. OCR then
-  // drains only these already-cropped images, with no continuing screen access.
-  collectResultFrame(Date.now(), true);
+  // Tab capture can sample its still-live video once before stopping. A canvas
+  // frame was already observed on arrival and must not count as fresh evidence.
+  // OCR then drains only already-cropped images, without continuing screen access.
+  if (status.source !== 'canvas') collectResultFrame(Date.now(), true);
   stopped = true;
   if (sampleTimer) clearInterval(sampleTimer);
   if (heartbeat) clearInterval(heartbeat);
+  sampleTimer = heartbeat = undefined;
   const endedAt = Date.now();
   endCurrent(endedAt);
   announce({ state: 'stopping', message: '最後のお題を保存しています' });
   // Stop the media tracks immediately; only already-cropped text awaits OCR.
   stream?.getTracks().forEach(track => track.stop()); stream = null;
   video.srcObject = null;
+  pendingCanvasDecode = null; lastCanvasAt = 0; externalCanvas.width = externalCanvas.height = 1;
   // A Tesseract startup error can leave its underlying createWorker promise
   // pending forever. Abort our startup ownership and do not await that promise;
   // background closes this document after stop returns, releasing raw workers
@@ -616,10 +721,11 @@ async function finishStop() {
   return { ok: true, status, sessionId: session?.id };
 }
 function snapshot() {
-  if (!stream || !video.videoWidth || video.readyState < 2) return { ok: false, error: '画面の準備中です。少し待ってから再試行してください。' };
-  const canvas = document.createElement('canvas'); canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-  canvas.getContext('2d')!.drawImage(video, 0, 0);
-  return { ok: true, frame: { dataUrl: canvas.toDataURL('image/jpeg', .9), width: canvas.width, height: canvas.height, at: Date.now() } };
+  const surface = frameSurface();
+  if (stopped || status.state !== 'recording' || !surface.ready || !surface.width) return { ok: false, error: '画面の準備中です。少し待ってから再試行してください。' };
+  const canvas = document.createElement('canvas'); canvas.width = surface.width; canvas.height = surface.height;
+  canvas.getContext('2d')!.drawImage(surface.image, 0, 0);
+  return { ok: true, frame: { dataUrl: canvas.toDataURL('image/jpeg', .9), width: canvas.width, height: canvas.height, at: status.source === 'canvas' ? lastCanvasAt : Date.now() } };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -627,6 +733,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   let task: Promise<unknown> | undefined;
   switch (message.type) {
     case 'UCHI_OFF_START': task = start(message); break;
+    case 'UCHI_OFF_CANVAS_FRAME': task = receiveCanvasFrame(message); break;
     case 'UCHI_OFF_STOP': task = stop(); break;
     case 'UCHI_OFF_STATUS': sendResponse({ ok: true, status }); return;
     case 'UCHI_OFF_FRAME': sendResponse(snapshot()); return;
@@ -641,13 +748,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       sendResponse({ ok: true }); return;
     case 'UCHI_OFF_VIEW_CHANGE':
-      if (status.state === 'recording') resetAutoRegions(Date.now());
+      if (message.sessionId === status.sessionId && status.state === 'recording') resetAutoRegions(Date.now());
       sendResponse({ ok: true }); return;
     case 'UCHI_OFF_AUTO_REGION':
       if (status.state === 'recording') resetAutoRegions(Date.now());
       sendResponse({ ok: true, status }); return;
     case 'UCHI_OFF_GAP':
-      if (Number.isFinite(message.at)) {
+      if (message.sessionId === status.sessionId && ['recording', 'stopping'].includes(status.state) && Number.isFinite(message.at)) {
         focusGaps.push(message.at);
         if (currentCandidate && message.at >= currentCandidate.at && (!currentCandidate.endedAt || message.at < currentCandidate.endedAt)) {
           currentCandidate.completionBoundary.settle(null);
@@ -658,7 +765,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!isCalibration(message.calibration)) { sendResponse({ ok: false }); return; }
       resetAutoRegions(Date.now(), false);
       calibration = message.calibration; manualRegions = true;
-      lastVideoWidth = video.videoWidth; lastVideoHeight = video.videoHeight;
+      { const frame = frameSurface(); lastFrameWidth = frame.width; lastFrameHeight = frame.height; }
       promptSignatures.reset();
       announce({ regionState: 'manual', regionConfidence: undefined, region: undefined, message: captureWarning ?? (status.ocrReady ? '手動の範囲で読み取っています' : '文字認識を準備しています') });
       sendResponse({ ok: true }); return;

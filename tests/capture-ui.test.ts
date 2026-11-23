@@ -31,9 +31,9 @@ define('chrome', {
     onMessage: { addListener: (fn: (m: unknown) => void) => listeners.add(fn), removeListener: (fn: (m: unknown) => void) => listeners.delete(fn) },
     async sendMessage(message: { type: string }) {
       messages.push(message.type);
-      if (message.type === 'UCHI_START') publish({ state: 'recording', ocrReady: true, regionState: 'searching', startedAt: Date.now(), sessionId: 'first-session' });
+      if (message.type === 'UCHI_RESUME') { await db.updateSettings({ autoRecord: true }); publish({ state: 'idle' }); }
       if (message.type === 'UCHI_AUTO_REGION') publish({ regionState: 'searching', region: undefined, regionConfidence: undefined });
-      if (message.type === 'UCHI_STOP') publish({ state: 'idle' });
+      if (message.type === 'UCHI_STOP') { await db.updateSettings({ autoRecord: false }); publish({ state: 'idle' }); }
       return { ok: true, status, sessionId: status.activeSessionId||status.sessionId };
     },
   },
@@ -66,12 +66,15 @@ after(async () => {
   await browser.happyDOM.close();
 });
 
-test('recording starts with automatic detection and no range-selection dialog', async () => {
-  const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find(b => b.textContent?.includes('記録をはじめる'));
-  assert.ok(button);
-  await act(async () => { button.click(); await delay(0); });
+test('automatic capture shows its status without a start button or range-selection dialog', async () => {
+  assert.equal((await db.getData()).settings.autoRecord, true);
+  assert.equal([...document.querySelectorAll<HTMLButtonElement>('button')].some(b => b.textContent?.includes('記録をはじめる')), false);
+  assert.match(document.querySelector('[data-testid="capture-card"]')?.textContent ?? '', /開くだけで、記録/);
+  await act(async () => { publish({ state: 'recording', source: 'canvas', ocrReady: true, regionState: 'searching', startedAt: Date.now(), sessionId: 'first-session' }); await delay(0); });
   await settle(() => document.querySelector('[data-testid="capture-region"]')?.textContent?.includes('お題を探しています') === true);
-  assert.ok(messages.includes('UCHI_START'));
+  assert.equal(messages.includes('UCHI_START'), false);
+  assert.equal(document.querySelector('.wave-bars'), null);
+  assert.equal(document.querySelector('.capture-heading .spin'), null);
   assert.equal(messages.includes('UCHI_FRAME'), false);
   assert.equal(messages.includes('UCHI_CALIBRATE'), false);
   assert.equal(document.querySelector('[role="dialog"]'), null);
@@ -101,9 +104,23 @@ test('an automatically recorded score is visible and stopping does not force man
   assert.match(document.querySelector('[data-testid="auto-score"]')?.textContent??'',/合計/);
   assert.match(document.querySelector('.panel-goal')?.textContent??'',/29,740/);
   assert.doesNotMatch(document.body.textContent??'',/お得|利益|profit/i);
-  const stop=[...document.querySelectorAll<HTMLButtonElement>('button')].find(button=>button.textContent?.includes('記録を終了'));
+  const stop=[...document.querySelectorAll<HTMLButtonElement>('button')].find(button=>button.textContent?.includes('記録を一時停止'));
   assert.ok(stop);await act(async()=>{stop.click();await delay(30);});
   await settle(()=>messages.includes('UCHI_STOP'));
   assert.equal(document.querySelector('[role="dialog"]'),null);
   assert.equal((await db.getData()).sessions[0].score,29740);assert.equal((await db.getData()).sessions[0].scoreType,'total');
+});
+
+test('pause exposes a resume control and resuming preserves all saved records', async () => {
+  await settle(() => document.querySelector('[data-testid="capture-card"]')?.textContent?.includes('自動記録を一時停止中') === true);
+  assert.equal((await db.getData()).settings.autoRecord, false);
+  const saved = (await db.getData()).sessions;
+  const resume = [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.includes('自動記録を再開'));
+  assert.ok(resume);
+  await act(async () => { resume.click(); await delay(30); });
+  await settle(() => document.querySelector('[data-testid="capture-card"]')?.textContent?.includes('自動記録を待機') === true);
+  assert.equal((await db.getData()).settings.autoRecord, true);
+  assert.deepEqual((await db.getData()).sessions, saved);
+  assert.ok(messages.includes('UCHI_RESUME'));
+  assert.equal(messages.includes('UCHI_START'), false);
 });

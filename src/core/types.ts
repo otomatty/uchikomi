@@ -10,6 +10,10 @@ export interface Phrase {
  id: string; text: string; reading: string; roman: string; source: Source;
  confidence: number; verified: boolean; capturedAt: number; lastSeenAt: number; seenCount: number;
  screenshot?: string; tags?: string[];
+ /** Original images archived by consolidation, including its representative. */
+ screenshots?: string[];
+ /** Per-original-ID counts make consolidation and backup replay idempotent. */
+ seenSources?: {id:string;count:number}[];
 }
 export interface Attempt {
  id: string; phraseId: string; sessionId: string; source: Source; startedAt: number; endedAt: number;
@@ -30,7 +34,7 @@ export interface Rect { x:number; y:number; width:number; height:number; }
 export interface Calibration { japanese:Rect; reading?:Rect; roman:Rect; viewport?:{width:number;height:number}; updatedAt:number; }
 export interface Settings {
  targetScore:number; baselineScore:number; targetDate:string; scoreType:'total';
- sessionLength:number; includeUnverified:boolean; calibration?:Calibration;
+ sessionLength:number; includeUnverified:boolean; autoRecord:boolean; calibration?:Calibration;
 }
 export interface PatternStat {
  pattern:string; count:number; errors:number; errorRate:number; medianMs:number; p90Ms:number;
@@ -44,6 +48,7 @@ export interface WordStat {
 }
 export interface CaptureStatus {
  state:'idle'|'starting'|'recording'|'stopping'|'error'; sessionId?:string; tabId?:number; startedAt?:number;
+ source?:'canvas'|'tab'; frameId?:number; documentId?:string; documentToken?:string;
  phraseCount:number; message?:string; ocrReady?:boolean; latestPhrase?:string; lastFrameAt?:number;
  regionState?:'searching'|'locked'|'manual'; regionConfidence?:number; region?:Rect;
  activeSessionId?:string; latestScore?:{sessionId:string;score:number;scoreType:'total';confidence?:number};
@@ -51,5 +56,5 @@ export interface CaptureStatus {
 }
 export interface AppData { phrases:Phrase[]; attempts:Attempt[]; sessions:Session[]; settings:Settings; }
 export interface FrameSnapshot { dataUrl:string; width:number; height:number; at:number; }
-export const DEFAULT_SETTINGS:Settings={targetScore:30000,baselineScore:18000,targetDate:'2026-12-25',scoreType:'total',sessionLength:10,includeUnverified:false};
+export const DEFAULT_SETTINGS:Settings={targetScore:30000,baselineScore:18000,targetDate:'2026-12-25',scoreType:'total',sessionLength:10,includeUnverified:false,autoRecord:true};
 export const EMPTY_CAPTURE:CaptureStatus={state:'idle',phraseCount:0};

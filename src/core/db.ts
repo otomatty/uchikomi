@@ -2,8 +2,9 @@ import { DEFAULT_SETTINGS } from './types';
 import type { AppData, Attempt, Calibration, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
 import { normalizeRoman } from './romaji';
 import { isErrorTerminatedAttempt } from './analytics';
-const DB_NAME='uchikomi-v1', VERSION=2;
-const STORE_NAMES=['phrases','attempts','sessions','settings'] as const;
+import { compatibleAttemptWithPhrase, compatiblePhraseAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
+const DB_NAME='uchikomi-v1', VERSION=3;
+const STORE_NAMES=['phrases','attempts','sessions','settings','phraseAliases'] as const;
 let database:Promise<IDBDatabase>|undefined;
 const listeners=new Set<()=>void>();
 let channel:BroadcastChannel|undefined;
@@ -31,6 +32,8 @@ function db():Promise<IDBDatabase> {
         if(!attempts.indexNames.contains('sessionId'))attempts.createIndex('sessionId','sessionId');
         if(!result.objectStoreNames.contains('sessions'))result.createObjectStore('sessions',{keyPath:'id'});
         if(!result.objectStoreNames.contains('settings'))result.createObjectStore('settings');
+        const aliases=result.objectStoreNames.contains('phraseAliases')?tx.objectStore('phraseAliases'):result.createObjectStore('phraseAliases',{keyPath:'id'});
+        if(!aliases.indexNames.contains('phraseId'))aliases.createIndex('phraseId','phraseId');
         if(event.oldVersion>0&&event.oldVersion<2){
           // The versionchange transaction commits all converted scores/settings
           // together. Phrase images and physical input records are untouched.
@@ -43,6 +46,13 @@ function db():Promise<IDBDatabase> {
           stored.onsuccess=()=>{
             if(stored.result===undefined)return;
             try{settings.put(migrateSettingsToTotal({...DEFAULT_SETTINGS,...stored.result}),'main');}catch(error){abort(error);}
+          };
+        }
+        if(event.oldVersion>0&&event.oldVersion<3){
+          const rows=tx.objectStore('phrases').getAll();
+          rows.onsuccess=()=>{
+            const values=rows.result as Phrase[];
+            void consolidatePhrases(tx,values,new Map(values.map(phrase=>[phrase.id,phrase]))).catch(abort);
           };
         }
       }catch(error){abort(error);}
@@ -61,49 +71,90 @@ export async function getData():Promise<AppData> {
   ]);await done;
   return {phrases:phrases.sort((a,b)=>b.lastSeenAt-a.lastSeenAt),attempts:attempts.sort((a,b)=>a.startedAt-b.startedAt),sessions:sessions.sort((a,b)=>a.startedAt-b.startedAt),settings:{...DEFAULT_SETTINGS,...settings}};
 }
-function samePhrase(a:Phrase,b:Phrase):boolean {
-  const text=(s:string)=>s.normalize('NFKC').replace(/\s+/g,'');
-  return text(a.text)===text(b.text)&&((a.reading&&b.reading&&text(a.reading)===text(b.reading))||normalizeRoman(a.roman)===normalizeRoman(b.roman));
+/** Auto-discovery reads only preferences, never the growing image/history stores. */
+export async function getSettings():Promise<Settings> {
+  const database=await db(),tx=database.transaction('settings','readonly'),done=complete(tx);
+  const settings=await request<Settings|undefined>(tx.objectStore('settings').get('main'));await done;
+  return {...DEFAULT_SETTINGS,...settings};
+}
+interface Consolidation {phrases:Phrase[];bySource:Map<string,Phrase>;}
+async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<string,Phrase>,changedIds?:ReadonlySet<string>,replacedAttemptIds?:ReadonlySet<string>):Promise<Consolidation> {
+  const groups=groupDuplicatePhrases(rows),phrases:Phrase[]=[],bySource=new Map<string,Phrase>();
+  const plans=groups.map(group=>{
+    // Existing IDs stay stable when a fresh capture or an older backup arrives.
+    const existing=group.filter(phrase=>previous.has(phrase.id)).sort((a,b)=>a.capturedAt-b.capturedAt||a.id.localeCompare(b.id));
+    const merged=validatePhrase(mergePhraseGroup(group,existing[0]?.id));
+    phrases.push(merged);
+    for(const source of phraseSeenSources(merged)){
+      const owner=bySource.get(source.id);
+      if(owner&&owner.id!==merged.id)throw new Error('同じ元IDに異なる語句があるため、統合できません。');
+      bySource.set(source.id,merged);
+    }
+    bySource.set(merged.id,merged);
+    return {group,merged};
+  });
+  const store=tx.objectStore('phrases'),attempts=tx.objectStore('attempts'),aliases=tx.objectStore('phraseAliases');
+  for(const {group,merged} of plans){
+    if(changedIds&&group.length===1&&!changedIds.has(group[0].id))continue;
+    store.put(merged);
+    for(const source of phraseSeenSources(merged))aliases.put({id:source.id,phraseId:merged.id});
+    aliases.put({id:merged.id,phraseId:merged.id});
+    for(const member of group){
+      if(member.id!==merged.id)store.delete(member.id);
+      const before=previous.get(member.id)??member;
+      if(member.id===merged.id&&!spellingChanged(before,merged))continue;
+      const history=await request<Attempt[]>(attempts.index('phraseId').getAll(member.id));
+      for(const attempt of history){
+        const reliable=attempt.reliable&&(replacedAttemptIds?.has(attempt.id)||compatiblePhraseAttempt(before,merged,attempt));
+        if(attempt.phraseId!==merged.id||reliable!==attempt.reliable)attempts.put({...attempt,phraseId:merged.id,reliable});
+      }
+    }
+  }
+  return {phrases,bySource};
 }
 export async function savePhrase(value:Phrase):Promise<Phrase> {
-  const phrase=validatePhrase(value),database=await db(),tx=database.transaction(['phrases','attempts'],'readwrite'),done=complete(tx),store=tx.objectStore('phrases');
-  const all=await request<Phrase[]>(store.getAll()),existing=all.find(p=>p.id===phrase.id)??all.find(p=>samePhrase(p,phrase));
-  const result:Phrase=existing?{...phrase,...(existing.verified?existing:{}),id:existing.id,verified:existing.verified||phrase.verified,
-    capturedAt:Math.min(existing.capturedAt,phrase.capturedAt),lastSeenAt:Math.max(existing.lastSeenAt,phrase.lastSeenAt),
-    confidence:Math.max(existing.confidence,phrase.confidence),seenCount:existing.id===phrase.id?Math.max(existing.seenCount,phrase.seenCount):existing.seenCount+Math.max(1,phrase.seenCount),
-    screenshot:phrase.screenshot??existing.screenshot,tags:[...new Set([...(existing.tags??[]),...(phrase.tags??[])])]}:phrase;
-  store.put(result);
-  if(existing&&spellingChanged(existing,result))await invalidatePhraseAttempts(tx.objectStore('attempts'),existing.id);
-  await done;notify();return result;
+  const phrase=validatePhrase(value),database=await db(),tx=database.transaction(['phrases','attempts','phraseAliases'],'readwrite'),done=complete(tx),store=tx.objectStore('phrases');
+  try{
+    const all=await request<Phrase[]>(store.getAll()),previous=new Map(all.map(row=>[row.id,row]));
+    const sameId=all.find(row=>row.id===phrase.id||row.seenSources?.some(source=>source.id===phrase.id));
+    const matches=sameId?[]:groupDuplicatePhrases([...all,phrase]).find(group=>group.includes(phrase))!.filter(row=>row!==phrase);
+    const existing=sameId??(matches.length===1?matches[0]:undefined);
+    const next=existing?mergePhraseGroup([existing,phraseSnapshot(existing,phrase)],existing.id,existing.verified?existing:undefined,phrase.source!=='capture'):phrase;
+    const rows=existing?all.map(row=>row.id===existing.id?next:row):[...all,next];
+    const result=await consolidatePhrases(tx,rows,previous,new Set([next.id]));
+    await done;notify();return result.bySource.get(phrase.id)!;
+  }catch(error){try{tx.abort();}catch{}await done.catch(()=>{});throw error;}
 }
 function spellingChanged(before:Phrase,after:Phrase):boolean {
   return normalizeRoman(before.roman)!==normalizeRoman(after.roman)||before.reading.normalize('NFKC')!==after.reading.normalize('NFKC');
 }
-async function invalidatePhraseAttempts(store:IDBObjectStore,phraseId:string,replacedIds?:ReadonlySet<string>):Promise<void> {
-  const attempts=await request<Attempt[]>(store.index('phraseId').getAll(phraseId));
-  // Preserve history but do not attribute old measurements to the newly corrected reading.
-  for(const attempt of attempts)if(attempt.reliable&&!replacedIds?.has(attempt.id))store.put({...attempt,reliable:false});
-}
-export async function updatePhrase(id:string,patch:Partial<Phrase>):Promise<void> {
-  const database=await db(),tx=database.transaction(['phrases','attempts'],'readwrite'),done=complete(tx),store=tx.objectStore('phrases');
-  const existing=await request<Phrase|undefined>(store.get(id));
-  if(!existing){await done;throw new Error('語句が見つかりません。');}
-  let next:Phrase;try{next=validatePhrase({...existing,...patch,id:existing.id});}catch(error){tx.abort();await done.catch(()=>{});throw error;}
-  store.put(next);
-  if(spellingChanged(existing,next))await invalidatePhraseAttempts(tx.objectStore('attempts'),existing.id);
-  await done;notify();
+export async function updatePhrase(id:string,patch:Partial<Phrase>):Promise<Phrase> {
+  const database=await db(),tx=database.transaction(['phrases','attempts','phraseAliases'],'readwrite'),done=complete(tx),store=tx.objectStore('phrases');
+  try{
+    const rows=await request<Phrase[]>(store.getAll()),existing=rows.find(row=>row.id===id||row.seenSources?.some(source=>source.id===id));
+    if(!existing)throw new Error('語句が見つかりません。');
+    const next=validatePhrase({...existing,...patch,id:existing.id});
+    const result=await consolidatePhrases(tx,rows.map(row=>row.id===existing.id?next:row),new Map(rows.map(row=>[row.id,row])),new Set([existing.id]));
+    await done;notify();return result.bySource.get(existing.id)!;
+  }catch(error){try{tx.abort();}catch{}await done.catch(()=>{});throw error;}
 }
 export async function deletePhrase(id:string):Promise<void> {
-  const database=await db(),tx=database.transaction(['phrases','attempts'],'readwrite'),done=complete(tx);
-  tx.objectStore('phrases').delete(id);
-  const attempts=tx.objectStore('attempts'),keys=await request<IDBValidKey[]>(attempts.index('phraseId').getAllKeys(id));
-  for(const key of keys)attempts.delete(key);await done;notify();
+  const database=await db(),tx=database.transaction(['phrases','attempts','phraseAliases'],'readwrite'),done=complete(tx);
+  const aliases=tx.objectStore('phraseAliases'),alias=await request<{phraseId:string}|undefined>(aliases.get(id)),canonical=alias?.phraseId??id;
+  tx.objectStore('phrases').delete(canonical);
+  const attempts=tx.objectStore('attempts'),keys=await request<IDBValidKey[]>(attempts.index('phraseId').getAllKeys(canonical));
+  for(const key of keys)attempts.delete(key);
+  const aliasKeys=await request<IDBValidKey[]>(aliases.index('phraseId').getAllKeys(canonical));for(const key of aliasKeys)aliases.delete(key);
+  await done;notify();
 }
 export async function saveAttempt(value:Attempt):Promise<void> {
-  const attempt=validateAttempt(value),database=await db(),tx=database.transaction(['attempts','phrases'],'readwrite'),done=complete(tx);
-  const phrase=await request(tx.objectStore('phrases').get(attempt.phraseId));
+  const attempt=validateAttempt(value),database=await db(),tx=database.transaction(['attempts','phrases','phraseAliases'],'readwrite'),done=complete(tx);
+  const alias=await request<{phraseId:string}|undefined>(tx.objectStore('phraseAliases').get(attempt.phraseId));
+  const phrase=await request<Phrase|undefined>(tx.objectStore('phrases').get(alias?.phraseId??attempt.phraseId));
   if(!phrase){tx.abort();await done.catch(()=>{});throw new Error('語句を保存してから練習結果を保存してください。');}
-  tx.objectStore('attempts').put(attempt);await done;notify();
+  const compatible=attempt.judgements?compatibleAttemptWithPhrase(phrase,attempt):phrase.id===attempt.phraseId;
+  const result={...attempt,phraseId:phrase.id,reliable:attempt.reliable&&compatible};
+  tx.objectStore('attempts').put(result);await done;notify();
 }
 export async function saveSession(value:Session):Promise<void> {
   // An explicit edit replaces the previous derived total along with its score.
@@ -182,21 +233,42 @@ export async function clearData():Promise<void> {
 export async function importData(value:unknown):Promise<void> {
   // Validate every byte-bound field before opening a write transaction: malformed imports make no partial writes.
   const imported=validateImport(value),database=await db(),tx=database.transaction([...STORE_NAMES],'readwrite'),done=complete(tx);
-  const [currentPhrases,currentSessions]=await Promise.all([request<Phrase[]>(tx.objectStore('phrases').getAll()),request<Session[]>(tx.objectStore('sessions').getAll())]);
-  const phraseIds=new Set([...currentPhrases,...imported.phrases].map(p=>p.id)),sessionIds=new Set([...currentSessions,...imported.sessions].map(s=>s.id));
-  if(imported.attempts.some(a=>!phraseIds.has(a.phraseId)||!sessionIds.has(a.sessionId))){tx.abort();await done.catch(()=>{});throw new Error('参照する語句・セッションが見つからないデータです。');}
-  const previousPhrases=new Map(currentPhrases.map(phrase=>[phrase.id,phrase]));
-  const replacedAttemptIds=new Set(imported.attempts.map(attempt=>attempt.id));
-  for(const phrase of imported.phrases){
-    const previous=previousPhrases.get(phrase.id);
-    // A merge can change the reading while retaining older measurements. Only
-    // retained attempts need invalidation; imported replacements have new data.
-    if(previous&&spellingChanged(previous,phrase))await invalidatePhraseAttempts(tx.objectStore('attempts'),phrase.id,replacedAttemptIds);
-    tx.objectStore('phrases').put(phrase);
-  }
-  for(const attempt of imported.attempts)tx.objectStore('attempts').put(attempt);
-  for(const session of imported.sessions)tx.objectStore('sessions').put(session);
-  tx.objectStore('settings').put(imported.settings,'main');await done;notify();
+  try{
+    const [currentPhrases,currentSessions]=await Promise.all([request<Phrase[]>(tx.objectStore('phrases').getAll()),request<Session[]>(tx.objectStore('sessions').getAll())]);
+    const phraseIds=new Set([...currentPhrases,...imported.phrases].flatMap(phrase=>[phrase.id,...phraseSeenSources(phrase).map(source=>source.id)])),sessionIds=new Set([...currentSessions,...imported.sessions].map(s=>s.id));
+    if(imported.attempts.some(a=>!phraseIds.has(a.phraseId)||!sessionIds.has(a.sessionId)))throw new Error('参照する語句・セッションが見つからないデータです。');
+    const previousPhrases=new Map(currentPhrases.map(phrase=>[phrase.id,phrase])),working=new Map(previousPhrases),sourceOwners=new Map<string,string>();
+    for(const phrase of currentPhrases)for(const source of phraseSeenSources(phrase))sourceOwners.set(source.id,phrase.id);
+    const changedIds=new Set<string>(),replacedAttemptIds=new Set(imported.attempts.map(attempt=>attempt.id));
+    for(const phrase of imported.phrases){
+      const previous=working.get(sourceOwners.get(phrase.id)??phrase.id);
+      let next=phrase;
+      if(previous){
+        // Replaying an old merged ID may add evidence, but cannot downgrade a
+        // subsequently verified spelling. Explicit canonical-ID edits retain
+        // the import's existing replacement semantics.
+        const keepVerified=previous.id!==phrase.id&&previous.verified;
+        // Legacy backup rows carry counts for their original ID; unlike a
+        // savePhrase(canonicalSnapshot), they are not aggregate-count updates.
+        // A canonical backup already carries its finite original-image archive,
+        // so replaying it must not archive the current live preview again.
+        const canonicalSnapshot=phrase.id===previous.id&&phrase.seenSources!==undefined;
+        next={...mergePhraseGroup([previous,phrase],previous.id,keepVerified?previous:phrase,!canonicalSnapshot),verified:keepVerified||phrase.verified};
+      }
+      working.set(next.id,next);changedIds.add(next.id);
+      for(const source of phraseSeenSources(next))sourceOwners.set(source.id,next.id);
+    }
+    const consolidated=await consolidatePhrases(tx,[...working.values()],previousPhrases,changedIds,replacedAttemptIds);
+    const importedPhrases=new Map(imported.phrases.map(phrase=>[phrase.id,phrase]));
+    for(const attempt of imported.attempts){
+      const target=consolidated.bySource.get(attempt.phraseId)!;
+      const before=importedPhrases.get(attempt.phraseId)??previousPhrases.get(attempt.phraseId)??currentPhrases.find(phrase=>phrase.seenSources?.some(source=>source.id===attempt.phraseId));
+      const reliable=attempt.reliable&&(before?compatiblePhraseAttempt(before,target,attempt):attempt.phraseId===target.id||compatibleAttemptWithPhrase(target,attempt));
+      tx.objectStore('attempts').put({...attempt,phraseId:target.id,reliable});
+    }
+    for(const session of imported.sessions)tx.objectStore('sessions').put(session);
+    tx.objectStore('settings').put(imported.settings,'main');await done;notify();
+  }catch(error){try{tx.abort();}catch{}await done.catch(()=>{});throw error;}
 }
 function object(value:unknown,label:string):Record<string,unknown> {
   if(!value||typeof value!=='object'||Array.isArray(value))throw new Error(`${label}の形式が正しくありません。`);return value as Record<string,unknown>;
@@ -224,6 +296,12 @@ function validatePhrase(value:unknown):Phrase {
   if(result.roman&&!/^[\x21-\x7e]+$/.test(result.roman))throw new Error('ローマ字は半角英数・記号で入力してください。');
   if(result.verified&&!result.roman)throw new Error('確認済みの語句にはローマ字が必要です。');
   if(p.screenshot!==undefined)result.screenshot=imageData(p.screenshot,'画像');
+  if(p.screenshots!==undefined)result.screenshots=list(p.screenshots,'保存画像',1000).map(value=>imageData(value,'画像'));
+  if(new Set([...(result.screenshot?[result.screenshot]:[]),...(result.screenshots??[])]).size>1000)throw new Error('保存画像の件数が多すぎます。');
+  if(p.seenSources!==undefined){
+    result.seenSources=list(p.seenSources,'出題元',100000).map(value=>{const entry=object(value,'出題元');return {id:identifier(entry.id),count:number(entry.count,'出題回数',0,1000000)};});
+    if(new Set(result.seenSources.map(source=>source.id)).size!==result.seenSources.length||!result.seenSources.some(source=>source.id===result.id)||result.seenSources.reduce((sum,source)=>sum+source.count,0)!==result.seenCount)throw new Error('出題元と出題回数が一致しません。');
+  }
   if(p.tags!==undefined)result.tags=list(p.tags,'タグ',20).map(x=>text(x,'タグ',60));
   return result;
 }
@@ -340,7 +418,7 @@ function validateRect(value:unknown):Rect {
 function validateSettings(value:unknown):Settings {
   const s=object(value,'設定');const targetDate=text(s.targetDate,'目標日',10);
   if(!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)||!Number.isFinite(Date.parse(targetDate))||new Date(`${targetDate}T00:00:00Z`).toISOString().slice(0,10)!==targetDate)throw new Error('目標日を確認してください。');
-  const result:Settings={targetScore:number(s.targetScore,'目標スコア',1,10000000),baselineScore:number(s.baselineScore,'開始時のスコア',-10000,10000000),targetDate,scoreType:scoreType(s.scoreType),sessionLength:Math.round(number(s.sessionLength,'復習語句数',1,100)),includeUnverified:bool(s.includeUnverified,'未確認語句の設定')};
+  const result:Settings={targetScore:number(s.targetScore,'目標スコア',1,10000000),baselineScore:number(s.baselineScore,'開始時のスコア',-10000,10000000),targetDate,scoreType:scoreType(s.scoreType),sessionLength:Math.round(number(s.sessionLength,'復習語句数',1,100)),includeUnverified:bool(s.includeUnverified,'未確認語句の設定'),autoRecord:s.autoRecord===undefined?true:bool(s.autoRecord,'自動記録の設定')};
   if(s.calibration!==undefined){const c=object(s.calibration,'読取範囲');const calibration:Calibration={japanese:validateRect(c.japanese),roman:validateRect(c.roman),updatedAt:number(c.updatedAt,'設定時刻')};if(c.reading!==undefined)calibration.reading=validateRect(c.reading);if(c.viewport!==undefined){const v=object(c.viewport,'画面サイズ');calibration.viewport={width:number(v.width,'画面の幅',1,20000),height:number(v.height,'画面の高さ',1,20000)};}result.calibration=calibration;}
   return result;
 }

@@ -85,14 +85,23 @@ try {
     // Chrome's supported extension-testing API needs an explicit opt-in. Playwright
     // supplies --remote-debugging-pipe itself. This is an isolated, disposable profile.
     // https://github.com/GoogleChrome/chrome-launcher/blob/main/test/load-extension-test.ts
-    args: ['--no-sandbox', '--enable-unsafe-extension-debugging'],
+    // Software rendering also exercises an actual WebGL drawing buffer on
+    // GPU-less CI runners; these flags are confined to this disposable browser.
+    args: ['--no-sandbox', '--enable-unsafe-extension-debugging', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
     viewport: { width: 1440, height: 1000 },
     acceptDownloads: true,
   });
   // All website requests are blocked; only the independent local fixture is served.
   const fixture = await readFile(path.join(root, 'tests/capture-fixture.html'), 'utf8');
+  let activeFixture = fixture;
+  let canvasFixture = await readFile(path.join(root, 'tests/canvas-capture-fixture.html'), 'utf8');
+  for (const kind of ['reading', 'japanese', 'roman']) {
+    const png = await readFile(path.join(root, `tests/ocr-fixtures/${kind}.png`));
+    canvasFixture = canvasFixture.replace(`__UCHI_${kind.toUpperCase()}_PNG__`, `data:image/png;base64,${png.toString('base64')}`);
+  }
+  assert.ok(!canvasFixture.includes('__UCHI_'), 'Unresolved WebGL fixture image');
   await context.route(/^https?:\/\//, async route => {
-    if (route.request().url() === 'https://sushida.net/play.html') return route.fulfill({ contentType: 'text/html; charset=utf-8', body: fixture });
+    if (route.request().url() === 'https://sushida.net/play.html') return route.fulfill({ contentType: 'text/html; charset=utf-8', body: activeFixture });
     return route.abort('blockedbyclient');
   });
   context.on('weberror', event => report.browserErrors.push(event.error().message));
@@ -137,7 +146,11 @@ try {
     const data = await app.evaluate(() => window.UchiQA.getData());
     assert.equal(data.phrases.length, 0); assert.equal(data.attempts.length, 0); assert.equal(data.sessions.length, 0);
     assert.equal(data.settings.targetScore, 30000); assert.equal(data.settings.targetDate, '2026-12-25');
+    assert.equal(data.settings.autoRecord, true, 'Automatic recording must be enabled by default');
     assert.ok((await app.locator('body').innerText()).includes('UCHIKOMI'));
+    // The original screenshot/layout fixtures are not live capture tests. Keep
+    // their data unchanged; a separate WebGL check below exercises the default.
+    await app.evaluate(() => window.UchiQA.updateSettings({ autoRecord: false }));
   });
   await run('Desktop layout and keyboard focus', async () => {
     assert.ok(await app.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'desktop overflow');
@@ -187,7 +200,7 @@ try {
   const now = Date.now();
   const imported = {
     version: 1, exportedAt: now,
-    settings: { targetScore: 30000, baselineScore: 18000, targetDate: '2026-12-25', scoreType: 'total', sessionLength: 10, includeUnverified: false },
+    settings: { targetScore: 30000, baselineScore: 18000, targetDate: '2026-12-25', scoreType: 'total', sessionLength: 10, includeUnverified: false, autoRecord: false },
     phrases: [
       { id: 'qa-phrase-1', text: 'テスト用のペアルック', reading: 'ぺあるっく', roman: 'pearukku', source: 'manual', confidence: 100, verified: true, capturedAt: now, lastSeenAt: now, seenCount: 1 },
       { id: 'qa-phrase-2', text: 'テスト用の写真', reading: 'しゃしん', roman: 'syasinn', source: 'manual', confidence: 100, verified: true, capturedAt: now, lastSeenAt: now, seenCount: 1 },
@@ -462,7 +475,7 @@ try {
       req.onsuccess=()=>{clearTimeout(timer);const version=req.result.version;req.result.close();resolve(version);};
       req.onerror=()=>{clearTimeout(timer);reject(req.error);};
     }));
-    assert.equal(version,2);assert.match(await app.locator('.goal-bottom').innerText(),/29,740/);
+    assert.equal(version,3);assert.match(await app.locator('.goal-bottom').innerText(),/29,740/);
     await app.getByTestId('nav-growth').click();
     assert.match(await app.locator('.score-chart svg').getAttribute('aria-label'),/29740円/);
     assert.match(await app.locator('.chart-card').innerText(),/食べた金額の合計/);
@@ -471,6 +484,223 @@ try {
     assert.doesNotMatch(await app.locator('body').innerText(),/お得|利益|profit/i);
     await app.screenshot({animations:'disabled',path:path.join(output,'database-migrated.png'),fullPage:true});
     report.databaseMigration={from:1,to:version,reloads:2,phrases:expected.phrases.length,attempts:expected.attempts.length,sessions:expected.sessions.length,total:29740,reviewTotal:15000};
+  });
+  await run('Duplicate keywords consolidate histories and preserve counts when the old backup is replayed', async () => {
+    const before = await app.evaluate(() => window.UchiQA.getData());
+    // This check exercises real Chrome IndexedDB import transactions and
+    // readback. The direct version-2-to-3 upgrade is covered by Node regressions.
+    const duplicateBackup = await app.evaluate(async () => {
+      const data = await window.UchiQA.getData(), at = Date.now() - 10000;
+      const images = ['#b9563b', '#597763'].map(color => {
+        const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 12;
+        const ctx = canvas.getContext('2d'); ctx.fillStyle = color; ctx.fillRect(0, 0, 24, 12);
+        return canvas.toDataURL('image/png');
+      });
+      const base = { text: '統合の確認', reading: 'とうごうのかくにん', roman: 'tougounokakuninn', verified: true };
+      const phrases = [
+        { ...base, id: 'qa-duplicate-capture', source: 'capture', confidence: 95, verified: false, capturedAt: at, lastSeenAt: at + 1000, seenCount: 3, screenshot: images[0] },
+        { ...base, id: 'qa-duplicate-manual', source: 'manual', confidence: 100, capturedAt: at + 1000, lastSeenAt: at + 2000, seenCount: 4, screenshot: images[1] },
+      ];
+      const session = { id: 'qa-duplicate-session', startedAt: at + 3000, endedAt: at + 9000, source: 'practice', scoreType: 'total',
+        course: 10000, mode: 'accuracy', phraseCount: 2, correctKeys: 0, mistakes: 0, durationMs: 6000 };
+      const attempts = phrases.map((phrase, index) => {
+        const startedAt = at + 3500 + index * 2000;
+        const strokes = [...phrase.roman].map((key, index) => ({ key, at: startedAt + (index + 1) * 80 }));
+        return { ...window.UchiQA.buildAttempt({ phrase, strokes, startedAt, endedAt: strokes.at(-1).at + 80,
+          sessionId: session.id, source: 'practice', complete: true, reliable: true }), id: `qa-duplicate-attempt-${index}` };
+      });
+      session.correctKeys = attempts.reduce((sum, attempt) => sum + attempt.correctKeys, 0);
+      return { version: 1, settings: data.settings, phrases, attempts, sessions: [session] };
+    });
+    assert.ok(duplicateBackup.attempts.every(attempt => attempt.complete && attempt.reliable));
+    assert.ok(duplicateBackup.phrases.every(phrase => !before.phrases.some(existing => existing.id === phrase.id || existing.text === phrase.text)),
+      'The duplicate fixture must be independent of previously saved words');
+    await app.evaluate(value => window.UchiQA.importData(value), duplicateBackup);
+    const merged = await app.evaluate(() => window.UchiQA.getData());
+    const rows = merged.phrases.filter(phrase => phrase.text === '統合の確認');
+    assert.equal(rows.length, 1); const canonical = rows[0];
+    assert.equal(canonical.seenCount, 7);
+    assert.equal(canonical.capturedAt, duplicateBackup.phrases[0].capturedAt);
+    assert.equal(canonical.lastSeenAt, duplicateBackup.phrases[1].lastSeenAt);
+    const retainedImages = [...new Set([canonical.screenshot, ...(canonical.screenshots ?? [])])];
+    assert.deepEqual(retainedImages.sort(), duplicateBackup.phrases.map(phrase => phrase.screenshot).sort());
+    assert.equal(merged.phrases.length, before.phrases.length + 1);
+    assert.equal(merged.attempts.length, before.attempts.length + 2);
+    assert.equal(merged.sessions.length, before.sessions.length + 1);
+    for (const attempt of duplicateBackup.attempts) {
+      assert.deepEqual(merged.attempts.find(value => value.id === attempt.id), { ...attempt, phraseId: canonical.id },
+        'Consolidation must preserve all judgements and intervals under the canonical keyword');
+    }
+    assert.deepEqual(merged.sessions.find(session => session.id === duplicateBackup.sessions[0].id), duplicateBackup.sessions[0]);
+    assert.deepEqual(merged.settings, before.settings);
+    for (const kind of ['phrases', 'attempts', 'sessions']) for (const existing of before[kind]) {
+      assert.deepEqual(merged[kind].find(row => row.id === existing.id), existing, `Consolidation changed existing ${kind}`);
+    }
+    await app.getByTestId('nav-phrases').click();
+    await app.getByRole('textbox', { name: 'キーワードを検索', exact: true }).fill('統合の確認');
+    await app.waitForFunction(() => {
+      const rows = document.querySelectorAll('[data-testid="phrase-row"]');
+      return rows.length === 1 && rows[0].textContent.includes('統合の確認');
+    }, null, { polling: 100 });
+    assert.equal(await app.getByTestId('phrase-row').count(), 1);
+    assert.match(await app.getByTestId('phrase-row').innerText(), /統合の確認/);
+    await app.screenshot({ animations: 'disabled', path: path.join(output, 'keywords-consolidated.png'), fullPage: true });
+    const ordered = data => ({ ...data, phrases: [...data.phrases].sort((a, b) => a.id.localeCompare(b.id)),
+      attempts: [...data.attempts].sort((a, b) => a.id.localeCompare(b.id)), sessions: [...data.sessions].sort((a, b) => a.id.localeCompare(b.id)) });
+    await app.reload(); await app.getByTestId('app-shell').waitFor();
+    await app.addScriptTag({ url: `chrome-extension://${extensionId}/qa-harness.js` });
+    assert.deepEqual(ordered(await app.evaluate(() => window.UchiQA.getData())), ordered(merged), 'Reload changed consolidated data');
+    await app.evaluate(value => window.UchiQA.importData(value), duplicateBackup);
+    assert.deepEqual(ordered(await app.evaluate(() => window.UchiQA.getData())), ordered(merged),
+      'Replaying the original IDs must not add words, attempts, images or occurrence counts');
+    await app.getByRole('textbox', { name: 'キーワードを検索', exact: true }).fill('統合の確認');
+    await app.waitForFunction(() => {
+      const rows = document.querySelectorAll('[data-testid="phrase-row"]');
+      return rows.length === 1 && rows[0].textContent.includes('統合の確認');
+    }, null, { polling: 100 });
+    assert.equal(await app.getByTestId('phrase-row').count(), 1);
+    report.keywordConsolidation = { scope: 'Real Chrome IndexedDB import and readback; v2-to-v3 duplicate migration is a separate Node regression',
+      canonicalId: canonical.id, oldIds: duplicateBackup.phrases.map(phrase => phrase.id), keywords: 1, seenCount: 7,
+      histories: 2, retainedImages: retainedImages.length, reloads: 1, oldBackupReimports: 1, existingRecordsPreserved: true };
+  });
+  await run('Opening a live WebGL game automatically records, pauses on hide, and respects manual pause', async () => {
+    let game, panel;
+    const result = report.automaticCanvas = { preserveDrawingBuffer: false, phases: {} };
+    const send = type => app.evaluate(type => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${type} did not respond within 30 seconds`)), 30000);
+      chrome.runtime.sendMessage({ type }).then(reply => { clearTimeout(timer); resolve(reply); }, error => { clearTimeout(timer); reject(error); });
+    }), type);
+    const readStatus = async () => {
+      const reply = await send('UCHI_STATUS');
+      assert.equal(reply?.ok, true, 'The real background status handler failed');
+      assert.notEqual(reply.status?.state, 'error', reply.status?.message || 'Automatic capture failed');
+      return reply.status;
+    };
+    const poll = async (label, read, accept, timeout = 45000) => {
+      const deadline = Date.now() + timeout; let last;
+      do {
+        last = await read(); if (accept(last)) return last;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      } while (Date.now() < deadline);
+      throw new Error(`${label} timed out; last observation: ${JSON.stringify(last)}`);
+    };
+    const waitRecording = label => poll(label, readStatus, state => state.state === 'recording' && state.source === 'canvas' && state.lastFrameAt >= state.startedAt);
+    const assertPaused = async label => {
+      // Observe for longer than the content observer's discovery interval, so
+      // a delayed, unwanted restart cannot pass an immediate idle assertion.
+      const deadline = Date.now() + 3500;
+      do {
+        assert.equal((await readStatus()).state, 'idle', label);
+        await new Promise(resolve => setTimeout(resolve, 250));
+      } while (Date.now() < deadline);
+    };
+    try {
+      await app.bringToFront();
+      await app.getByTestId('nav-dashboard').click();
+      panel = await context.newPage();
+      await panel.setViewportSize({ width: 360, height: 900 });
+      await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+      await panel.getByTestId('capture-card').waitFor();
+      await app.evaluate(() => window.UchiQA.updateSettings({ autoRecord: true }));
+      activeFixture = canvasFixture;
+      game = await context.newPage();
+      await game.goto('https://sushida.net/play.html');
+      await game.bringToFront();
+      await game.waitForFunction(() => window.canvasFixture?.ready && window.canvasFixture.frames > 2 && !document.hidden);
+      result.fixture = await game.evaluate(() => ({
+        title: document.title,
+        contextAttributes: window.canvasFixture.contextAttributes,
+        frames: window.canvasFixture.frames,
+        visible: !document.hidden,
+        canvasCount: document.querySelectorAll('canvas').length,
+      }));
+      assert.equal(result.fixture.contextAttributes.preserveDrawingBuffer, false);
+      assert.equal(result.fixture.canvasCount, 1, 'Only the live WebGL surface belongs in the page');
+      // No extension action, capture permission grant, start button, or UCHI_START.
+      // evaluate() observes the background extension tab without activating it.
+      const first = result.phases.opened = await waitRecording('Automatic canvas recording');
+      assert.ok(first.sessionId && first.documentToken);
+      result.phases.recognized = await poll('The new capture recognizes its first keyword', readStatus,
+        state => state.sessionId === first.sessionId && state.phraseCount >= 1 && state.latestPhrase === 'ペアルック', 90000);
+      result.phrase = await poll('A real OCR phrase saved to IndexedDB', () => app.evaluate(async startedAt => {
+        const data = await window.UchiQA.getData();
+        const phrase = data.phrases.find(p => p.source === 'capture' && p.text === 'ペアルック' && p.lastSeenAt >= startedAt);
+        return phrase ? { id: phrase.id, text: phrase.text, reading: phrase.reading, roman: phrase.roman, source: phrase.source,
+          confidence: phrase.confidence, seenCount: phrase.seenCount, lastSeenAt: phrase.lastSeenAt, hasImage: !!phrase.screenshot } : null;
+      }, first.startedAt), phrase => !!phrase, 90000);
+      assert.equal(result.phrase.reading, 'ぺあるっく'); assert.equal(result.phrase.roman, 'pearukku');
+      assert.equal(result.phrase.source, 'capture'); assert.equal(result.phrase.hasImage, true);
+      assert.ok(result.phrase.lastSeenAt >= first.startedAt, 'An older saved keyword cannot satisfy the live OCR check');
+      const firstGame = await poll('A real captured game saved to IndexedDB', () => app.evaluate(async captureId => {
+        const data = await window.UchiQA.getData();
+        return data.sessions.find(session => session.captureId === captureId) ?? null;
+      }, first.sessionId), session => session?.phraseCount >= 1);
+      assert.equal(firstGame.source, 'capture'); assert.equal(firstGame.scoreType, 'total');
+      assert.equal(firstGame.course, 10000); assert.equal(firstGame.mode, 'accuracy');
+      result.phases.freshFrames = await poll('Continuing live frames', readStatus, state => state.sessionId === first.sessionId && state.lastFrameAt > first.lastFrameAt);
+
+      await panel.waitForFunction(() => !!document.querySelector('.capture-dot.on'), null, { polling: 250, timeout: 20000 });
+      result.quietIndicator = await panel.evaluate(() => {
+        const dot = document.querySelector('.capture-dot.on'), region = document.querySelector('.region-symbol');
+        return { animationName: getComputedStyle(dot).animationName, boxShadow: getComputedStyle(dot).boxShadow,
+          regionAnimationName: region ? getComputedStyle(region).animationName : null,
+          waveBars: document.querySelectorAll('.wave-bars').length,
+          label: document.querySelector('.capture-heading')?.textContent, hidden: document.hidden };
+      });
+      assert.equal(result.quietIndicator.animationName, 'none'); assert.equal(result.quietIndicator.boxShadow, 'none');
+      assert.equal(result.quietIndicator.regionAnimationName, 'none'); assert.equal(result.quietIndicator.waveBars, 0);
+      assert.match(result.quietIndicator.label, /記録中/); assert.equal(result.quietIndicator.hidden, true);
+      await app.waitForFunction(() => !!document.querySelector('.session-done .live-dot'), null, { polling: 250, timeout: 20000 });
+      result.quietIndicator.historyAnimations = await app.evaluate(() => [...document.querySelectorAll('.session-done .live-dot')].map(dot => getComputedStyle(dot).animationName));
+      assert.ok(result.quietIndicator.historyAnimations.every(name => name === 'none'));
+      assert.equal(await game.evaluate(() => document.hidden), false, 'Reading extension state must not hide the game');
+      await panel.screenshot({ path: path.join(output, 'automatic-recording-panel.png'), fullPage: true });
+      assert.equal(await game.evaluate(() => document.hidden), false, 'Inspecting the panel must not hide the game');
+      await game.screenshot({ path: path.join(output, 'automatic-webgl-fixture.png') });
+
+      await app.bringToFront();
+      await game.waitForFunction(() => document.hidden, null, { polling: 100 });
+      result.phases.hidden = await poll('Hidden canvas stops recording', readStatus, state => state.state === 'idle');
+      assert.equal(await app.evaluate(async () => (await window.UchiQA.getSettings()).autoRecord), true, 'Hiding a game must keep automatic recording enabled');
+      const ended = await app.evaluate(async id => (await window.UchiQA.getData()).sessions.find(session => session.id === id), firstGame.id);
+      assert.ok(ended?.endedAt, 'Hiding the game must finish the captured session');
+      assert.ok(ended.phraseCount >= 1, 'The recognized keyword must survive automatic stop');
+
+      await game.bringToFront();
+      const visible = result.phases.visible = await waitRecording('Visible canvas automatically resumes');
+      assert.notEqual(visible.sessionId, first.sessionId, 'Returning to the game must create a fresh capture');
+      assert.equal((await send('UCHI_STOP'))?.ok, true);
+      result.phases.paused = await poll('Manual pause stops recording', readStatus, state => state.state === 'idle');
+      assert.equal(await app.evaluate(async () => (await window.UchiQA.getSettings()).autoRecord), false);
+      const pausedIds = await app.evaluate(async () => (await window.UchiQA.getData()).sessions.map(session => session.id).sort());
+      await app.bringToFront();
+      await game.waitForFunction(() => document.hidden, null, { polling: 100 });
+      await game.bringToFront();
+      await assertPaused('Manual pause was lost after the game became visible');
+      await game.reload();
+      await game.waitForFunction(() => window.canvasFixture?.ready && window.canvasFixture.frames > 2 && !document.hidden);
+      await assertPaused('Manual pause was lost after reloading the game');
+      assert.deepEqual(await app.evaluate(async () => (await window.UchiQA.getData()).sessions.map(session => session.id).sort()), pausedIds,
+        'A paused game must not create extra capture sessions');
+
+      assert.equal((await send('UCHI_RESUME'))?.ok, true);
+      const resumed = result.phases.resumed = await waitRecording('Explicit resume restarts the visible canvas');
+      assert.notEqual(resumed.sessionId, visible.sessionId);
+      assert.equal(await app.evaluate(async () => (await window.UchiQA.getSettings()).autoRecord), true);
+      assert.equal(await game.evaluate(() => document.hidden), false);
+      result.openedWithoutCaptureAction = true;
+      result.manualPauseSurvivedVisibilityAndReload = true;
+    } catch (error) {
+      result.failureStatus = await send('UCHI_STATUS').catch(e => ({ error: String(e.message || e) }));
+      if (game && !game.isClosed()) await game.screenshot({ path: path.join(output, 'automatic-webgl-failure.png'), timeout: 5000 }).catch(() => {});
+      throw error;
+    } finally {
+      // Cleanup uses the public pause handler, never a test hook in the product.
+      await send('UCHI_STOP').catch(error => report.errors.push(`Automatic capture cleanup: ${error.message || error}`));
+      if (game && !game.isClosed()) await game.close();
+      if (panel && !panel.isClosed()) await panel.close();
+      activeFixture = fixture;
+    }
   });
   await run('No uncaught application exceptions', async () => assert.deepEqual(report.browserErrors, []));
 } catch (e) {

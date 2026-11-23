@@ -3,8 +3,9 @@ All times are epoch milliseconds; intervals are ms. `Session.score` is the total
 
 core/db.ts exports:
 - getData():Promise<AppData>
+- getSettings():Promise<Settings> (preferences-only read; canvas discovery never loads image/history stores)
 - savePhrase(phrase:Phrase):Promise<Phrase> (upsert/dedupe by text + reading/roman; returns canonical ID)
-- updatePhrase(id:string, patch:Partial<Phrase>):Promise<void>
+- updatePhrase(id:string, patch:Partial<Phrase>):Promise<Phrase> (returns the canonical phrase after editing/consolidation, so immediate practice uses its current ID)
 - deletePhrase(id:string):Promise<void> (cascade attempts)
 - saveAttempt(attempt:Attempt):Promise<void>
 - saveSession(session:Session):Promise<void>
@@ -32,13 +33,24 @@ core/romaji.ts exports:
 
 UI <=> extension runtime messages all names prefixed UCHI_:
 UCHI_STATUS -> {ok:true,status:CaptureStatus}
-UCHI_START -> {ok:true,status} or {ok:false,error}; invoked directly by UI button. Agent handles active/last known sushida tab.
-UCHI_STOP -> {ok:true,status,sessionId?}
+UCHI_START -> {ok:true,status} or {ok:false,error}; explicit manual tabCapture fallback for the active Sushi-da tab, subject to Chrome's user-invocation requirement.
+UCHI_STOP -> {ok:true,status,sessionId?}; persists autoRecord:false, stops media and saves queued records. Does not restart on navigation/visibility changes.
+UCHI_RESUME -> {ok:true,status}; persists autoRecord:true and probes permitted game tabs. A visible canvas starts itself; no tabCapture permission is requested.
 UCHI_FRAME -> {ok:true,frame:FrameSnapshot} (snapshot for calibration, recording active)
 UCHI_CALIBRATE {calibration} -> {ok:true}
 UCHI_OPEN_GAME -> {ok:true} activates/opens official https://sushida.net/play.html
 UCHI_STATE broadcast {status} to UI.
 UI uses db directly for CRUD; service worker/offscreen same origin IndexedDB. Agent may introduce private capture message names freely.
+
+## Automatic visible-canvas recording
+
+`Settings.autoRecord:boolean` defaults to true; backups and stored preferences without it use that default. A user pause is persistent and resume is explicit. Merely hiding/closing/navigating away from the game stops the current capture without changing the preference. No game Session is created until the first detected prompt; reopening a visible game starts a fresh capture rather than extending a partially observed typing interval.
+
+The permitted content script selects the largest visible game canvas and uses the standard origin-clean `captureStream(15)` API. A detached muted video supplies fresh `requestVideoFrameCallback` frames; the script samples at most once per 80 ms with one outstanding JPEG message, capped at 1920×1440. It neither changes the WebGL context nor reads game internals. The game video/audio is not forwarded through tabCapture in the default path. Tainted/muted/ended streams fail closed and need a new visibility event or an explicit retry. Hidden documents do not submit frames or observe keys.
+
+`UCHI_CANVAS_READY {documentToken}` returns `{ok:true,sessionId? ,paused?,busy?}`. The background binds the session to sender tab/frame/document IDs and the per-document token. `UCHI_CANVAS_FRAME {sessionId,documentToken,frame:{dataUrl,width,height,at,sequence}}` is forwarded as `UCHI_OFF_CANVAS_FRAME`; `{ok:true,dropped:true}` acknowledges stale/concurrent frames without reprocessing them. `UCHI_CANVAS_END {sessionId,documentToken,reason}` stops that owner only. Keys, focus gaps and view changes carry the same ownership identity. `UCHI_CANVAS_PROBE` permits rediscovery; `UCHI_CAPTURE_DISABLE` stops the producer and flushes keys. Manual fallback observers retain their key subscription when the tab is temporarily hidden, while excluding hidden/out-of-focus input.
+
+`CaptureStatus.source?:'canvas'|'tab'` describes the active path. Optional `frameId`, `documentId` and `documentToken` belong to the background's owner record; offscreen status updates cannot replace them or revive an old capture. Startup cancellation waits for its transition before draining/closing the offscreen document. Late frames, decoded images and worker notifications cannot attach to a newer session. More than 300 ms without a frame breaks the typing boundary. A repeated or stopped image cannot serve as another independent result-score observation.
 
 ## Detailed keys and personal speed
 
@@ -70,8 +82,18 @@ CaptureStatus adds `activeSessionId`, `latestScore:{sessionId,score,scoreType,co
 
 ## Total-score migration and backup compatibility
 
-The database name remains `uchikomi-v1`; its IndexedDB schema version is now **2**. Opening a version 1 database converts sessions and stored settings in the single versionchange transaction. Object stores and indexes are created only if absent. Phrase records, screenshots, attempts, physical-key details, IDs, links, counters, and timestamps are retained. Connections close on `versionchange`; a blocked open reports the need to close the other UCHIKOMI page. If migration validation fails, the upgrade aborts and the version 1 data remains intact. Reopening a version 2 database does not run the conversion again.
+The database name remains `uchikomi-v1`; its current IndexedDB schema version is **3**. The total-score conversion was introduced in schema 2 and still runs only for databases older than schema 2. Opening a version 1 database converts sessions and stored settings in the single versionchange transaction, together with the phrase consolidation below. Object stores and indexes are created only if absent. Connections close on `versionchange`; a blocked open reports the need to close the other UCHIKOMI page. If migration validation fails, the upgrade aborts and the old database remains intact. Reopening a version 2 or 3 database does not run the monetary conversion again.
 
 Backup format remains `version:1`. Legacy import and the database upgrade use the same conversion: a legacy `scoreType:'profit'` amount becomes `score + course` (the supported course is 10,000 yen); an existing total amount stays unchanged. Pending review candidates follow their own recorded score type. Legacy `scoreProfit` is removed after its corresponding total is checked. Canonical exports contain total-only fields, and reimporting them does not add the course price again. Settings change only their score type: the numeric target, baseline, target date, and all other supported settings are preserved. The defaults remain a 30,000 yen target and an 18,000 yen baseline.
 
 When legacy monetary fields imply different totals, migration does not choose one. It removes the confirmed score and its total alias, and stores a pending review with no prefilled score. Its reason retains every conflicting total plus the converted candidate and reason from any earlier review. Existing review confidence, timestamps, and evidence are retained; the session's separate evidence also remains available. These records stay out of graphs until the user confirms the total. New ordinary writes accept only canonical total values; legacy conversion is confined to upgrade and import.
+
+## Duplicate keywords and accumulated history
+
+Schema 3 consolidates existing duplicate phrases in the versionchange transaction and creates `phraseAliases` (key `id`, index `phraseId`). The same grouping applies when saving, editing or importing phrases. Text is compared after NFKC and whitespace removal; known readings are additionally normalized from katakana to hiragana and must match. Different text, different known readings and approximate OCR matches are not merged. A missing-reading row can join a matching roman spelling only when exactly one known-reading group exists for that text; if there are two known readings, even a single roman match remains separate. Missing readings never connect two different readings.
+
+Existing canonical IDs remain stable when new captures or old backups arrive; otherwise the oldest saved phrase supplies the ID. Verified, complete spelling takes precedence over unverified OCR. Merges retain the earliest/latest observation dates and unique tags. `Phrase.seenSources?:{id:string;count:number}[]` records each original ID's count; repeated snapshots of the same source use its maximum rather than adding again. The sum equals `seenCount`, so importing an old duplicate or the same backup repeatedly does not increase the total. `Phrase.screenshots?:string[]` retains original image evidence from consolidated saved rows/imports. Ordinary repeated captures update the representative `screenshot` without appending a new archived image on every appearance.
+
+Attempts retain their IDs, physical keystrokes, timings and session links; `phraseId` moves to the canonical keyword. Aliases also route delayed attempts from an already-merged ID. Only measurements compatible with the canonical input graph retain `reliable:true`; incompatible records remain inspectable. Session counters and scores are not reduced by consolidation. Word/pattern analytics recompute from the linked eligible history using their existing observation windows; rates are never obtained by summing percentages.
+
+The merged row is validated before writing. A count, tag, image or provenance limit failure aborts the entire transaction instead of dropping records or storing an unexportable aggregate. Export format remains version 1, with the new fields optional; aliases are reconstructed from `seenSources` during import. `clearData()` also clears alias records.

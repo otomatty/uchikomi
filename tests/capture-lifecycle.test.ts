@@ -135,11 +135,12 @@ test('background stop propagates offscreen save failure, cleans up, and permits 
       assert.equal(handler?.({ type: 'UCHI_STOP' }, { id: 'uchikomi-test', url: origin + 'sidepanel.html' }, resolve), true);
     });
   }
-  function resumeRecording(): Promise<any> {
+  let recordingNumber = 0;
+  async function resumeRecording(): Promise<void> {
     exists = true;
-    return new Promise(resolve => {
-      assert.equal(handler?.({ type: 'UCHI_OFF_STATE', status: recording }, { id: 'uchikomi-test', url: origin + 'offscreen.html' }, resolve), true);
-    });
+    // A fresh service worker recovers a real current capture from storage.
+    // A late OFF_STATE message can no longer revive an ended recording.
+    await import(`../src/capture/background.ts?stop-save-${++recordingNumber}`);
   }
 
   const failed = await requestStop();
@@ -225,7 +226,7 @@ test('background drops legacy score notifications without relabelling them or ch
   const id = 'total-status-test', origin = `chrome-extension://${id}/`;
   const ignored = { addListener() {} };
   const legacy = { sessionId: 'previous-game', score: 19740, scoreType: 'profit', confidence: 95 };
-  const stored = { state: 'idle', phraseCount: 8, sessionId: 'bridge', latestScore: legacy };
+  const stored = { state: 'recording', phraseCount: 8, sessionId: 'bridge', tabId: 7, latestScore: legacy };
   let live: any = { ...stored, state: 'recording', tabId: 7 };
   const published: any[] = [];
   let handler: ((message: any, sender: any, reply: (result: any) => void) => unknown) | undefined;
@@ -246,7 +247,7 @@ test('background drops legacy score notifications without relabelling them or ch
     assert.equal(handler?.(message, { id, url: origin + from }, resolve), true);
   });
   const cached = await request({ type: 'UCHI_STATUS' });
-  assert.equal(cached.status.state, 'idle'); assert.equal(cached.status.latestScore, undefined);
+  assert.equal(cached.status.state, 'recording'); assert.equal(cached.status.latestScore, undefined);
   assert.equal(cached.status.phraseCount, 8); assert.equal(cached.status.sessionId, 'bridge');
   await request({ type: 'UCHI_OFF_STATE', status: live }, 'offscreen.html');
   assert.equal(published.at(-1).state, 'recording'); assert.equal(published.at(-1).latestScore, undefined);

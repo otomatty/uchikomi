@@ -24,9 +24,15 @@
 .capture-region div > span { display: block; margin-top: 2px; font-size: 10px; color: #657255; }
 .capture-region .icon-button { flex: 0 0 30px; width: 30px; height: 30px; color: #5c6a4e; }
 .region-symbol { display: grid; place-items: center; width: 26px; height: 26px; flex: 0 0 26px; color: #60794b; }
-.region-symbol.is-searching { animation: region-search 2s ease-in-out infinite; }
+.region-symbol.is-searching { color: #87917c; }
 .capture-advanced { margin: 13px 0 0; text-align: center; color: #68735e; font-size: 11px; }
 .capture-advanced summary { cursor: pointer; padding: 4px 0; }
 .capture-advanced .text-button { margin: 9px 0 3px; }
-@keyframes region-search { 50% { opacity: .45; } }
-@media (prefers-reduced-motion: reduce) { .region-symbol.is-searching { animation: none; } }
+.capture-advanced p { margin: 10px 0 4px; line-height: 1.8; text-align: left; }
+.setting-toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 0; margin: 2px 0 18px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: pointer; }
+.setting-toggle strong { display: block; font-size: 12px; font-weight: 550; }
+.setting-toggle small { display: block; font-size: 10px; color: #727965; margin-top: 4px; }
+.setting-toggle input { appearance: none; width: 36px; height: 22px; flex: 0 0 36px; border-radius: 12px; background: #d8dbd0; margin: 0; padding: 3px; cursor: pointer; }
+.setting-toggle input::before { content: ''; display: block; width: 16px; height: 16px; border-radius: 50%; background: #fffefa; box-shadow: 0 1px 2px #26362325; }
+.setting-toggle input:checked { background: #7a8d6a; }
+.setting-toggle input:checked::before { transform: translateX(14px); }

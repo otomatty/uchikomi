@@ -33,7 +33,7 @@ test('concurrent repeated captures deduplicate atomically and return one canonic
 });
 test('confirmed text survives lower-quality OCR observations',async()=>{
   const p=await savePhrase(phrase());
-  const returned=await savePhrase({...phrase('later'),reading:'ぺあるく',confidence:61,verified:false,lastSeenAt:now+9000});
+  const returned=await savePhrase({...phrase('later'),reading:'',confidence:61,verified:false,lastSeenAt:now+9000});
   assert.equal(returned.id,p.id);assert.equal(returned.reading,p.reading);assert.equal(returned.verified,true);assert.equal(returned.confidence,92);assert.equal(returned.seenCount,2);
 });
 test('editing roman or reading preserves history but invalidates stale analysis atomically',async()=>{
@@ -74,12 +74,11 @@ test('exports validate standalone restore compatibility and preserve all records
   assert.equal(backup.version,1);assert.equal(backup.phrases[0].screenshot,screenshot);assert.equal(backup.sessions[0].scoreEvidence,evidence);
   await clearData();await importData(JSON.parse(JSON.stringify(backup)));
   assert.deepEqual(await getData(),original);
-  // Two individually valid captures can merge beyond the restore format's tag
-  // limit. Export must reject the unsupported snapshot instead of dropping tags.
-  await savePhrase({...phrase('repeat'),tags:['one-more']});
-  const unsupported=await getData();assert.equal(unsupported.phrases[0].tags?.length,21);
-  await assert.rejects(exportData(),/タグ/);
-  assert.deepEqual(await getData(),unsupported);
+  // Individually valid captures cannot create a merged record outside the
+  // restore limits. Reject the complete write without silently dropping tags.
+  await assert.rejects(savePhrase({...phrase('repeat'),tags:['one-more']}),/タグ/);
+  assert.deepEqual(await getData(),original);
+  assert.deepEqual((await exportData()).phrases,backup.phrases);
 });
 test('malformed import and dangling references do not partially overwrite existing records',async()=>{
   await seed();const before=await getData();

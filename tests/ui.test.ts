@@ -112,6 +112,25 @@ test('phrase form rejects conflicting reading, and duplicate save-to-practice us
   assert.ok(data.sessions.some(s=>s.id===data.attempts[0].sessionId));
 });
 
+test('editing a keyword preserves captures that arrive while its dialog is open',async()=>{
+  const original={...phrase('ui-live-a'),source:'capture' as const,screenshot:'data:image/png;base64,AA=='};
+  await db.savePhrase(original);
+  await db.savePhrase({...original,id:'ui-live-b',lastSeenAt:original.lastSeenAt+1,screenshot:'data:image/png;base64,AQ=='});
+  await mount();await navigateWords();
+  await click(query('button[aria-label="テスト用のペアルックを編集"]'));
+  assert.equal((await db.getData()).phrases[0].seenCount,2);
+  await act(async()=>{
+    await db.savePhrase({...original,id:'ui-live-c',lastSeenAt:original.lastSeenAt+2,screenshot:'data:image/png;base64,Ag==',tags:['追加の出題']});
+    await delay(0);
+  });
+  const latest=(await db.getData()).phrases[0];assert.equal(latest.seenCount,3);
+  await input(query<HTMLInputElement>('input[placeholder="実際に出題されたキーワード"]'),'確認したペアルック');
+  await click(button('保存'));await settled(()=>!document.querySelector('[role="dialog"]'));
+  const saved=(await db.getData()).phrases[0];
+  assert.equal(saved.text,'確認したペアルック');assert.equal(saved.id,original.id);
+  for(const field of ['seenCount','seenSources','lastSeenAt','screenshot','screenshots','tags'] as const)assert.deepEqual(saved[field],latest[field],field);
+});
+
 test('filtered visible vocabulary drives actual practice; completed words and errors persist',async()=>{
   await db.savePhrase(phrase('ui-pair'));await db.savePhrase(phrase('ui-photo','テスト用の写真','しゃしん','syasinn'));await db.updateSettings({sessionLength:5});
   await mount();await navigateWords();await input(query<HTMLInputElement>('input[aria-label="キーワードを検索"]'),'ペアルック');

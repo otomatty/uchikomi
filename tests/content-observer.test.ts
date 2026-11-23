@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Window } from 'happy-dom';
 
-test('keyboard focus leaving a clicked canvas stops capture and records a focus gap', async t => {
+test('manual keyboard capture excludes outside focus and resumes after tab visibility changes', async t => {
   const browser = new Window({ url: 'https://sushida.net/play.html' });
   const originals = new Map<string, PropertyDescriptor | undefined>();
   const define = (name: string, value: unknown) => {
@@ -14,7 +14,7 @@ test('keyboard focus leaving a clicked canvas stops capture and records a focus 
   const messages: any[] = [];
   let onMessage: ((message: any, sender: any, respond: (value: any) => void) => unknown) | undefined;
   define('chrome', { runtime: {
-    id: 'observer-test', async sendMessage(message: unknown) { messages.push(message); return { ok: true }; },
+    id: 'observer-test', getManifest: () => ({ version: '1.4.0' }), async sendMessage(message: unknown) { messages.push(message); return { ok: true }; },
     onMessage: { addListener(listener: typeof onMessage) { onMessage = listener; } },
   } });
   Object.defineProperty(browser.document, 'hasFocus', { configurable: true, value: () => true });
@@ -57,4 +57,24 @@ test('keyboard focus leaving a clicked canvas stops capture and records a focus 
   disable();
   assert.deepEqual(messages.filter(message => message.type === 'UCHI_CAPTURE_KEYS').flatMap(message => message.keys.map((key: any) => key.key)), ['c', 'e']);
   assert.equal(messages.filter(message => message.type === 'UCHI_CAPTURE_GAP').length, 2);
+
+  messages.length = 0; canvas.focus(); enable();
+  press(canvas, 'g');
+  Object.defineProperty(browser.document, 'visibilityState', { configurable: true, value: 'hidden' });
+  browser.document.dispatchEvent(new browser.Event('visibilitychange'));
+  press(canvas, 'h');
+  Object.defineProperty(browser.document, 'visibilityState', { configurable: true, value: 'visible' });
+  browser.document.dispatchEvent(new browser.Event('visibilitychange'));
+  press(canvas, 'i');
+  disable();
+  assert.deepEqual(messages.filter(message => message.type === 'UCHI_CAPTURE_KEYS').flatMap(message => message.keys.map((key: any) => key.key)), ['g', 'i']);
+  assert.equal(messages.filter(message => message.type === 'UCHI_CAPTURE_GAP').length, 1);
+  assert.equal(messages.filter(message => message.type === 'UCHI_CANVAS_END').length, 0, 'manual tab capture is not ended through the automatic canvas protocol');
+
+  messages.length = 0; canvas.focus(); enable();
+  press(canvas, 'j');
+  browser.dispatchEvent(new browser.Event('pagehide'));
+  press(canvas, 'k');
+  assert.deepEqual(messages.filter(message => message.type === 'UCHI_CAPTURE_KEYS').flatMap(message => message.keys.map((key: any) => key.key)), ['j']);
+  assert.equal(messages.filter(message => message.type === 'UCHI_CANVAS_END').length, 0, 'navigation flushes manual keys and leaves stopping to the background');
 });

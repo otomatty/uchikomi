@@ -47,7 +47,7 @@ test('opening the old IndexedDB upgrades all money once while retaining phrases,
   const changes:{oldVersion:number;newVersion:number|null}[]=[];
   legacy.onversionchange=event=>{changes.push({oldVersion:event.oldVersion,newVersion:event.newVersion});legacy.close();};
   const data=await getData();
-  assert.deepEqual(changes,[{oldVersion:1,newVersion:2}]);
+  assert.deepEqual(changes,[{oldVersion:1,newVersion:3}]);
   assert.deepEqual(data.phrases,[phrase]);assert.deepEqual(data.attempts,[attempt]);
   assert.deepEqual(data.settings,{...settings,scoreType:'total'});
   assert.equal(data.settings.targetScore,30000);assert.equal(data.settings.baselineScore,18000);
@@ -70,7 +70,7 @@ test('opening the old IndexedDB upgrades all money once while retaining phrases,
   }
   const inspect=await requested(indexedDB.open(name));
   try{
-    assert.equal(inspect.version,2);
+    assert.equal(inspect.version,3);
     const tx=inspect.transaction('sessions','readonly'),done=completed(tx),stored=await requested(tx.objectStore('sessions').getAll());await done;
     assert.ok(stored.every(session=>session.scoreType==='total'&&!('scoreProfit' in session)),'conversion is persisted, not just applied by getData');
   }finally{inspect.close();}
