@@ -24,6 +24,7 @@ interface FixtureOptions {
   scene?: { prompt: boolean; receipt: boolean; variant?: number };
   clock?: () => number;
   decode?: () => Promise<void>;
+  savePhrase?: typeof db.savePhrase;
   saveSession?: typeof db.saveSession;
   saveAttempt?: typeof db.saveAttempt;
   controlReplayTimeout?: boolean;
@@ -127,7 +128,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
           return worker.recognize(crop, ...rest);
         } };
       }) };
-      if (name === '../core/db') return { ...db, saveSession: options.saveSession ?? db.saveSession, saveAttempt: options.saveAttempt ?? db.saveAttempt };
+      if (name === '../core/db') return { ...db, savePhrase: options.savePhrase ?? db.savePhrase, saveSession: options.saveSession ?? db.saveSession, saveAttempt: options.saveAttempt ?? db.saveAttempt };
       if (name === 'tesseract.js') return { PSM: { SINGLE_LINE: '7' } };
       if ((receipt !== undefined || options.scene) && name === './auto-region') return { detectPromptRegions: () => {
         if (!options.scene?.prompt) return null;
@@ -794,7 +795,7 @@ test('a failed review save blocks replay, while a later successful durable save 
   assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
 });
 
-async function typedResultFixture(options: Pick<FixtureOptions, 'saveAttempt' | 'saveSession'> = {}) {
+async function typedResultFixture(options: Pick<FixtureOptions, 'savePhrase' | 'saveAttempt' | 'saveSession'> = {}) {
   const base = 1700000000000;
   let now = base, sequence = 0, receiptLine = 0, terminatedWorkers = 0;
   const scene = { prompt: true, receipt: false, variant: 0 };
@@ -828,6 +829,82 @@ async function typedResultFixture(options: Pick<FixtureOptions, 'saveAttempt' | 
   assert.equal(app.evaluate('activeGame.lastResult.parsed.score'), 29740);
   return { ...app, terminatedWorkers: () => terminatedWorkers };
 }
+
+test('valid OCR with failed phrase writes retains its observations and input until the same payloads and attempts are saved', async () => {
+  let fail = true, hold = false;
+  const release = deferred<void>();
+  const written: Parameters<typeof db.savePhrase>[0][] = [];
+  const app = await typedResultFixture({ savePhrase: async phrase => {
+    written.push(structuredClone(phrase));
+    if (hold) await release.promise;
+    if (fail) throw new Error('Storage temporarily unavailable');
+    return db.savePhrase(phrase);
+  } });
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 2);
+  assert.equal(app.evaluate('currentCandidate.finalized'), false);
+  assert.equal(app.evaluate('currentCandidate.phrase'), undefined);
+  assert.equal(app.evaluate('currentCandidate.pendingPhrase.value.text'), 'ペアルック');
+  const attempts = structuredClone(app.evaluate('[...unfinishedCandidates].map(candidate => candidate.pendingAttempt.value)'));
+  assert.equal(attempts.length, 2); assert.ok(attempts.every((attempt: any) => attempt?.typed === 'pearukku'));
+  const observationIds = [...new Set(written.map(phrase => phrase.id))].sort();
+  assert.equal(observationIds.length, 2);
+  assert.equal((await replay(app)).ready, false, 'valid OCR cannot bypass a failed phrase write');
+  assert.equal((await db.getData()).phrases.length, 0); assert.equal((await db.getData()).attempts.length, 0);
+  assert.equal(app.evaluate('activeGame.session.phraseCount'), 0);
+  // Model bounded-buffer eviction after both observed words ended. Retries
+  // must use the stored replay, not reconstruct it from this newer buffer.
+  app.evaluate('keyBuffer = []');
+  const ocrInputs = app.ocrInputs.length;
+  fail = false; hold = true;
+  let replied = false;
+  const waiting = replay(app).then(result => { replied = true; return result; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(replied, false, 'replay cannot be granted while phrase persistence is still pending');
+  assert.equal((await db.getData()).attempts.length, 0);
+  release.resolve();
+  assert.equal((await waiting).ready, true);
+  const data = await db.getData();
+  assert.equal(data.phrases.length, 1); assert.equal(data.phrases[0].seenCount, 2);
+  assert.deepEqual(data.phrases[0].seenSources!.map(source => source.id).sort(), observationIds);
+  assert.deepEqual(data.attempts.map(attempt => attempt.id).sort(), attempts.map((attempt: any) => attempt.id).sort());
+  assert.ok(data.attempts.every(attempt => attempt.phraseId === data.phrases[0].id && attempt.typed === 'pearukku'));
+  assert.equal(data.sessions[0].phraseCount, 2); assert.equal(app.evaluate('status.phraseCount'), 2);
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 0);
+  assert.equal(app.ocrInputs.length, ocrInputs, 'retrying persistence does not re-read or invent an OCR observation');
+  for (const id of observationIds) {
+    const snapshots = written.filter(phrase => phrase.id === id);
+    assert.ok(snapshots.length > 1);
+    for (const snapshot of snapshots) assert.deepEqual(snapshot, snapshots[0], 'the original source UUID and seenCount:1 payload remain unchanged');
+  }
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('a session failure after phrase persistence retries only the unfinished stages without repeating phrase counts', async () => {
+  let fail = true;
+  const phraseIds: string[] = [];
+  const app = await typedResultFixture({
+    savePhrase: async phrase => { phraseIds.push(phrase.id); return db.savePhrase(phrase); },
+    saveSession: async session => {
+      if (fail && session.phraseCount > 0) throw new Error('Storage temporarily unavailable');
+      await db.saveSession(session);
+    },
+  });
+  assert.equal(phraseIds.length, 2);
+  assert.equal(app.evaluate('activeGame.session.phraseCount'), 2);
+  assert.equal(app.evaluate('status.phraseCount'), 0, 'only durable session counts are announced');
+  assert.equal((await db.getData()).phrases[0].seenCount, 2);
+  assert.equal((await db.getData()).attempts.length, 0);
+  assert.equal((await replay(app)).ready, false);
+  assert.equal(phraseIds.length, 2, 'successful phrase persistence is not repeated by the failed session retry');
+  fail = false;
+  assert.equal((await replay(app)).ready, true);
+  const data = await db.getData();
+  assert.equal(data.sessions[0].phraseCount, 2); assert.equal(app.evaluate('status.phraseCount'), 2);
+  assert.equal(data.phrases[0].seenCount, 2); assert.equal(phraseIds.length, 2);
+  assert.equal(data.attempts.length, 2); assert.equal(data.sessions[0].correctKeys, 8);
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 0);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
 
 test('failed attempt writes remain retryable after replacement and block replay until the same attempts are saved', async () => {
   let fail = true;
@@ -882,13 +959,14 @@ test('retrying a session write after its attempt was saved cannot write or aggre
   assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
 });
 
-test('a permanent final attempt failure stops capture, retains daily activity and reports STOP failure after cleanup', async () => {
+for (const stage of ['attempt', 'phrase'] as const) test(`a permanent final ${stage} failure stops capture, retains daily activity and reports STOP failure after cleanup`, async () => {
   let hold = false;
   const release = deferred<void>();
-  const app = await typedResultFixture({ saveAttempt: async () => {
+  const failSave = async () => {
     if (hold) await release.promise;
     throw new Error('Storage temporarily unavailable');
-  } });
+  };
+  const app = await typedResultFixture(stage === 'phrase' ? { savePhrase: failSave } : { saveAttempt: failSave });
   hold = true;
   const stopping = app.request('UCHI_OFF_STOP');
   await new Promise(resolve => setImmediate(resolve));
@@ -903,6 +981,7 @@ test('a permanent final attempt failure stops capture, retains daily activity an
   assert.equal(app.terminatedWorkers(), 2);
   const data = await db.getData();
   assert.equal(data.attempts.length, 0, 'failed history writes are not claimed as saved');
+  if (stage === 'phrase') assert.equal(data.phrases.length, 0);
   assert.ok(data.sessions[0].endedAt);
   assert.equal(data.sessions[0].activity?.reduce((sum, row) => sum + row.keys, 0), 16);
   assert.equal(data.sessions[0].activity?.reduce((sum, row) => sum + row.phrases, 0), 2);

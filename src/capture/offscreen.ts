@@ -44,7 +44,8 @@ interface Candidate {
   game: CaptureGame;
   precedingBoundary?: CompletionBoundary; completionBoundary: CompletionBoundary;
   finalizing?: Promise<void>;
-  pendingAttempt?: { value: Attempt; completionAt: number | null; saved: boolean; totalsApplied: boolean };
+  pendingPhrase?: { value: Phrase; counted: boolean; sessionSaved: boolean };
+  pendingAttempt?: { value: Attempt | null; completionAt: number | null; saved: boolean; totalsApplied: boolean };
   id: number; at: number; endedAt?: number;
   japanese: HTMLCanvasElement; reading?: HTMLCanvasElement; roman: HTMLCanvasElement;
   screenshot: string; signature: Uint8Array; phrase?: Phrase;
@@ -287,13 +288,25 @@ function imageSignature(rect: Rect): { bytes: Uint8Array; ink: number } {
   }
   return { bytes, ink: ink / bytes.length };
 }
+async function persistCandidatePhrase(candidate: Candidate) {
+  const pending = candidate.pendingPhrase;
+  if (!pending || pending.sessionSaved) return;
+  // Preserve the source observation ID and payload on every retry. The DB may
+  // return a different canonical ID after merging this word with its history.
+  if (!candidate.phrase) candidate.phrase = await savePhrase(pending.value);
+  if (!pending.counted) { candidate.game.session.phraseCount++; pending.counted = true; }
+  await persistGame(candidate.game);
+  pending.sessionSaved = true;
+  announce({ phraseCount: (status.phraseCount ?? 0) + 1, latestPhrase: candidate.phrase.text, lastFrameAt: candidate.at, message: captureWarning });
+}
 function finalizeCandidate(candidate: Candidate): Promise<void> {
   if (candidate.finalized || !candidate.processed || candidate.endedAt === undefined) return Promise.resolve();
   if (candidate.finalizing) return candidate.finalizing;
   unfinishedCandidates.add(candidate);
   const task = (async () => {
     try {
-      if (!candidate.phrase) { candidate.finalized = true; return; }
+      const phrase = candidate.phrase ?? candidate.pendingPhrase?.value;
+      if (!phrase) { candidate.finalized = true; return; }
       const game = candidate.game;
       if (!candidate.pendingAttempt) {
         // A final key may still be in the content script's 90 ms batch.
@@ -301,16 +314,19 @@ function finalizeCandidate(candidate: Candidate): Promise<void> {
         if (settle > 0) await new Promise(resolve => setTimeout(resolve, settle));
         const precedingCompletion = candidate.precedingBoundary ? await candidate.precedingBoundary.promise : null;
         const { attempt, completionAt } = replayCapturedPhrase({
-          phrase: candidate.phrase, strokes: keyBuffer, observedAt: candidate.at, endedAt: candidate.endedAt!,
+          phrase, strokes: keyBuffer, observedAt: candidate.at, endedAt: candidate.endedAt!,
           sessionId: game.session.id, contiguous: candidate.reliableBoundary, precedingCompletion,
           observationReliable: candidate.observationReliable, focusGaps, accuracyMode: game.session.mode === 'accuracy',
         });
-        if (!attempt) { candidate.finalized = true; return; }
         // Keep the same ID and replayed keys across retries, even after the
         // candidate has been replaced or its source key buffer has moved on.
+        // Build from valid OCR before retrying any failed phrase persistence.
         candidate.pendingAttempt = { value: attempt, completionAt, saved: false, totalsApplied: false };
       }
+      await persistCandidatePhrase(candidate);
       const pending = candidate.pendingAttempt;
+      if (!pending.value) { candidate.finalized = true; return; }
+      pending.value.phraseId = candidate.phrase!.id;
       await game.writes.catch(() => persistGame(game));
       if (!pending.saved) { await saveAttempt(pending.value); pending.saved = true; }
       if (pending.value.reliable) {
@@ -503,14 +519,13 @@ async function recognize(candidate: Candidate) {
   const verified = confidence >= 82 && jpResult.data.confidence >= 85 && romanResult.data.confidence >= 88 && resolved.consistent;
   // Historical confirmation of a canonical phrase must not upgrade this frame's OCR.
   candidate.observationReliable = verified;
-  const phrase = await savePhrase({
+  candidate.pendingPhrase = { value: {
     id: crypto.randomUUID(), text, reading: resolved.reading, roman,
     source: 'capture', confidence, verified, capturedAt: candidate.at, lastSeenAt: candidate.at, seenCount: 1,
     screenshot: candidate.screenshot, tags: resolved.source === 'title' ? ['よみを表記から確認'] : undefined,
-  });
-  candidate.phrase = phrase;
-  candidate.game.session.phraseCount++; await persistGame(candidate.game);
-  announce({ phraseCount: (status.phraseCount ?? 0) + 1, latestPhrase: phrase.text, lastFrameAt: candidate.at, message: captureWarning });
+  }, counted: false, sessionSaved: false };
+  unfinishedCandidates.add(candidate);
+  await persistCandidatePhrase(candidate);
 }
 
 function collectResultFrame(now: number, force = false, observedFrame?: ImageData): boolean {
@@ -667,7 +682,7 @@ async function processQueue() {
       const candidate = queue.shift()!;
       try { await recognize(candidate); }
       catch (error) { reportError(error); }
-      if (!candidate.phrase || !candidate.observationReliable) candidate.completionBoundary.settle(null);
+      if ((!candidate.phrase && !candidate.pendingPhrase) || !candidate.observationReliable) candidate.completionBoundary.settle(null);
       candidate.processed = true;
       await finalizeCandidate(candidate).catch(reportError);
     }
@@ -1002,8 +1017,8 @@ async function finishStop() {
   await processQueue();
   if (currentCandidate) await finalizeCandidate(currentCandidate).catch(reportError);
   await Promise.all([...pendingWrites]);
-  let attemptWriteFailed = false;
-  await retryCandidateWrites().catch(error => { attemptWriteFailed = true; reportError(error); });
+  let candidateWriteFailed = false;
+  await retryCandidateWrites().catch(error => { candidateWriteFailed = true; reportError(error); });
   for (const game of games) {
     if (!game.scoreSaved && game.lastResult) {
       const last = game.lastResult;
@@ -1019,9 +1034,9 @@ async function finishStop() {
   jpWorker = romanWorker = null; initializing = null;
   keyBuffer = []; seenKeyEvents.clear(); focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
   calibration = undefined; detectedRegions = null; manualRegions = false;
-  const error = attemptWriteFailed ? '最後の入力履歴を保存できませんでした。保存済みの履歴を確認してください。' : undefined;
-  announce({ state: attemptWriteFailed ? 'error' : 'idle', ocrReady: false, regionState: undefined, regionConfidence: undefined, region: undefined, message: error ?? captureWarning });
-  if (attemptWriteFailed) return { ok: false, error, status, sessionId: session?.id };
+  const error = candidateWriteFailed ? '最後のお題・入力履歴を保存できませんでした。保存済みの履歴を確認してください。' : undefined;
+  announce({ state: candidateWriteFailed ? 'error' : 'idle', ocrReady: false, regionState: undefined, regionConfidence: undefined, region: undefined, message: error ?? captureWarning });
+  if (candidateWriteFailed) return { ok: false, error, status, sessionId: session?.id };
   return { ok: true, status, sessionId: session?.id };
 }
 function snapshot() {
