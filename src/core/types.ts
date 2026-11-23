@@ -1,6 +1,8 @@
 import type { ReplayShortcut } from './shortcuts';
 
 export type Source = 'capture' | 'practice' | 'manual' | 'demo';
+/** Includes the 10,000-yen course price when migrating the largest legacy profit. */
+export const MAX_SCORE = 10_010_000;
 export interface KeyStroke { key: string; code?: string; at: number; repeat?: boolean; }
 export interface StrokeSample { pattern: string; intervalMs: number; error: boolean; at: number; }
 /** The expected alternatives are captured before feeding the actual key to the local matcher. */

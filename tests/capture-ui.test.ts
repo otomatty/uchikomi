@@ -178,3 +178,45 @@ test('restoring an older backup through settings informs live capture that nativ
   assert.equal(replayUpdates.at(-1), 'Escape');
   assert.deepEqual((await db.getData()).sessions, backup.sessions);
 });
+
+test('saving an unrelated setting preserves a pause made after opening the form', async () => {
+  await act(async () => { await db.updateSettings({ autoRecord: true }); publish({ state: 'idle' }); await delay(20); });
+  const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
+  await act(async () => { open.click(); await delay(0); });
+  const toggle = document.querySelector<HTMLInputElement>('[role="switch"]'); assert.ok(toggle); assert.equal(toggle.checked, true);
+  await act(async () => { await db.updateSettings({ autoRecord: false, replayShortcut: 'F2' }); await delay(20); });
+  const resumeCount = messages.filter(type => type === 'UCHI_RESUME').length;
+  const target = document.querySelector<HTMLInputElement>('[role="dialog"] input[type="number"]'); assert.ok(target);
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(browser.HTMLInputElement.prototype, 'value')!.set!.call(target, '32000');
+    target.dispatchEvent(new browser.Event('input', { bubbles: true })); await delay(0);
+  });
+  const save = document.querySelector<HTMLButtonElement>('[role="dialog"] button[type="submit"]'); assert.ok(save);
+  await act(async () => { save.click(); await delay(0); });
+  await settle(() => !document.querySelector('[role="dialog"]'));
+  const settings = await db.getSettings();
+  assert.equal(settings.autoRecord, false); assert.equal(settings.replayShortcut, 'F2'); assert.equal(settings.targetScore, 32000);
+  assert.equal(messages.filter(type => type === 'UCHI_RESUME').length, resumeCount);
+  // An explicit switch edit still resumes capture even after another window paused it.
+  await act(async () => { open.click(); await delay(0); });
+  const resume = document.querySelector<HTMLInputElement>('[role="switch"]'); assert.ok(resume);
+  await act(async () => { resume.click(); await delay(0); });
+  const confirm = document.querySelector<HTMLButtonElement>('[role="dialog"] button[type="submit"]'); assert.ok(confirm);
+  await act(async () => { confirm.click(); await delay(0); });
+  await settle(() => !document.querySelector('[role="dialog"]'));
+  assert.equal((await db.getSettings()).autoRecord, true);
+  assert.equal(messages.filter(type => type === 'UCHI_RESUME').length, resumeCount + 1);
+});
+
+test('saving an unchanged disabled auto-record setting stops an active manual capture', async () => {
+  await act(async () => { await db.updateSettings({ autoRecord: false }); publish({ state: 'recording', source: 'tab' }); await delay(20); });
+  const before = messages.filter(type => type === 'UCHI_STOP').length;
+  const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
+  await act(async () => { open.click(); await delay(0); });
+  const toggle = document.querySelector<HTMLInputElement>('[role="switch"]'); assert.ok(toggle); assert.equal(toggle.checked, false);
+  const save = document.querySelector<HTMLButtonElement>('[role="dialog"] button[type="submit"]'); assert.ok(save);
+  await act(async () => { save.click(); await delay(0); });
+  await settle(() => !document.querySelector('[role="dialog"]'));
+  assert.equal(messages.filter(type => type === 'UCHI_STOP').length, before + 1);
+  assert.equal(status.state, 'idle'); assert.equal((await db.getSettings()).autoRecord, false);
+});

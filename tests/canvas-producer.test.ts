@@ -20,6 +20,7 @@ function fixture() {
   let stopped = 0;
   let paused = 0;
   let nextId = 0;
+  let videoPixels = 'initial', encodedPixels = 'initial';
   track.muted = false;
   track.readyState = 'live';
   track.stop = () => { stopped++; track.readyState = 'ended'; };
@@ -33,8 +34,8 @@ function fixture() {
     requestVideoFrameCallback: { value: (callback: any) => { const id = ++nextId; callbacks.set(id, callback); return id; } },
     cancelVideoFrameCallback: { value: (id: number) => callbacks.delete(id) },
   });
-  Object.defineProperty(image, 'getContext', { value: () => ({ drawImage: (...args: unknown[]) => draws.push(args) }) });
-  Object.defineProperty(image, 'toDataURL', { value: (type: string, quality: number) => { assert.equal(type, 'image/jpeg'); assert.equal(quality, .92); return 'data:image/jpeg;base64,AAAA'; } });
+  Object.defineProperty(image, 'getContext', { value: () => ({ drawImage: (...args: unknown[]) => { draws.push(args); encodedPixels = videoPixels; } }) });
+  Object.defineProperty(image, 'toDataURL', { value: (type: string, quality: number) => { assert.equal(type, 'image/jpeg'); assert.equal(quality, .92); return `data:image/jpeg;base64,${Buffer.from(encodedPixels).toString('base64')}`; } });
   const originalCreate = document.createElement.bind(document);
   Object.defineProperty(document, 'createElement', { value: (name: string) => name === 'video' ? video : name === 'canvas' ? image : originalCreate(name) });
   Object.defineProperties(browser, {
@@ -46,6 +47,7 @@ function fixture() {
   return {
     browser, document, source, video, image, track, draws, callbacks, intervals, timeouts,
     stopped: () => stopped, paused: () => paused,
+    setVideoPixels: (pixels: string) => { videoPixels = pixels; },
     tick() { for (const fn of intervals.values()) fn(); },
     timeout() { for (const [id, fn] of timeouts) { timeouts.delete(id); fn(); } },
     frame(count: number, now = count * 80) {
@@ -84,7 +86,7 @@ test('canvas capture samples only fresh frames, bounds image size and waits for 
   acknowledge!(); await Promise.resolve();
   f.tick();
   assert.equal(frames.length, 2);
-  assert.equal(frames[1].sequence, 2);
+  assert.equal(frames[1].sequence, 3, 'Only the latest snapshot is retained while waiting for the ACK');
   assert.equal(frames[1].at, f.browser.performance.timeOrigin + 240);
   acknowledge!(); await Promise.resolve();
   f.tick(); f.tick();
@@ -95,6 +97,25 @@ test('canvas capture samples only fresh frames, bounds image size and waits for 
   assert.equal(f.callbacks.size, 0);
   assert.equal(f.intervals.size, 0);
   assert.equal(f.video.srcObject, null);
+});
+
+test('video fallback snapshots pixels with their presentation timestamp before a later timer tick', async t => {
+  const f = fixture(); t.after(() => f.browser.happyDOM.close());
+  const frames: CanvasFrame[] = [];
+  const producer = createCanvasProducer(f.source as any, { async onFrame(frame) { frames.push(frame); }, onError(error) { throw error; } });
+  t.after(() => producer.stop()); await producer.ready;
+  f.setVideoPixels('frame A'); f.frame(1, 80);
+  f.setVideoPixels('frame B'); // Playback advances before its next callback is delivered.
+  f.tick(); await settleFrames();
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].dataUrl, `data:image/jpeg;base64,${Buffer.from('frame A').toString('base64')}`);
+  assert.equal(frames[0].at, f.browser.performance.timeOrigin + 80);
+  f.frame(2, 160); f.tick(); await settleFrames();
+  assert.equal(frames.length, 2);
+  assert.equal(frames[1].dataUrl, `data:image/jpeg;base64,${Buffer.from('frame B').toString('base64')}`);
+  assert.equal(frames[1].at, f.browser.performance.timeOrigin + 160);
+  f.frame(2, 240); f.tick(); await settleFrames();
+  assert.equal(frames.length, 2, 'The same presented frame cannot become independent evidence at a new time');
 });
 
 function trackFixture() {
@@ -240,4 +261,23 @@ test('canvas discovery ignores hidden, offscreen and small surfaces', async t =>
   f.source.style.display = 'block';
   Object.defineProperty(f.document, 'visibilityState', { value: 'hidden' });
   assert.equal(visibleGameCanvas(f.document as any), null);
+});
+
+test('canvas discovery intersects clipping ancestors and admits the same canvas when it becomes partially visible', async t => {
+  const f = fixture(); t.after(() => f.browser.happyDOM.close());
+  const wrapper = f.document.createElement('div');
+  let bounds = { width: 300, height: 200, left: 980, top: 0, right: 1280, bottom: 200 };
+  Object.defineProperty(wrapper, 'getBoundingClientRect', { value: () => bounds });
+  wrapper.style.overflow = 'hidden';
+  f.document.body.append(wrapper); wrapper.append(f.source);
+  assert.equal(visibleGameCanvas(f.document as any), null, 'The canvas viewport rectangle alone is insufficient');
+  bounds = { ...bounds, left: 800, right: 1100 };
+  assert.equal(visibleGameCanvas(f.document as any), f.source, 'A partially visible canvas remains eligible');
+  bounds = { ...bounds, top: 810, bottom: 1010 };
+  assert.equal(visibleGameCanvas(f.document as any), null);
+  wrapper.style.overflow = 'visible';
+  wrapper.style.overflowX = 'hidden'; wrapper.style.overflowY = 'visible';
+  assert.equal(visibleGameCanvas(f.document as any), f.source, 'Only the clipped axis constrains the visible intersection');
+  wrapper.style.contain = 'paint';
+  assert.equal(visibleGameCanvas(f.document as any), null, 'Paint containment also clips both axes');
 });

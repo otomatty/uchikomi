@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS } from './types';
+import { DEFAULT_SETTINGS, MAX_SCORE } from './types';
 import type { AppData, Attempt, Calibration, DailyActivity, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
 import { normalizeRoman } from './romaji';
 import { isErrorTerminatedAttempt } from './analytics';
@@ -196,9 +196,9 @@ export interface AutomaticScore {
 /** Atomically record OCR results without overwriting a manual/legacy score. */
 export async function saveAutomaticScore(sessionId:string,patch:AutomaticScore):Promise<boolean> {
   identifier(sessionId);
-  const type=scoreType(patch.scoreType),score=number(patch.score,'合計金額',0,10010000);
+  const type=scoreType(patch.scoreType),score=number(patch.score,'合計金額',0,MAX_SCORE);
   const confidence=number(patch.scoreConfidence,'スコア認識率',0,100),at=number(patch.scoreObservedAt,'スコア確認時刻');
-  const total=patch.scoreTotal===undefined?score:number(patch.scoreTotal,'合計金額',0,10010000);
+  const total=patch.scoreTotal===undefined?score:number(patch.scoreTotal,'合計金額',0,MAX_SCORE);
   if(total!==score)throw new Error('合計金額が一致しません。');
   const evidence=patch.scoreEvidence===undefined?undefined:imageData(patch.scoreEvidence,'スコア画像');
   const modeSource=patch.scoreModeSource===undefined?undefined:validateScoreModeSource(patch.scoreModeSource);
@@ -268,8 +268,10 @@ export async function importData(value:unknown):Promise<void> {
     const importedPhrases=new Map(imported.phrases.map(phrase=>[phrase.id,phrase]));
     for(const attempt of imported.attempts){
       const target=consolidated.bySource.get(attempt.phraseId)!;
-      const before=importedPhrases.get(attempt.phraseId)??previousPhrases.get(attempt.phraseId)??currentPhrases.find(phrase=>phrase.seenSources?.some(source=>source.id===attempt.phraseId));
-      const reliable=attempt.reliable&&(before?compatiblePhraseAttempt(before,target,attempt):attempt.phraseId===target.id||compatibleAttemptWithPhrase(target,attempt));
+      // Only an incoming original definition describes the imported input.
+      // A current row with the same ID may already have a corrected spelling.
+      const before=importedPhrases.get(attempt.phraseId);
+      const reliable=attempt.reliable&&(before?compatiblePhraseAttempt(before,target,attempt):compatibleAttemptWithPhrase(target,attempt));
       tx.objectStore('attempts').put({...attempt,phraseId:target.id,reliable});
     }
     const previousSessions=new Map(currentSessions.map(session=>[session.id,session]));
@@ -350,7 +352,7 @@ function validateJudgement(value:unknown):KeyJudgement {
 function validateScoreReview(value:unknown):ScoreReview {
   const r=object(value,'スコアの確認'),type=scoreType(r.scoreType);
   const result:ScoreReview={scoreType:type,confidence:number(r.confidence,'スコア認識率',0,100),observedAt:number(r.observedAt,'スコア確認時刻'),reason:text(r.reason,'確認理由',2000)};
-  if(r.score!==undefined)result.score=number(r.score,'合計金額の候補',0,10010000);
+  if(r.score!==undefined)result.score=number(r.score,'合計金額の候補',0,MAX_SCORE);
   if(r.evidence!==undefined)result.evidence=imageData(r.evidence,'スコア画像');
   return result;
 }
@@ -373,14 +375,14 @@ function validateSession(value:unknown):Session {
   const s=object(value,'セッション');if(s.course!==10000||s.mode!=='accuracy')throw new Error('10,000円・正確重視の記録のみ読み込めます。');
   const result:Session={id:identifier(s.id),startedAt:number(s.startedAt,'開始時刻'),source:source(s.source),scoreType:scoreType(s.scoreType),course:10000,mode:'accuracy',phraseCount:number(s.phraseCount,'語句数',0,1000000),correctKeys:number(s.correctKeys,'正しい入力数',0,10000000),mistakes:number(s.mistakes,'ミス数',0,10000000),durationMs:number(s.durationMs,'セッション時間',0,86400000)};
   if(s.endedAt!==undefined)result.endedAt=number(s.endedAt,'終了時刻',result.startedAt);
-  if(s.score!==undefined)result.score=number(s.score,'合計金額',0,10010000);
+  if(s.score!==undefined)result.score=number(s.score,'合計金額',0,MAX_SCORE);
   if(s.captureId!==undefined)result.captureId=identifier(s.captureId);
   if(s.scoreSource!==undefined){if(s.scoreSource!=='ocr'&&s.scoreSource!=='manual')throw new Error('スコアの記録元を確認してください。');result.scoreSource=s.scoreSource;}
   if(s.scoreConfidence!==undefined)result.scoreConfidence=number(s.scoreConfidence,'スコア認識率',0,100);
   if(s.scoreObservedAt!==undefined)result.scoreObservedAt=number(s.scoreObservedAt,'スコア確認時刻');
   if(s.scoreEvidence!==undefined)result.scoreEvidence=imageData(s.scoreEvidence,'スコア画像');
   if(s.scoreModeSource!==undefined)result.scoreModeSource=validateScoreModeSource(s.scoreModeSource);
-  if(s.scoreTotal!==undefined)result.scoreTotal=number(s.scoreTotal,'合計金額',0,10010000);
+  if(s.scoreTotal!==undefined)result.scoreTotal=number(s.scoreTotal,'合計金額',0,MAX_SCORE);
   if(result.score!==undefined&&result.scoreTotal!==undefined&&result.score!==result.scoreTotal)throw new Error('合計金額が一致しません。');
   if(s.scoreReview!==undefined)result.scoreReview=validateScoreReview(s.scoreReview);
   if(s.activity!==undefined)result.activity=validateDailyActivity(s.activity);
@@ -393,10 +395,10 @@ function migrateSessionToTotal(value:unknown):Session {
   const next:Record<string,unknown>={...old,scoreType:'total'};
   const candidates:number[]=[];
   if(old.score!==undefined){
-    const amount=number(old.score,'保存済みの金額',type==='profit'?-10000:0,type==='profit'?10000000:10010000)+(type==='profit'?10000:0);
+    const amount=number(old.score,'保存済みの金額',type==='profit'?-10000:0,type==='profit'?10000000:MAX_SCORE)+(type==='profit'?10000:0);
     next.score=amount;candidates.push(amount);
   }
-  if(old.scoreTotal!==undefined)candidates.push(number(old.scoreTotal,'保存済みの合計金額',0,10010000));
+  if(old.scoreTotal!==undefined)candidates.push(number(old.scoreTotal,'保存済みの合計金額',0,MAX_SCORE));
   if(old.scoreProfit!==undefined){
     const total=number(old.scoreProfit,'保存済みの差額',-10000,10000000)+10000;
     candidates.push(total);
@@ -407,7 +409,7 @@ function migrateSessionToTotal(value:unknown):Session {
   if(old.scoreReview!==undefined){
     const review=object(old.scoreReview,'スコアの確認'),reviewType=legacyScoreType(review.scoreType);
     priorReview=validateScoreReview({...review,scoreType:'total',...(review.score===undefined?{}:{
-      score:number(review.score,'保存済みの候補',reviewType==='profit'?-10000:0,reviewType==='profit'?10000000:10010000)+(reviewType==='profit'?10000:0),
+      score:number(review.score,'保存済みの候補',reviewType==='profit'?-10000:0,reviewType==='profit'?10000000:MAX_SCORE)+(reviewType==='profit'?10000:0),
     })});
     next.scoreReview=priorReview;
   }

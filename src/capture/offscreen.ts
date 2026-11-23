@@ -1,7 +1,7 @@
 import { PSM, type Worker as OcrWorker } from 'tesseract.js';
 import { saveAttempt, savePhrase, saveSession } from '../core/db';
 import { TrainingActivity } from '../core/activity';
-import type { Calibration, CaptureStatus, KeyStroke, Phrase, Rect, Session, Settings } from '../core/types';
+import type { Attempt, Calibration, CaptureStatus, KeyStroke, Phrase, Rect, Session, Settings } from '../core/types';
 import { EMPTY_CAPTURE } from '../core/types';
 import { isCalibration, MAX_CANDIDATES, MAX_KEY_BUFFER, normalizeJapanese, normalizeOcrRoman, pixelRect, preprocessOcrPixels, SAMPLE_MS, signatureDistance, unionRects, validJapanese, validRoman } from './helpers';
 import { detectPromptRegions, type AutoRegions } from './auto-region';
@@ -30,7 +30,7 @@ interface ActivityOccurrence { id: string; from: number; until?: number; counted
 interface CaptureGame {
   activity: TrainingActivity; activityWindows: ActivityWindow[]; activityWindow?: ActivityWindow;
   activityLastWindow?: ActivityWindow; activityResumeAfter: number;
-  activityKeys: Set<string>; activityStrokes: KeyStroke[]; activityOccurrences: ActivityOccurrence[];
+  activityKeys: Set<string>; activityStrokes: KeyStroke[]; activityOccurrences: ActivityOccurrence[]; activityOccurrence?: ActivityOccurrence;
   activityRevision: number; savedActivityRevision: number; activityCheckpoint?: Promise<void>;
   session: Session; writes: Promise<void>; observedPrompt: boolean; resultSeen: boolean; scoreSaved: boolean;
   reader: ResultFrameSequence; lastResult?: { parsed: ParsedScore; at: number; evidence: string };
@@ -43,7 +43,8 @@ interface ResultCandidate {
 interface Candidate {
   game: CaptureGame;
   precedingBoundary?: CompletionBoundary; completionBoundary: CompletionBoundary;
-  activityOccurrence?: ActivityOccurrence;
+  finalizing?: Promise<void>;
+  pendingAttempt?: { value: Attempt; completionAt: number | null; saved: boolean; totalsApplied: boolean };
   id: number; at: number; endedAt?: number;
   japanese: HTMLCanvasElement; reading?: HTMLCanvasElement; roman: HTMLCanvasElement;
   screenshot: string; signature: Uint8Array; phrase?: Phrase;
@@ -85,11 +86,13 @@ let scoreQueue: ResultCandidate[] = [];
 let currentCandidate: Candidate | undefined;
 let processing: Promise<void> | null = null;
 const promptSignatures = new PromptSignatureTracker();
+const activitySignatures = new PromptSignatureTracker();
 let sequence = 0;
 let generation = 0;
 let stopped = false;
 let stopTask: Promise<unknown> | null = null;
 const pendingWrites = new Set<Promise<void>>();
+const unfinishedCandidates = new Set<Candidate>();
 let session: Session | null = null;
 let activeGame: CaptureGame | null = null;
 let games: CaptureGame[] = [];
@@ -182,16 +185,38 @@ function confirmActivityPrompt(game: CaptureGame, at: number) {
   } else game.activityWindow.through = Math.max(game.activityWindow.through, at);
   recordObservedActivity(game);
 }
-function breakActivity(game: CaptureGame | null, at: number) {
+function breakActivity(game: CaptureGame | null, at: number, confirmedResult = false) {
   if (!game) return;
   if (game.activityWindow) {
     game.activityWindow.until = at;
-    game.activityWindow.through = Math.min(game.activityWindow.through, at);
+    // A continuous prompt-to-receipt transition confirms the final input
+    // interval, including keys delivered later by the content-script batch.
+    // Unknown losses close the window first and must never extend it here.
+    game.activityWindow.through = confirmedResult ? at : Math.min(game.activityWindow.through, at);
+    if (confirmedResult) recordObservedActivity(game);
     game.activityWindow = undefined;
   }
   game.activityResumeAfter = Math.max(game.activityResumeAfter, at);
   game.activityLastWindow = undefined;
   game.activity.break();
+}
+function endActivityOccurrence(game: CaptureGame | null, at: number) {
+  if (!game?.activityOccurrence) return;
+  game.activityOccurrence.until = at;
+  game.activityOccurrence = undefined;
+}
+function observeActivityPhrase(bytes: Uint8Array, now: number) {
+  const game = activeGame;
+  if (!game) return;
+  const transition = activitySignatures.observe(bytes, now);
+  if (transition.interruptedAt !== undefined) endActivityOccurrence(game, transition.interruptedAt);
+  if (!transition.candidate) return;
+  const at = transition.candidate.at;
+  endActivityOccurrence(game, at);
+  const occurrence = { id: `${game.session.id}:visual:${game.activityOccurrences.length}`, from: at };
+  game.activityOccurrence = occurrence;
+  game.activityOccurrences.push(occurrence);
+  recordActivityOccurrence(game, occurrence);
 }
 function checkpointActivity() {
   for (const game of games) {
@@ -262,42 +287,62 @@ function imageSignature(rect: Rect): { bytes: Uint8Array; ink: number } {
   }
   return { bytes, ink: ink / bytes.length };
 }
-async function finalizeCandidate(candidate: Candidate) {
-  if (candidate.finalized || !candidate.processed || !candidate.endedAt) return;
-  candidate.finalized = true;
-  try {
-    if (!candidate.phrase) return;
-    const game = candidate.game;
-    await game.writes;
-    // A final key may still be in the content script's 90 ms batch.
-    const settle = candidate.endedAt + 200 - Date.now();
-    if (settle > 0) await new Promise(resolve => setTimeout(resolve, settle));
-    const precedingCompletion = candidate.precedingBoundary ? await candidate.precedingBoundary.promise : null;
-    const { attempt, completionAt } = replayCapturedPhrase({
-      phrase: candidate.phrase, strokes: keyBuffer, observedAt: candidate.at, endedAt: candidate.endedAt,
-      sessionId: game.session.id, contiguous: candidate.reliableBoundary, precedingCompletion,
-      observationReliable: candidate.observationReliable, focusGaps, accuracyMode: game.session.mode === 'accuracy',
-    });
-    if (!attempt) return;
-    await saveAttempt(attempt);
-    if (attempt.reliable) {
-      game.session.correctKeys += attempt.correctKeys;
-      game.session.mistakes += attempt.mistakes;
-      await persistGame(game);
+function finalizeCandidate(candidate: Candidate): Promise<void> {
+  if (candidate.finalized || !candidate.processed || candidate.endedAt === undefined) return Promise.resolve();
+  if (candidate.finalizing) return candidate.finalizing;
+  unfinishedCandidates.add(candidate);
+  const task = (async () => {
+    try {
+      if (!candidate.phrase) { candidate.finalized = true; return; }
+      const game = candidate.game;
+      if (!candidate.pendingAttempt) {
+        // A final key may still be in the content script's 90 ms batch.
+        const settle = candidate.endedAt! + 200 - Date.now();
+        if (settle > 0) await new Promise(resolve => setTimeout(resolve, settle));
+        const precedingCompletion = candidate.precedingBoundary ? await candidate.precedingBoundary.promise : null;
+        const { attempt, completionAt } = replayCapturedPhrase({
+          phrase: candidate.phrase, strokes: keyBuffer, observedAt: candidate.at, endedAt: candidate.endedAt!,
+          sessionId: game.session.id, contiguous: candidate.reliableBoundary, precedingCompletion,
+          observationReliable: candidate.observationReliable, focusGaps, accuracyMode: game.session.mode === 'accuracy',
+        });
+        if (!attempt) { candidate.finalized = true; return; }
+        // Keep the same ID and replayed keys across retries, even after the
+        // candidate has been replaced or its source key buffer has moved on.
+        candidate.pendingAttempt = { value: attempt, completionAt, saved: false, totalsApplied: false };
+      }
+      const pending = candidate.pendingAttempt;
+      await game.writes.catch(() => persistGame(game));
+      if (!pending.saved) { await saveAttempt(pending.value); pending.saved = true; }
+      if (pending.value.reliable) {
+        if (!pending.totalsApplied) {
+          game.session.correctKeys += pending.value.correctKeys;
+          game.session.mistakes += pending.value.mistakes;
+          pending.totalsApplied = true;
+        }
+        await persistGame(game);
+      }
+      candidate.completionBoundary.settle(pending.completionAt);
+      candidate.finalized = true;
+    } finally {
+      // Release boundary waiters on errors, but retain failed persistence for
+      // retry. A later save must not retroactively strengthen a successor.
+      candidate.completionBoundary.settle(null);
+      candidate.precedingBoundary = undefined;
+      candidate.japanese.width = 1; candidate.roman.width = 1;
+      if (candidate.reading) candidate.reading.width = 1;
+      if (candidate.finalized) unfinishedCandidates.delete(candidate);
     }
-    candidate.completionBoundary.settle(completionAt);
-  } finally {
-    // Every skipped/error path settles the handoff so stop() and later words
-    // can never wait forever for an OCR result that will not arrive.
-    candidate.completionBoundary.settle(null);
-    candidate.precedingBoundary = undefined;
-    candidate.japanese.width = 1; candidate.roman.width = 1;
-    if (candidate.reading) candidate.reading.width = 1;
-  }
+  })();
+  candidate.finalizing = task;
+  const release = () => { if (candidate.finalizing === task) candidate.finalizing = undefined; };
+  void task.then(release, release);
+  return task;
+}
+async function retryCandidateWrites() {
+  for (const candidate of [...unfinishedCandidates]) await finalizeCandidate(candidate);
 }
 function endCurrent(at: number, observedExit = true) {
   if (!currentCandidate || !closeObservedBoundary(currentCandidate, at, observedExit)) return;
-  if (currentCandidate.activityOccurrence) currentCandidate.activityOccurrence.until = at;
   if (currentCandidate.processed) {
     const write = finalizeCandidate(currentCandidate).catch(reportError);
     pendingWrites.add(write);
@@ -305,7 +350,8 @@ function endCurrent(at: number, observedExit = true) {
   }
 }
 function resetAutoRegions(at: number, publish = true, confirmedResult = false) {
-  breakActivity(activeGame, at);
+  breakActivity(activeGame, at, confirmedResult);
+  endActivityOccurrence(activeGame, at);
   // An unknown loss makes the attempt's end uncertain. A detected receipt is
   // an observed game-end transition and retains the final phrase's boundary.
   endCurrent(at, confirmedResult);
@@ -315,6 +361,7 @@ function resetAutoRegions(at: number, publish = true, confirmedResult = false) {
   manualRegions = false;
   lastRegionScan = 0;
   promptSignatures.reset();
+  activitySignatures.reset();
   if (publish) announce({ regionState: 'searching', regionConfidence: undefined, region: undefined, message: captureWarning ?? (status.ocrReady ? 'お題を探しています' : '文字認識を準備しています') });
 }
 function panelMoved(previous: Rect, next: Rect): boolean {
@@ -368,13 +415,11 @@ function candidateFromFrame(at: number, signature: Uint8Array, reliableBoundary:
   const c = calibration!;
   const bounds = unionRects([c.japanese, c.roman, ...(c.reading ? [c.reading] : [])]);
   const evidence = crop(bounds);
-  const id = ++sequence, activityOccurrence = { id: `${activeGame!.session.id}:${id}`, from: at };
-  activeGame!.activityOccurrences.push(activityOccurrence);
-  recordActivityOccurrence(activeGame!, activityOccurrence);
+  const id = ++sequence;
   return {
     game: activeGame!, completionBoundary: createCompletionBoundary(),
     precedingBoundary: reliableBoundary && currentCandidate?.game === activeGame ? currentCandidate.completionBoundary : undefined,
-    id, at, activityOccurrence, japanese: crop(c.japanese, true), reading: c.reading ? crop(c.reading, true) : undefined,
+    id, at, japanese: crop(c.japanese, true), reading: c.reading ? crop(c.reading, true) : undefined,
     roman: crop(c.roman, true), screenshot: evidence.toDataURL('image/jpeg', .84), signature,
     processed: false, finalized: false, reliableBoundary, observationReliable: false,
   };
@@ -396,17 +441,23 @@ function sampleFrame(now = Date.now()) {
   if (manualRegions && activeGame?.resultSeen) resetAutoRegions(now);
   scanRegions(now);
   if ((!calibration || manualRegions) && collectResultFrame(now)) return;
-  if (!status.ocrReady || !calibration) return;
+  if (!calibration) return;
   const { bytes, ink } = imageSignature(calibration.japanese);
   if (ink < .006 || ink > .85) {
     if (collectResultFrame(now, true)) return;
     breakActivity(activeGame, now);
+    endActivityOccurrence(activeGame, now);
     currentCandidate?.completionBoundary.settle(null);
     endCurrent(now, false);
     promptSignatures.reset();
+    activitySignatures.reset();
     return;
   }
   if (manualRegions) observePrompt(now);
+  // Physical practice volume depends on stable visual prompts, not on whether
+  // OCR startup has completed or can decode a particular word.
+  observeActivityPhrase(bytes, now);
+  if (!status.ocrReady) return;
   const transition = promptSignatures.observe(bytes, now);
   if (transition.interruptedAt !== undefined) endCurrent(transition.interruptedAt);
   if (!transition.candidate) return;
@@ -467,7 +518,7 @@ function collectResultFrame(now: number, force = false, observedFrame?: ImageDat
   // Starting a recording on an old result must not create another score. A
   // genuine prompt has to have been visible during this recording first.
   const surface = frameSurface();
-  if (!game?.observedPrompt || game.scoreSaved || !status.ocrReady || !surface.ready || !surface.width) return false;
+  if (!game?.observedPrompt || game.scoreSaved || !surface.ready || !surface.width) return false;
   // One external image is one observation, even if multiple detection paths
   // request a forced scan while handling that same frame.
   if (status.source === 'canvas' && lastCanvasResultSequence === lastCanvasSequence) return lastCanvasResultFound;
@@ -496,6 +547,7 @@ function collectResultFrame(now: number, force = false, observedFrame?: ImageDat
     resetAutoRegions(now, false, true);
     void persistGame(game).catch(reportError);
   }
+  if (!status.ocrReady) return true;
   if (scoreQueue.length >= 4) return true;
   scoreQueue.push({
     game, at: now, revision, header: crop(regions.header, true), total: crop(regions.total, true),
@@ -717,6 +769,7 @@ async function prepareReplay(message: { sessionId?: unknown }) {
       await processQueue();
       if (!replayStillCurrent(request)) return replayUnavailable('記録または画面が切り替わりました。');
       await Promise.all([...pendingWrites]);
+      await retryCandidateWrites();
       // The existing queue settles first; retry its latest cumulative snapshot
       // so a previously failed save does not permanently disable a later retry.
       await persistGame(game);
@@ -735,6 +788,7 @@ async function prepareReplay(message: { sessionId?: unknown }) {
       do {
         await processQueue();
         await Promise.all([...pendingWrites]);
+        await retryCandidateWrites();
         saved = game.writes; await saved;
       } while (replayStillCurrent(request) && (processing || pendingWrites.size || saved !== game.writes));
       if (!replayStillCurrent(request) || (!game.scoreSaved && !game.session.scoreReview)) return replayUnavailable('記録または画面が切り替わりました。');
@@ -853,7 +907,7 @@ async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; ta
   calibration = undefined; manualRegions = false; detectedRegions = null; lastRegionScan = 0;
   keyBuffer = []; seenKeyEvents = new Set(); focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
   games = []; activeGame = null; session = null; lastResultScan = 0;
-  promptSignatures.reset(); sequence = 0;
+  promptSignatures.reset(); activitySignatures.reset(); sequence = 0; unfinishedCandidates.clear();
   lastCanvasAt = 0; lastCanvasSequence = lastCanvasResultSequence = -1; lastCanvasResultFound = false;
   pendingCanvasDecode?.abort(); pendingCanvasDecode = null; externalCanvas.width = externalCanvas.height = 1;
   captureWarning = undefined; lastFrameWidth = lastFrameHeight = 0;
@@ -927,6 +981,7 @@ async function finishStop() {
   sampleTimer = heartbeat = activityTimer = undefined;
   const endedAt = Date.now();
   breakActivity(activeGame, endedAt);
+  endActivityOccurrence(activeGame, endedAt);
   for (const game of games) recordObservedActivity(game);
   endCurrent(endedAt);
   announce({ state: 'stopping', message: '最後のお題を保存しています' });
@@ -947,6 +1002,8 @@ async function finishStop() {
   await processQueue();
   if (currentCandidate) await finalizeCandidate(currentCandidate).catch(reportError);
   await Promise.all([...pendingWrites]);
+  let attemptWriteFailed = false;
+  await retryCandidateWrites().catch(error => { attemptWriteFailed = true; reportError(error); });
   for (const game of games) {
     if (!game.scoreSaved && game.lastResult) {
       const last = game.lastResult;
@@ -962,7 +1019,9 @@ async function finishStop() {
   jpWorker = romanWorker = null; initializing = null;
   keyBuffer = []; seenKeyEvents.clear(); focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
   calibration = undefined; detectedRegions = null; manualRegions = false;
-  announce({ state: 'idle', ocrReady: false, regionState: undefined, regionConfidence: undefined, region: undefined, message: captureWarning });
+  const error = attemptWriteFailed ? '最後の入力履歴を保存できませんでした。保存済みの履歴を確認してください。' : undefined;
+  announce({ state: attemptWriteFailed ? 'error' : 'idle', ocrReady: false, regionState: undefined, regionConfidence: undefined, region: undefined, message: error ?? captureWarning });
+  if (attemptWriteFailed) return { ok: false, error, status, sessionId: session?.id };
   return { ok: true, status, sessionId: session?.id };
 }
 function snapshot() {

@@ -694,7 +694,7 @@ try {
   await run('Live WebGL recording respects visibility and manual pause, and replay shortcuts only act on results', async () => {
     let game, panel;
     let observedTabId;
-    const result = report.automaticCanvas = { preserveDrawingBuffer: false, phases: {}, diagnostics: {} };
+    const result = report.automaticCanvas = { startedAt: Date.now(), preserveDrawingBuffer: false, phases: {}, diagnostics: {} };
     const send = (type, timeout = 30000) => app.evaluate(({ type, timeout }) => new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`${type} did not respond within ${timeout} ms`)), timeout);
       chrome.runtime.sendMessage({ type }).then(reply => { clearTimeout(timer); resolve(reply); }, error => { clearTimeout(timer); reject(error); });
@@ -716,7 +716,7 @@ try {
           confidence: value.scoreReview.confidence, observedAt: value.scoreReview.observedAt,
           hasEvidence: !!value.scoreReview.evidence } : undefined,
       }));
-    }, result.phases.opened?.startedAt ?? Date.now());
+    }, result.startedAt);
     const diagnose = async label => {
       const details = result.diagnostics[label] = {};
       const [routing, status] = await Promise.all([
@@ -914,15 +914,21 @@ try {
         const before = await fixtureState(), sessionBefore = (await readStatus()).activeSessionId;
         assert.equal(before.state, expectedState);
         await game.keyboard.press(key);
-        // Allow the actual runtime roundtrip to reject the action, so the
-        // assertion cannot pass merely because its asynchronous reply is late.
-        await game.waitForTimeout(1200);
-        const after = await fixtureState();
-        assert.equal(after.state, before.state, `${label}: the fixture changed screens`);
-        assert.equal(after.round, before.round, `${label}: an unintended replay occurred`);
-        assert.deepEqual(escapeEvents(after), escapeEvents(before), `${label}: an Escape was synthesized`);
+        // Cover the full eight-second replay deadline, including a late
+        // response. A shorter fixed delay can miss an incorrectly allowed key.
+        const startedAt = Date.now(), deadline = startedAt + 9000;
+        let after;
+        do {
+          after = await fixtureState();
+          assert.equal(after.state, before.state, `${label}: the fixture changed screens`);
+          assert.equal(after.round, before.round, `${label}: an unintended replay occurred`);
+          assert.deepEqual(escapeEvents(after), escapeEvents(before), `${label}: an Escape was synthesized`);
+          if (Date.now() >= deadline) break;
+          await game.waitForTimeout(250);
+        } while (true);
         assert.equal((await readStatus()).activeSessionId, sessionBefore, `${label}: a new game was created`);
-        return { key, screen: after.state, round: after.round, noSyntheticEscape: true };
+        return { key, screen: after.state, round: after.round, noSyntheticEscape: true,
+          observedForMs: Date.now() - startedAt };
       };
       const savedResult = async (label, gameId) => {
         const shownAt = Date.now();
@@ -1028,9 +1034,9 @@ try {
   report.errors.push(String(e.stack || e));
   console.error(e.message || e);
   if (cdp) {
-    try { report.extensionsAtFailure = (await cdp.send('Extensions.getExtensions')).extensions; }
+    try { report.extensionsAtFailure = (await cdp.send('Extensions.getExtensions', {}, { timeout: 5000 })).extensions; }
     catch (diagnosticError) { report.extensionDiagnosticError = String(diagnosticError.message || diagnosticError); }
-    try { report.targetsAtFailure = (await cdp.send('Target.getTargets')).targetInfos; }
+    try { report.targetsAtFailure = (await cdp.send('Target.getTargets', {}, { timeout: 5000 })).targetInfos; }
     catch (diagnosticError) { report.targetDiagnosticError = String(diagnosticError.message || diagnosticError); }
   }
   if (context) report.openPagesAtFailure = context.pages().map(page => page.url());

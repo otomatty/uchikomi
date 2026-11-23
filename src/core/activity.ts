@@ -137,14 +137,17 @@ export function dailyTraining(data:AppData,options:{today?:string;days?:number}=
     }
     const usable=history.filter(attempt=>attempt.source===kind&&tryDate(attempt.startedAt));
     if(usable.length){
-      for(const attempt of usable){
+      // Empty old attempts establish that history exists, but do not create
+      // activity or allow the parent session's larger estimate to replace it.
+      const active=usable.filter(attempt=>positive(attempt.durationMs)>0||positive(attempt.correctKeys)>0||positive(attempt.mistakes)>0||(attempt.judgements?.length??0)>0);
+      for(const attempt of active){
         const date=trainingDateKey(attempt.startedAt),keyCount=positive(attempt.correctKeys)+positive(attempt.mistakes);
         addDuration(kind,attempt.startedAt,attempt.endedAt,positive(attempt.durationMs));
         let datedKeys=0;
         for(const judgement of attempt.judgements??[]){const keyDate=tryDate(judgement.at);if(keyDate){add(keyDate,kind,{keys:1,estimated:true});datedKeys++;}}
         add(date,kind,{keys:Math.max(0,keyCount-datedKeys),phrases:1,estimated:true});
       }
-      add(trainingDateKey(usable[0].startedAt),kind,{records:1,estimated:true});
+      if(active.length)add(trainingDateKey(active[0].startedAt),kind,{records:1,estimated:true});
     }else if(session&&tryDate(session.startedAt)){
       const value={activeMs:positive(session.durationMs),keys:positive(session.correctKeys)+positive(session.mistakes),phrases:positive(session.phraseCount)};
       if(!hasActivity(value))continue;

@@ -11,9 +11,12 @@ export function createChromiumPipeTransport(pipeWrite, pipeRead) {
   const notifyClose = () => {
     if (!closed || !closeCallback || notified) return;
     notified = true;
-    const callback = closeCallback;
     // Deliver already received messages first, in their wire order.
-    setImmediate(() => callback(closeReason));
+    setImmediate(() => {
+      const callback = closeCallback;
+      if (!callback) { notified = false; return; }
+      callback(closeReason);
+    });
   };
   const transport = {
     onmessage: undefined,
@@ -45,6 +48,14 @@ export function createChromiumPipeTransport(pipeWrite, pipeRead) {
         message = JSON.parse(Buffer.concat(pending).toString('utf8'));
       } catch {
         transport.close('Chrome sent an invalid JSON pipe message');
+        return;
+      }
+      const record = message !== null && typeof message === 'object' && !Array.isArray(message);
+      const valid = record && (Object.hasOwn(message, 'id')
+        ? Number.isSafeInteger(message.id) && message.id >= 0
+        : typeof message.method === 'string' && message.method.trim().length > 0);
+      if (!valid) {
+        transport.close('Chrome sent an invalid CDP pipe message');
         return;
       }
       pending = [];

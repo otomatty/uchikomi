@@ -25,6 +25,7 @@ interface FixtureOptions {
   clock?: () => number;
   decode?: () => Promise<void>;
   saveSession?: typeof db.saveSession;
+  saveAttempt?: typeof db.saveAttempt;
   controlReplayTimeout?: boolean;
   controlDecodeTimeout?: boolean;
 }
@@ -126,7 +127,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
           return worker.recognize(crop, ...rest);
         } };
       }) };
-      if (name === '../core/db') return options.saveSession ? { ...db, saveSession: options.saveSession } : db;
+      if (name === '../core/db') return { ...db, saveSession: options.saveSession ?? db.saveSession, saveAttempt: options.saveAttempt ?? db.saveAttempt };
       if (name === 'tesseract.js') return { PSM: { SINGLE_LINE: '7' } };
       if ((receipt !== undefined || options.scene) && name === './auto-region') return { detectPromptRegions: () => {
         if (!options.scene?.prompt) return null;
@@ -793,6 +794,122 @@ test('a failed review save blocks replay, while a later successful durable save 
   assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
 });
 
+async function typedResultFixture(options: Pick<FixtureOptions, 'saveAttempt' | 'saveSession'> = {}) {
+  const base = 1700000000000;
+  let now = base, sequence = 0, receiptLine = 0, terminatedWorkers = 0;
+  const scene = { prompt: true, receipt: false, variant: 0 };
+  const jp = { async setParameters() {}, async terminate() { terminatedWorkers++; }, async recognize(image: any) {
+    const text = image.fixtureFrame === 'prompt' ? image.fixtureCropY === 248 ? 'ぺあるっく' : 'ペアルック'
+      : image.fixtureFrame === 'receipt' && image.fixtureCropY === 160 ? receiptLines[receiptLine++ % 4] : '?';
+    return { data: { text, confidence: 96 } };
+  } };
+  const roman = { async setParameters() {}, async terminate() { terminatedWorkers++; }, async recognize(image: any) {
+    return { data: { text: image.fixtureFrame === 'prompt' ? 'pearukku' : '?', confidence: 96 } };
+  } };
+  const app = await fixture(async () => [jp, roman], undefined, { ...options, scene, clock: () => now });
+  await app.start(canvasStart); await new Promise(resolve => setImmediate(resolve));
+  const send = async (offset: number) => {
+    now = base + offset;
+    assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, ++sequence) })).ok, true);
+    await app.evaluate('processQueue()');
+  };
+  const keys = async (text: string, offset: number) => {
+    const strokes = [...text].map((key, index) => ({ key, code: `Key${key.toUpperCase()}`, at: base + offset + index * 10 }));
+    now = Math.max(now, strokes.at(-1)!.at);
+    await app.request('UCHI_OFF_KEYS', { sessionId: 'startup-test', keys: strokes });
+  };
+  await send(80); await send(160);
+  await keys('pearukku', 170); await send(240);
+  scene.variant = 1; await send(320);
+  await keys('pearuk', 340); await send(400);
+  await keys('ku', 400); await send(480);
+  scene.prompt = false; scene.receipt = true; await send(560);
+  await app.evaluate('Promise.all([...pendingWrites])');
+  assert.equal(app.evaluate('activeGame.lastResult.parsed.score'), 29740);
+  return { ...app, terminatedWorkers: () => terminatedWorkers };
+}
+
+test('failed attempt writes remain retryable after replacement and block replay until the same attempts are saved', async () => {
+  let fail = true;
+  const writtenIds: string[] = [];
+  const app = await typedResultFixture({ saveAttempt: async attempt => {
+    writtenIds.push(attempt.id);
+    if (fail) throw new Error('Storage temporarily unavailable');
+    await db.saveAttempt(attempt);
+  } });
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 2, 'both the replaced and final candidates retain their failed writes');
+  assert.equal(app.evaluate('currentCandidate.finalized'), false);
+  assert.equal((await db.getData()).attempts.length, 0);
+  const originalIds = [...new Set(writtenIds)].sort();
+  assert.equal(originalIds.length, 2);
+  const blocked = await replay(app);
+  assert.equal(blocked.ready, false); assert.match(blocked.reason, /保存/);
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 2);
+  assert.equal((await db.getData()).attempts.length, 0);
+  fail = false;
+  assert.equal((await replay(app)).ready, true);
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 0);
+  assert.equal(app.evaluate('currentCandidate.finalized'), true);
+  const data = await db.getData();
+  assert.deepEqual(data.attempts.map(attempt => attempt.id).sort(), originalIds, 'a retry keeps its original attempt ID and does not create another history row');
+  assert.equal(data.attempts.filter(attempt => attempt.reliable).length, 1);
+  assert.equal(data.sessions[0].correctKeys, 8);
+  assert.equal(data.sessions[0].mistakes, 0);
+  await app.evaluate('finalizeCandidate(currentCandidate)');
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+  assert.equal((await db.getData()).sessions[0].correctKeys, 8);
+});
+
+test('retrying a session write after its attempt was saved cannot write or aggregate that attempt twice', async () => {
+  let fail = true;
+  const writtenIds: string[] = [];
+  const app = await typedResultFixture({
+    saveAttempt: async attempt => { writtenIds.push(attempt.id); await db.saveAttempt(attempt); },
+    saveSession: async session => {
+      if (fail && session.correctKeys > 0) throw new Error('Storage temporarily unavailable');
+      await db.saveSession(session);
+    },
+  });
+  assert.equal((await db.getData()).attempts.length, 2);
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 1);
+  assert.equal(app.evaluate('currentCandidate.pendingAttempt.saved'), true);
+  assert.equal((await replay(app)).ready, false);
+  fail = false;
+  assert.equal((await replay(app)).ready, true);
+  assert.equal(writtenIds.length, 2, 'successful attempt writes are not repeated after a later session failure');
+  assert.equal((await db.getData()).sessions[0].correctKeys, 8);
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 0);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('a permanent final attempt failure stops capture, retains daily activity and reports STOP failure after cleanup', async () => {
+  let hold = false;
+  const release = deferred<void>();
+  const app = await typedResultFixture({ saveAttempt: async () => {
+    if (hold) await release.promise;
+    throw new Error('Storage temporarily unavailable');
+  } });
+  hold = true;
+  const stopping = app.request('UCHI_OFF_STOP');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.intervals.size, 0, 'capture timers stop before a pending persistence retry finishes');
+  assert.equal((await app.request('UCHI_OFF_FRAME')).ok, false);
+  assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(1700000000640, 99) })).dropped, true);
+  release.resolve();
+  const stopped = await stopping;
+  assert.equal(stopped.ok, false); assert.match(stopped.error, /入力履歴を保存できません/);
+  assert.equal(stopped.status.state, 'error');
+  assert.equal(stopped.status.ocrReady, false);
+  assert.equal(app.terminatedWorkers(), 2);
+  const data = await db.getData();
+  assert.equal(data.attempts.length, 0, 'failed history writes are not claimed as saved');
+  assert.ok(data.sessions[0].endedAt);
+  assert.equal(data.sessions[0].activity?.reduce((sum, row) => sum + row.keys, 0), 16);
+  assert.equal(data.sessions[0].activity?.reduce((sum, row) => sum + row.phrases, 0), 2);
+  assert.equal(data.sessions[0].activity?.reduce((sum, row) => sum + row.activeMs, 0), 240);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, false, 'a repeated STOP must not change the failed outcome into success');
+});
+
 test('tab replay freshness follows actual presented or decoded frames rather than its sampling timer', async () => {
   let now = 1700000000000;
   const scene = { prompt: true, receipt: false }, ready = deferred<any[]>();
@@ -811,15 +928,15 @@ test('tab replay freshness follows actual presented or decoded frames rather tha
 });
 
 
-async function activityFixture(base = Date.parse('2026-12-24T14:59:59.000Z')) {
+async function activityFixture(base = Date.parse('2026-12-24T14:59:59.000Z'), startWorkers?: () => Promise<any[]>) {
   let now = base, sequence = 0;
-  const scene = { prompt: false, receipt: false };
+  const scene = { prompt: false, receipt: false, variant: 0 };
   // Real prompt geometry is enough to retain physical volume even when text
   // recognition never produces a usable phrase or an accurate speed result.
   const worker = () => ({ async setParameters() {}, async terminate() {}, async recognize() { return { data: { text: '?', confidence: 10 } }; } });
-  const app = await fixture(async () => [worker(), worker()], undefined, { scene, clock: () => now });
+  const app = await fixture(startWorkers ?? (async () => [worker(), worker()]), undefined, { scene, clock: () => now });
   await app.start(canvasStart); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.evaluate('status.ocrReady'), true);
+  if (!startWorkers) assert.equal(app.evaluate('status.ocrReady'), true);
   const keys = async (values: [number, string][]) => {
     const strokes = values.map(([offset, key]) => ({ key, code: key === ' ' ? 'Space' : `Key${key.toUpperCase()}`, at: base + offset }));
     now = Math.max(now, ...strokes.map(stroke => stroke.at));
@@ -839,6 +956,87 @@ async function activityFixture(base = Date.parse('2026-12-24T14:59:59.000Z')) {
   };
   return { app, scene, keys, observed, checkpoint, gap, base };
 }
+
+test('a continuous result boundary includes late final gameplay keys and excludes result-screen keys', async () => {
+  const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'));
+  run.scene.prompt = true;
+  for (const at of [80, 160, 240, 320]) await run.observed(at);
+  run.scene.prompt = false; run.scene.receipt = true;
+  await run.observed(560);
+  // The final gameplay batch arrives after the receipt. Neither the exact
+  // receipt timestamp nor a later result-screen shortcut is gameplay input.
+  await run.keys([[350, 'a'], [540, ' '], [560, 'x'], [590, 'z']]);
+  await run.checkpoint();
+  const measured = [{ date: '2026-12-25', activeMs: 190, keys: 2, phrases: 1 }];
+  assert.deepEqual((await db.getData()).sessions[0].activity, measured);
+  await run.keys([[350, 'a'], [540, ' ']]);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  assert.deepEqual((await db.getData()).sessions[0].activity, measured);
+});
+
+test('result detection cannot extend activity over a missing frame, focus gap or viewport change', async () => {
+  for (const gap of ['frame', 'UCHI_OFF_GAP', 'UCHI_OFF_VIEW_CHANGE'] as const) {
+    await db.clearData();
+    const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'));
+    run.scene.prompt = true;
+    await run.observed(80); await run.observed(160); await run.observed(240);
+    await run.keys([[300, 'a']]); await run.observed(320);
+    if (gap !== 'frame') await run.gap(gap, 330);
+    run.scene.prompt = false; run.scene.receipt = true;
+    await run.observed(gap === 'frame' ? 640 : 560);
+    await run.keys([[350, 'x'], [650, ' ']]);
+    assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+    assert.deepEqual((await db.getData()).sessions[0].activity,
+      [{ date: '2026-12-25', activeMs: 0, keys: 1, phrases: 1 }], gap);
+  }
+});
+
+test('visual phrase activity survives OCR startup and is not counted again when OCR becomes ready', async () => {
+  const ready = deferred<any[]>();
+  const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'), () => ready.promise);
+  run.scene.prompt = true;
+  await run.observed(80); await run.keys([[100, 'a']]); await run.observed(160);
+  await run.keys([[200, 'b']]); await run.observed(240); await run.observed(320);
+  run.scene.variant = 1;
+  await run.observed(400); await run.keys([[420, 'c']]); await run.observed(480);
+  await run.keys([[520, 'd']]); await run.observed(560); await run.observed(640);
+  assert.equal(run.app.evaluate('status.ocrReady'), false);
+  await run.checkpoint();
+  assert.deepEqual((await db.getData()).sessions[0].activity,
+    [{ date: '2026-12-25', activeMs: 420, keys: 4, phrases: 2 }]);
+  const worker = () => ({ async setParameters() {}, async terminate() {}, async recognize() { return { data: { text: '?', confidence: 10 } }; } });
+  ready.resolve([worker(), worker()]); await new Promise(resolve => setImmediate(resolve));
+  await run.observed(720); await run.keys([[740, 'e']]); await run.observed(800);
+  await run.keys([[840, 'f']]); await run.observed(880);
+  run.scene.prompt = false; run.scene.receipt = true; await run.observed(1120);
+  assert.equal(run.app.evaluate('status.ocrReady'), true);
+  assert.ok(run.app.ocrInputs.length > 0, 'the visible startup word is still eligible for OCR when workers arrive');
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  const data = await db.getData();
+  assert.deepEqual(data.sessions[0].activity,
+    [{ date: '2026-12-25', activeMs: 740, keys: 6, phrases: 2 }]);
+  assert.equal(data.attempts.length, 0, 'visual volume does not invent a recognized or reliable attempt');
+});
+
+test('failed OCR startup still measures visual phrases and separates games without counting result keys', async () => {
+  const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'), async () => { throw new Error('OCR unavailable'); });
+  assert.equal(run.app.evaluate('status.ocrReady'), false);
+  await run.keys([[20, ' ']]); run.scene.prompt = true;
+  await run.observed(80); await run.keys([[100, 'a']]); await run.observed(160); await run.observed(320);
+  run.scene.variant = 1;
+  await run.observed(400); await run.keys([[420, 'b']]); await run.observed(480); await run.observed(560);
+  run.scene.prompt = false; run.scene.receipt = true; await run.observed(800);
+  await run.keys([[850, ' ']]);
+  run.scene.prompt = true; run.scene.receipt = false;
+  await run.observed(1040); await run.keys([[1080, 'c']]); await run.observed(1120); await run.observed(1280);
+  run.scene.prompt = false; run.scene.receipt = true; await run.observed(1520);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  const data = await db.getData();
+  assert.equal(data.sessions.length, 2);
+  assert.deepEqual(data.sessions[0].activity, [{ date: '2026-12-25', activeMs: 320, keys: 2, phrases: 2 }]);
+  assert.deepEqual(data.sessions[1].activity, [{ date: '2026-12-25', activeMs: 0, keys: 1, phrases: 1 }]);
+  assert.equal(data.phrases.length, 0); assert.equal(data.attempts.length, 0);
+});
 
 test('capture checkpoints retain uncertain physical input across JST days without menu keys or duplicate batches', async () => {
   const run = await activityFixture();

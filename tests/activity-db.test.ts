@@ -15,14 +15,15 @@ const row=(date='2026-12-25',activeMs=1000,keys=10,phrases=2):DailyActivity=>({d
 test('cumulative activity survives stale session saves and both automatic and manual score changes',async()=>{
   await saveSession({...base(),activity:[row()]});
   await saveAutomaticScore('game',{score:30000,scoreType:'total',scoreConfidence:95,scoreObservedAt:now+2000});
+  await saveSession({...base(),activity:[row('2026-12-25',500,8,1)]});
   await Promise.all([
-    saveSession({...base(),activity:[row('2026-12-25',500,8,1)]}),
+    saveSession({...base(),activity:[row('2026-12-27',300,4,1)]}),
     saveSession({...base(),activity:[row('2026-12-26',200,3,1)]}),
   ]);
   await saveSession({...base(),score:31000,scoreType:'total',scoreSource:'manual'});
   await saveSession({...base(),activity:[]});
   const saved=(await getData()).sessions[0];
-  assert.deepEqual(saved.activity,[row(),row('2026-12-26',200,3,1)]);
+  assert.deepEqual(saved.activity,[row(),row('2026-12-26',200,3,1),row('2026-12-27',300,4,1)]);
   assert.equal(saved.score,31000);assert.equal(saved.scoreSource,'manual');
   assert.equal(await saveAutomaticScore('game',{score:32000,scoreType:'total',scoreConfidence:99,scoreObservedAt:now+5000}),false);
   assert.deepEqual((await getData()).sessions[0].activity,saved.activity);

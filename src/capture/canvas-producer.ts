@@ -26,11 +26,25 @@ export function visibleGameCanvas(document: Document): HTMLCanvasElement | null 
     if (!canvas.isConnected || canvas.width <= 0 || canvas.height <= 0) return false;
     const rect = canvas.getBoundingClientRect();
     if (rect.width <= 200 || rect.height <= 100 || rect.bottom <= 0 || rect.right <= 0 || rect.top >= view.innerHeight || rect.left >= view.innerWidth) return false;
+    let left = Math.max(0, rect.left), right = Math.min(view.innerWidth, rect.right);
+    let top = Math.max(0, rect.top), bottom = Math.min(view.innerHeight, rect.bottom);
     // A canvas hidden by an ancestor is not a visible game surface yet.
     // No canvas pixels or game state are read during discovery.
     for (let element: Element | null = canvas; element; element = element.parentElement) {
       const style = view.getComputedStyle(element);
       if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
+      if (element !== canvas) {
+        const clips = (value: string) => /^(hidden|clip|auto|scroll)$/.test(value);
+        const clipsPaint = /\b(paint|strict|content)\b/.test(style.contain);
+        const clipX = clipsPaint || clips(style.overflowX || style.overflow);
+        const clipY = clipsPaint || clips(style.overflowY || style.overflow);
+        if (clipX || clipY) {
+          const bounds = element.getBoundingClientRect();
+          if (clipX) { left = Math.max(left, bounds.left); right = Math.min(right, bounds.right); }
+          if (clipY) { top = Math.max(top, bounds.top); bottom = Math.min(bottom, bounds.bottom); }
+          if (left >= right || top >= bottom) return false;
+        }
+      }
     }
     return true;
   });
@@ -77,8 +91,7 @@ export function createCanvasProducer(
   let callback: number | undefined;
   let reader: ReadableStreamDefaultReader<VideoFrame> | undefined;
   let presented = -1;
-  let captured = -1;
-  let frameAt = 0;
+  let pendingFrame: CanvasFrame | undefined;
   let sequence = 0;
   let cancelStartup!: () => void;
   const cancelled = new Promise<void>(resolve => { cancelStartup = resolve; });
@@ -86,6 +99,7 @@ export function createCanvasProducer(
   function stop() {
     if (stopped) return;
     stopped = true;
+    pendingFrame = undefined;
     cancelStartup();
     if (timer !== undefined) view.clearInterval(timer);
     if (firstFrameTimer !== undefined) view.clearTimeout(firstFrameTimer);
@@ -152,15 +166,13 @@ export function createCanvasProducer(
   }
 
   async function sample() {
-    if (stopped || sending || !video || presented < 0 || presented === captured || !context || video.readyState < 2) return;
+    if (stopped || sending || !pendingFrame) return;
     if (canvas.ownerDocument.visibilityState !== 'visible') return;
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    if (!width || !height) return;
+    const frame = pendingFrame;
+    pendingFrame = undefined;
     sending = true;
-    captured = presented;
     try {
-      await options.onFrame(encode(video, width, height, frameAt));
+      await options.onFrame(frame);
       acknowledged();
     } catch (error) {
       if (!stopped) fail(error instanceof Error ? error : new Error('ゲーム画面を送信できませんでした。'));
@@ -171,11 +183,15 @@ export function createCanvasProducer(
 
   function observeFrame(now: number, metadata: VideoFrameCallbackMetadata) {
     if (stopped || !video) return;
-    // Timers only sample a newly presented source frame. A frozen image never
-    // counts as multiple independent observations of a prompt or a receipt.
-    if (metadata.presentedFrames !== presented) {
+    // Snapshot in the presentation callback itself: a later timer could see
+    // newer video pixels with this older timestamp, then count them twice.
+    // Keep only the latest immutable JPEG while one message is in flight.
+    if (Number.isFinite(metadata.presentedFrames) && metadata.presentedFrames > presented) {
       presented = metadata.presentedFrames;
-      frameAt = view.performance.timeOrigin + now;
+      if (context && canvas.ownerDocument.visibilityState === 'visible' && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+        try { pendingFrame = encode(video, video.videoWidth, video.videoHeight, view.performance.timeOrigin + now); }
+        catch (error) { fail(error instanceof Error ? error : new Error('ゲーム画面を取得できませんでした。')); return; }
+      }
     }
     callback = video.requestVideoFrameCallback(observeFrame);
   }

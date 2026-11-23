@@ -141,13 +141,47 @@ test('ordinary repeat captures update one preview while keeping the finite migra
   assert.equal(second.screenshot,images[1]);assert.equal(second.screenshots,undefined,'normal observations do not start an image archive');
 });
 
+test('replaying an original-ID backup after fresh captures never archives their live previews',async()=>{
+  const first=phrase('first',{screenshot:images[0]}),old=phrase('retired',{screenshot:images[1],capturedAt:now+100});
+  await legacy([first,old],[]);
+  const backup={version:1,phrases:[old],attempts:[],sessions:[],settings:DEFAULT_SETTINGS};
+  for(let i=0;i<5;i++){
+    const screenshot=`data:image/png;base64,${Buffer.from(`live-preview-${i}`).toString('base64')}`;
+    const captured=await savePhrase(phrase(`capture-${i}`,{screenshot,lastSeenAt:now+200+i}));
+    assert.equal(captured.screenshot,screenshot);
+    await importData(backup);
+    const replayed=(await getData()).phrases[0];
+    assert.equal(replayed.seenCount,captured.seenCount,'the known original ID adds no count');
+    assert.deepEqual(new Set(replayed.screenshots),new Set(images.slice(0,2)),'the existing archive is authoritative; a live preview is not a new original');
+  }
+  await importData({...backup,phrases:[phrase('new-original',{screenshot:images[2]})]});
+  assert.deepEqual(new Set((await getData()).phrases[0].screenshots),new Set(images),'a genuinely new original image is retained');
+});
+
+test('an attempt-only import revalidates detailed input instead of reviving a corrected spelling',async()=>{
+  const original=await savePhrase(phrase('p1',{text:'ペアルック',reading:'ぺあるっく',roman:'pearukku',verified:true}));
+  await saveSession(session());
+  const earlier=attempt(original,'earlier');await saveAttempt(earlier);
+  const edited=await updatePhrase(original.id,{reading:'ぺあるく',roman:'pearuku'});
+  assert.equal((await getData()).attempts[0].reliable,false);
+  const current=attempt(edited,'current');
+  await importData({version:1,phrases:[],attempts:[earlier,current],sessions:[],settings:DEFAULT_SETTINGS});
+  const data=await getData();
+  assert.deepEqual(data.attempts.find(value=>value.id===earlier.id),{...earlier,reliable:false},'the import retains old measurements without restoring analysis eligibility');
+  assert.equal(data.attempts.find(value=>value.id===current.id)?.reliable,true,'compatible detailed input remains usable');
+  assert.equal(analyzeWords(data.attempts,data.phrases)[0].attempts,1);
+  const legacy={...current,id:'with-original-definition'};delete legacy.judgements;
+  await importData({version:1,phrases:[edited],attempts:[legacy],sessions:[],settings:DEFAULT_SETTINGS});
+  assert.deepEqual((await getData()).attempts.find(value=>value.id===legacy.id),legacy,'an original phrase supplied by the backup still proves compatible legacy input');
+});
+
 test('merged count and image limits reject the entire operation instead of creating an unrestorable record',async()=>{
   await savePhrase(phrase('full',{seenCount:1000000}));const before=await getData();
   await assert.rejects(savePhrase(phrase('one-too-many')),/出題回数/);
   assert.deepEqual(await getData(),before);
   const pictures=Array.from({length:1001},(_,i)=>`data:image/png;base64,${Buffer.from(`image-${i}`).toString('base64')}`);
-  const a=phrase('images-a',{text:'画像の語句',screenshot:pictures[0],screenshots:pictures.slice(1,501)});
-  const b=phrase('images-b',{text:'画像の語句',screenshot:pictures[501],screenshots:pictures.slice(502)});
+  const a=phrase('images-a',{text:'画像の語句',screenshot:pictures[0],screenshots:pictures.slice(0,501)});
+  const b=phrase('images-b',{text:'画像の語句',screenshot:pictures[501],screenshots:pictures.slice(501)});
   await assert.rejects(importData({version:1,phrases:[a,b],attempts:[],sessions:[],settings:DEFAULT_SETTINGS}),/保存画像/);
   assert.deepEqual(await getData(),before);
 });
@@ -203,9 +237,9 @@ test('delayed detailed input is rechecked against a corrected target even when t
   assert.deepEqual(stored,{...pending,reliable:false});
   const current=attempt(canonical,'current','pearukku');await saveAttempt(current);
   assert.equal((await getData()).attempts.find(value=>value.id===current.id)?.reliable,true);
-  // Legacy backups without detailed judgements retain their existing import
-  // compatibility; they are not silently deleted or given fabricated details.
+  // A partial legacy backup without its original phrase or detailed judgements
+  // is preserved, but cannot prove compatibility with the corrected spelling.
   const legacyAttempt={...pending,id:'legacy-without-detail'};delete legacyAttempt.judgements;
   await importData({version:1,phrases:[],attempts:[legacyAttempt],sessions:[],settings:DEFAULT_SETTINGS});
-  assert.deepEqual((await getData()).attempts.find(value=>value.id===legacyAttempt.id),legacyAttempt);
+  assert.deepEqual((await getData()).attempts.find(value=>value.id===legacyAttempt.id),{...legacyAttempt,reliable:false});
 });

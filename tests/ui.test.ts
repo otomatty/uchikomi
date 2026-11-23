@@ -3,7 +3,7 @@ import test, { before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { Window } from 'happy-dom';
 import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb';
-import type { Phrase } from '../src/core/types';
+import { MAX_SCORE, type Phrase } from '../src/core/types';
 import { buildAttempt } from '../src/core/analytics';
 import { trainingDateKey } from '../src/core/activity';
 
@@ -30,9 +30,9 @@ let container:HTMLElement,root:ReturnType<typeof createRoot>|null;
 const delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
 
 async function settled(predicate:()=>boolean,message='UI did not settle',timeout=3000){
-  const start=Date.now();
+  const start=performance.now();
   while(!predicate()){
-    if(Date.now()-start>timeout)throw new Error(`${message}\n${document.body.textContent?.slice(-1800)}`);
+    if(performance.now()-start>timeout)throw new Error(`${message}\n${document.body.textContent?.slice(-1800)}`);
     await act(async()=>{await delay(10);});
   }
 }
@@ -97,7 +97,9 @@ test('UI first run contains no invented history or vocabulary',async()=>{
   await navigateWords();assert.equal(document.querySelectorAll('[data-testid="phrase-row"]').length,0);
 });
 
-test('daily training shows real per-day volume, zero days, older estimates and source breakdowns',async()=>{
+test('daily training shows real per-day volume, zero days, older estimates and source breakdowns',async(t)=>{
+  const now=Date.parse('2026-12-25T23:59:59.900+09:00');
+  t.mock.method(Date,'now',()=>now);
   const today=trainingDateKey(Date.now()),yesterday=trainingDateKey(Date.now()-86400000);
   const at=Date.parse(`${today}T10:00:00+09:00`);
   const base={startedAt:at,endedAt:at+120000,scoreType:'total' as const,course:10000 as const,mode:'accuracy' as const,phraseCount:0,correctKeys:0,mistakes:0,durationMs:0};
@@ -261,6 +263,47 @@ test('legacy review amounts are normalized to total before manual confirmation',
   await click(button('スコアを保存'));await settled(()=>!document.querySelector('[role="dialog"]'));
   const saved=(await db.getData()).sessions[0];
   assert.equal(saved.score,25000);assert.equal(saved.scoreType,'total');assert.equal(saved.scoreTotal,25000);assert.equal('scoreProfit' in saved,false);assert.equal(saved.scoreReview,undefined);
+});
+
+test('a migrated large total remains editable up to the same storage limit',async()=>{
+  const backup=await db.exportData(),now=Date.now();
+  await db.importData({...backup,sessions:[{id:'ui-large-total',startedAt:now,source:'manual',score:995000,scoreType:'profit',
+    course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:0}]});
+  await mount();await click(query('[data-testid="nav-growth"]'));
+  await click(query('button[aria-label="1,005,000円の記録を編集"]'));
+  const amount=query<HTMLInputElement>('input[aria-label="スコア"]');
+  assert.equal(amount.value,'1005000');assert.equal(amount.max,String(MAX_SCORE));
+  await click(button('スコアを保存'));await settled(()=>!document.querySelector('[role="dialog"]'));
+  await act(async()=>{await delay(20);});
+  assert.equal((await db.getData()).sessions[0].score,1005000);
+  await click(query('button[aria-label="1,005,000円の記録を編集"]'));
+  await input(query<HTMLInputElement>('input[aria-label="スコア"]'),String(MAX_SCORE+1));
+  await act(async()=>{query('form.score-form').dispatchEvent(new browserWindow.Event('submit',{bubbles:true,cancelable:true}));await delay(0);});
+  assert.ok(document.querySelector('[role="dialog"] [role="alert"]'));
+  assert.equal((await db.getData()).sessions[0].score,1005000);
+  await input(query<HTMLInputElement>('input[aria-label="スコア"]'),String(MAX_SCORE));
+  await click(button('スコアを保存'));await settled(()=>!document.querySelector('[role="dialog"]'));
+  await act(async()=>{await delay(20);});
+  assert.equal((await db.getData()).sessions[0].score,MAX_SCORE);
+});
+
+test('score review shows both distinct evidence images while avoiding duplicate or empty images',async()=>{
+  await mount();await click(query('[data-testid="nav-growth"]'));
+  const first='data:image/png;base64,AA==',second='data:image/png;base64,AQ==',now=Date.now();
+  const cases=[[first,second],[first,first],[first,undefined],[undefined,second]] as const;
+  for(let i=0;i<cases.length;i++){
+    const [saved,review]=cases[i],score=20000+i;
+    await act(async()=>{await db.saveSession({id:`proof-${i}`,startedAt:now+i,source:'capture',score,scoreType:'total',
+      course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:0,scoreEvidence:saved,
+      scoreReview:{score:25000,scoreType:'total',confidence:60,observedAt:now,reason:'画像を確認してください',evidence:review}});await delay(0);});
+    const selector=`button[aria-label="${score.toLocaleString('ja-JP')}円の記録を編集"]`;
+    await settled(()=>!!document.querySelector(selector));await click(query(selector));
+    const images=[...query('[role="dialog"]').querySelectorAll<HTMLImageElement>('.phrase-proof img')];
+    assert.deepEqual(new Set(images.map(img=>img.getAttribute('src'))),new Set([saved,review].filter(Boolean)));
+    assert.equal(images.length,new Set([saved,review].filter(Boolean)).size);
+    if(images.length===2)assert.notEqual(images[0].alt,images[1].alt,'the two sources need distinct labels');
+    await closeModal();
+  }
 });
 
 test('conflicting legacy amounts stay out of the graph until a total is confirmed',async()=>{

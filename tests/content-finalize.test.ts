@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Window } from 'happy-dom';
 
-test('a fast visible return waits for final keys and the old END acknowledgement before starting another capture', async t => {
+for (const failedDelivery of [false, true]) test(failedDelivery
+  ? 'a rejected END is retried and cannot reuse the old capture session with a reset producer'
+  : 'a fast visible return waits for final keys and the old END acknowledgement before starting another capture', async t => {
   const browser = new Window({ url: 'https://sushida.net/play.html' });
   const originals = new Map<string, PropertyDescriptor | undefined>();
   const define = (name: string, value: unknown) => {
@@ -15,6 +17,7 @@ test('a fast visible return waits for final keys and the old END acknowledgement
   let owner: string | null = null, nextOwner = 0, tracks = 0, stoppedTracks = 0, nextTimer = 0;
   let releaseKeys: ((value: any) => void) | undefined, releaseEnd: ((value: any) => void) | undefined;
   let holdKeys = true, ending = false;
+  let failEndDelivery = failedDelivery, failedEnds = 0;
   const messages: any[] = [];
   const request = (type: string) => onMessage?.({ type }, { id: 'finalize-test' }, () => {});
   define('chrome', { runtime: {
@@ -31,6 +34,7 @@ test('a fast visible return waits for final keys and the old END acknowledgement
       if (message.type === 'UCHI_CAPTURE_KEYS' && holdKeys) return new Promise(resolve => { releaseKeys = resolve; });
       if (message.type === 'UCHI_CANVAS_END') {
         assert.equal(message.sessionId, owner);
+        if (failEndDelivery) { failedEnds++; throw new Error('The message port closed before delivery'); }
         ending = true;
         request('UCHI_CAPTURE_DISABLE');
         return new Promise(resolve => { releaseEnd = value => { owner = null; ending = false; resolve(value); }; });
@@ -87,7 +91,7 @@ test('a fast visible return waits for final keys and the old END acknowledgement
       else delete (globalThis as any)[name];
     }
   });
-  await import('../src/capture/content.ts?finalize-race'); await settle();
+  await import(`../src/capture/content.ts?finalize-race=${failedDelivery}`); await settle();
   assert.equal(owner, 'capture-1'); assert.equal(tracks, 1);
   key('a'); visibility('hidden'); await settle();
   assert.ok(releaseKeys); assert.equal(count('UCHI_CANVAS_END'), 0); assert.equal(stoppedTracks, 1);
@@ -95,7 +99,19 @@ test('a fast visible return waits for final keys and the old END acknowledgement
   assert.equal(count('UCHI_CANVAS_READY'), 1, 'returning during the final key ACK cannot reclaim the ending session');
   assert.equal(tracks, 1);
   holdKeys = false; releaseKeys!({ ok: true }); await settle();
-  assert.ok(releaseEnd); assert.equal(count('UCHI_CANVAS_END'), 1);
+  if (failedDelivery) {
+    assert.ok(failedEnds > 0);
+    assert.equal(releaseEnd, undefined);
+    assert.equal(owner, 'capture-1'); assert.equal(tracks, 1);
+    assert.equal(count('UCHI_CANVAS_READY'), 1, 'A rejected END must not release the finalization barrier');
+    const attempts = failedEnds;
+    request('UCHI_CANVAS_PROBE'); await settle();
+    assert.ok(failedEnds > attempts, 'Rediscovery retries the same END before requesting a session');
+    assert.equal(count('UCHI_CANVAS_READY'), 1); assert.equal(tracks, 1);
+    failEndDelivery = false;
+    request('UCHI_CANVAS_PROBE'); await settle();
+  }
+  assert.ok(releaseEnd); assert.equal(count('UCHI_CANVAS_END') - failedEnds, 1);
   request('UCHI_CANVAS_PROBE'); await settle();
   assert.equal(count('UCHI_CANVAS_READY'), 1, 'the END acknowledgement is also part of the barrier');
   releaseEnd!({ ok: true }); await settle();
@@ -116,5 +132,5 @@ test('a fast visible return waits for final keys and the old END acknowledgement
   assert.deepEqual(messages.filter(message => message.type === 'UCHI_CAPTURE_KEYS').map(message => [message.sessionId, message.keys.map((stroke: any) => stroke.key)]), [
     ['capture-1', ['a']], ['capture-2', ['b']], ['capture-3', ['c']],
   ]);
-  assert.equal(count('UCHI_CANVAS_END'), 2, 'coalesced probes do not end or duplicate the new subscription');
+  assert.equal(count('UCHI_CANVAS_END') - failedEnds, 2, 'coalesced probes do not end or duplicate the new subscription');
 });

@@ -81,6 +81,24 @@ test('legacy source records are deduplicated and incomplete or orphan input stil
   assert.equal(empty.activeDays,0);assert.equal(empty.totals.captureCount,0);assert.equal(empty.totals.estimated,false);
 });
 
+test('empty legacy attempts do not create activity or fall back to a parent session estimate',()=>{
+  const empty=attempt('empty','game',{durationMs:0,correctKeys:0,mistakes:0,typed:'',judgements:[]});
+  const parent=session('game',{durationMs:90000,correctKeys:1000,mistakes:100,phraseCount:50});
+  for(const sessions of [[],[parent]]){
+    const summary=dailyTraining(data(sessions,[empty]),{today:'2026-12-25',days:2});
+    assert.deepEqual([summary.totals.activeMs,summary.totals.keys,summary.totals.phrases,summary.totals.captureCount,summary.activeDays],[0,0,0,0,0]);
+    assert.equal(summary.totals.estimated,false);
+  }
+});
+
+test('legacy record counts start at the first nonempty attempt, including detailed keys without counters',()=>{
+  const empty=attempt('empty','game',{startedAt:at('2026-12-24'),durationMs:0,correctKeys:0,mistakes:0,typed:'',judgements:[]});
+  const keyed=attempt('keyed','game',{durationMs:0,correctKeys:0,mistakes:0,judgements:[{actual:'x',expected:['a'],accepted:false,position:0,at:now}]});
+  const summary=dailyTraining(data([session('game')],[empty,keyed]),{today:'2026-12-25',days:2});
+  assert.deepEqual([summary.rows[0].keys,summary.rows[0].phrases,summary.rows[0].captureCount],[0,0,0]);
+  assert.deepEqual([summary.today.keys,summary.today.phrases,summary.today.captureCount,summary.activeDays],[1,1,1,1]);
+});
+
 test('historical ranges include leap days and never count a multi-day record again after its first activity day',()=>{
   const history=session('old',{activity:[{date:'2028-02-01',activeMs:100,keys:2,phrases:1},{date:'2028-02-29',activeMs:300,keys:4,phrases:2}]});
   const summary=dailyTraining(data([history]),{today:'2028-03-01',days:3});

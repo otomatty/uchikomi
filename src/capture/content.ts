@@ -21,12 +21,15 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
   let pageHidden = false;
   let gameFocused = false;
   let replayShortcut: ReplayShortcut = 'Escape';
+  let pendingReplaySettings: { sessionId: string; shortcut: ReplayShortcut } | undefined;
   let replayPending: object | null = null;
   let replayRevision = 0;
   let lastReplayAt = 0;
   let buffer: { key: string; code: string; at: number }[] = [];
   let pendingKeys: Promise<unknown> = Promise.resolve();
   let pendingEnd: Promise<void> = Promise.resolve();
+  let unconfirmedEnd: { type: 'UCHI_CANVAS_END'; sessionId: string; documentToken: string;
+    reason: 'hidden' | 'removed' | 'pagehide' | 'error'; error?: string } | undefined;
   let timer: number | undefined;
   let probeTimer: number | undefined;
   const safeSend = async (message: unknown) => {
@@ -72,6 +75,7 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
     ++generation;
     replayRevision++;
     replayPending = null;
+    pendingReplaySettings = undefined;
     flush();
     sessionId = null; captureMode = null;
     gameFocused = false;
@@ -83,15 +87,25 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
     producer = null;
     captureCanvas = null;
   }
+  async function acknowledgeEnd() {
+    const ending = unconfirmedEnd;
+    if (!ending) return;
+    const reply = await safeSend(ending);
+    if (reply?.ok && unconfirmedEnd === ending) unconfirmedEnd = undefined;
+  }
+  function queueEnd(id: string, reason: 'hidden' | 'removed' | 'pagehide' | 'error', error?: string) {
+    pendingEnd = Promise.all([pendingEnd, pendingKeys]).then(async () => {
+      unconfirmedEnd = { type: 'UCHI_CANVAS_END', sessionId: id, documentToken, reason, ...(error ? { error } : {}) };
+      await acknowledgeEnd();
+    });
+    return pendingEnd;
+  }
   async function endCapture(reason: 'hidden' | 'removed' | 'pagehide' | 'error', error?: string) {
     const endingSession = sessionId, endingMode = captureMode;
     if (reason === 'error') retryBlocked = true;
     disable();
     if (endingSession && endingMode === 'canvas') {
-      pendingEnd = Promise.all([pendingEnd, pendingKeys]).then(async () => {
-        await safeSend({ type: 'UCHI_CANVAS_END', sessionId: endingSession, documentToken, reason, ...(error ? { error } : {}) });
-      });
-      await pendingEnd;
+      await queueEnd(endingSession, reason, error);
     }
   }
 
@@ -104,6 +118,14 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
       // and END are still in flight: that late END would stop the new producer.
       await pendingEnd;
       if (pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
+      // A failed message is not an END acknowledgement. Reusing its session
+      // would reset the producer's sequence while offscreen still expects the
+      // previous producer's larger sequence. Retry release before any READY.
+      if (unconfirmedEnd) {
+        pendingEnd = pendingEnd.then(acknowledgeEnd);
+        await pendingEnd;
+        if (unconfirmedEnd || pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
+      }
       const canvas = visibleGameCanvas(document);
       if (captureMode === 'tab' && sessionId && captureCanvas !== canvas) {
         // Manual tabCapture keeps the same media owner when the page replaces
@@ -113,16 +135,17 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
         return;
       }
       if (captureCanvas && captureCanvas !== canvas) await endCapture('removed');
-      if (!canvas || sessionId || pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
+      if (!canvas || sessionId || unconfirmedEnd || pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
       const requestGeneration = generation;
       const reply = await safeSend({ type: 'UCHI_CANVAS_READY', documentToken });
       if (!reply?.ok || typeof reply.sessionId !== 'string') return;
       if (requestGeneration !== generation || pageHidden || document.visibilityState !== 'visible' || visibleGameCanvas(document) !== canvas) {
-        await safeSend({ type: 'UCHI_CANVAS_END', sessionId: reply.sessionId, documentToken, reason: pageHidden ? 'pagehide' : document.visibilityState !== 'visible' ? 'hidden' : 'removed' });
+        await queueEnd(reply.sessionId, pageHidden ? 'pagehide' : document.visibilityState !== 'visible' ? 'hidden' : 'removed');
         return;
       }
       captureCanvas = canvas;
-      setReplayShortcut(reply.replayShortcut);
+      setReplayShortcut(pendingReplaySettings && pendingReplaySettings.sessionId === reply.sessionId ? pendingReplaySettings.shortcut : reply.replayShortcut);
+      pendingReplaySettings = undefined;
       enableKeys(reply.sessionId, 'canvas');
       const startedSession = reply.sessionId;
       const startedGeneration = generation;
@@ -254,7 +277,8 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
       // visible game may claim manual capture's key/replay ownership.
       const canvas = visibleGameCanvas(document);
       if (!canvas) return;
-      setReplayShortcut(message.replayShortcut);
+      const shortcut = pendingReplaySettings && pendingReplaySettings.sessionId === message.sessionId ? pendingReplaySettings.shortcut : message.replayShortcut;
+      pendingReplaySettings = undefined;
       if (captureMode !== 'tab' || sessionId !== message.sessionId) {
         // Also invalidate a pending automatic READY reply before enabling the
         // manual fallback; it must not replace this subscription on arrival.
@@ -262,10 +286,18 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
         captureCanvas = canvas;
         enableKeys(message.sessionId, 'tab');
       }
+      setReplayShortcut(shortcut);
       sendResponse({ ok: true, documentToken, canvasCount: document.querySelectorAll('canvas').length });
-    } else if (message.type === 'UCHI_REPLAY_SETTINGS' && message.sessionId === sessionId) {
-      setReplayShortcut(message.replayShortcut);
-      sendResponse({ ok: true });
+    } else if (message.type === 'UCHI_REPLAY_SETTINGS') {
+      if (message.sessionId === sessionId) {
+        setReplayShortcut(message.replayShortcut);
+        sendResponse({ ok: true });
+      } else if (!sessionId && typeof message.sessionId === 'string' && isReplayShortcut(message.replayShortcut)) {
+        // A preference notification can arrive before the READY response has
+        // installed its session. Keep it so an older response cannot undo it.
+        pendingReplaySettings = { sessionId: message.sessionId, shortcut: message.replayShortcut };
+        sendResponse({ ok: true });
+      }
     } else if (message.type === 'UCHI_CAPTURE_DISABLE') {
       disable();
       sendResponse({ ok: true });
@@ -273,6 +305,8 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
       retryBlocked = false;
       void probe();
       sendResponse({ ok: true, documentToken });
+    } else if (message.type === 'UCHI_CANVAS_CHECK') {
+      sendResponse({ ok: !pageHidden && !!visibleGameCanvas(document), documentToken });
     } else if (message.type === 'UCHI_CAPTURE_GEOMETRY') {
       const canvases = [...document.querySelectorAll('canvas')].map(canvas => canvas.getBoundingClientRect()).filter(r => r.width > 200 && r.height > 100).sort((a, b) => b.width * b.height - a.width * a.height);
       const r = canvases[0];

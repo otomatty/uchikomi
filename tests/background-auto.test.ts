@@ -22,6 +22,9 @@ async function harness() {
   let contexts = false, failContextRead = false, status: CaptureStatus = { state: 'idle', phraseCount: 0 };
   let live: CaptureStatus = { ...status }, closed = 0, mediaRequests = 0;
   let creation: Promise<void> | undefined, frameReply: Promise<any> | undefined, replayReply: Promise<any> | undefined;
+  let contextReply: Promise<any[]> | undefined, tabRead: Promise<void> | undefined;
+  let contextReads = 0, tabReads = 0;
+  let liveDocument = 'actual-document', liveToken = token;
   const calls: any[] = [], contentMessages: any[] = [];
   const listeners: Record<string, (...args: any[]) => void> = {};
   const listener = (name: string) => ({ addListener(fn: (...args: any[]) => void) { listeners[name] = fn; } });
@@ -30,7 +33,12 @@ async function harness() {
     runtime: {
       id, getURL: (path: string) => origin + path, onInstalled: listener('installed'),
       onMessage: { addListener(fn: typeof handler) { handler = fn; } },
-      async getContexts() { if (failContextRead) { failContextRead = false; throw new Error('temporary context read failure'); } return contexts ? [{}] : []; },
+      async getContexts() {
+        contextReads++;
+        if (contextReply) { const reply = contextReply; contextReply = undefined; return reply; }
+        if (failContextRead) { failContextRead = false; throw new Error('temporary context read failure'); }
+        return contexts ? [{}] : [];
+      },
       async sendMessage(message: any) {
         if (message.target !== 'offscreen') return { ok: true };
         calls.push(message);
@@ -52,9 +60,17 @@ async function harness() {
     action: { onClicked: listener('action'), async setBadgeText() {}, async setBadgeBackgroundColor() {} },
     tabs: {
       onRemoved: listener('removed'), onUpdated: listener('updated'),
-      async get(tabId: number) { return { id: tabId, active: tabId === 9, url: 'https://sushida.net/play.html' }; },
+      async get(tabId: number) {
+        tabReads++;
+        if (tabRead) { const pending = tabRead; tabRead = undefined; await pending; }
+        return { id: tabId, active: tabId === 9, url: 'https://sushida.net/play.html' };
+      },
       async query() { return [{ id: 9, active: true, url: 'https://sushida.net/play.html' }]; },
-      async sendMessage(tabId: number, message: any, options: any) { contentMessages.push({ tabId, ...message, options }); return { ok: true, documentToken: token }; },
+      async sendMessage(tabId: number, message: any, options: any) {
+        contentMessages.push({ tabId, ...message, options });
+        if (message.type === 'UCHI_CANVAS_CHECK' && (options?.documentId !== liveDocument || message.documentToken !== liveToken)) throw new Error('Receiving end does not exist');
+        return { ok: true, documentToken: liveToken };
+      },
       async create() { return {}; },
     },
     scripting: { async executeScript() { return []; } },
@@ -76,6 +92,10 @@ async function harness() {
     blockCreation: (promise: Promise<void>) => { creation = promise; },
     blockFrames: (promise: Promise<any>) => { frameReply = promise; },
     blockReplay: (promise: Promise<any>) => { replayReply = promise; },
+    blockNextContextRead: (promise: Promise<any[]>) => { contextReply = promise; },
+    blockNextTabRead: (promise: Promise<void>) => { tabRead = promise; },
+    contextReads: () => contextReads, tabReads: () => tabReads,
+    setLiveDocument: (id: string, value: string) => { liveDocument = id; liveToken = value; },
     failNextContextRead: () => { failContextRead = true; },
     notify: (value: CaptureStatus) => send({ type: 'UCHI_OFF_STATE', status: value }, { id, url: origin + 'offscreen.html' }),
   };
@@ -197,7 +217,9 @@ test('hiding auto capture keeps the preference enabled; explicit pause survives 
   const before = app.state();
   assert.equal((await app.notify({ ...before, sessionId: first.sessionId, state: 'idle' })).dropped, true);
   assert.equal(app.state().sessionId, third.sessionId); assert.equal(app.state().state, 'recording');
-  assert.equal((await app.content({ type: 'UCHI_CANVAS_END', sessionId: first.sessionId, reason: 'hidden' })).ok, false);
+  assert.deepEqual(await app.content({ type: 'UCHI_CANVAS_END', sessionId: first.sessionId, reason: 'hidden' }), { ok: true, ended: true });
+  assert.equal(app.state().sessionId, third.sessionId, 'Retrying an old release cannot stop the current owner');
+  assert.equal(app.state().state, 'recording');
   await app.send({ type: 'UCHI_STOP' });
   assert.equal((await app.notify({ ...before, state: 'recording' })).dropped, true);
   assert.equal(app.state().state, 'idle');
@@ -228,5 +250,101 @@ test('navigation cancels automatic startup, and tabCapture events do not stop a 
   const resumed = await app.ready();
   app.listeners.tabCapture({ tabId: 9, status: 'stopped' }); await delay(5);
   assert.equal(app.state().state, 'recording'); assert.equal(app.state().sessionId, resumed.sessionId);
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('an allowed hash update during offscreen creation leaves automatic startup intact', async () => {
+  const app = await harness(); let release!: () => void;
+  app.blockCreation(new Promise(resolve => { release = resolve; }));
+  const opening = app.ready(); await until(() => app.state().state === 'starting');
+  const preparingId = app.state().sessionId;
+  app.listeners.updated(9, { url: 'https://sushida.net/play.html#result' });
+  await delay(); release();
+  const started = await opening;
+  assert.equal(started.sessionId, preparingId, 'A same-document URL update must not cancel the pending owner');
+  assert.equal(app.state().state, 'recording');
+  assert.equal(app.calls.filter(call => call.type === 'UCHI_OFF_START').length, 1);
+  assert.equal(app.calls.some(call => call.type === 'UCHI_OFF_STOP'), false);
+  assert.equal((await app.ready()).sessionId, started.sessionId);
+  assert.equal((await app.content({ type: 'UCHI_CANVAS_FRAME', sessionId: started.sessionId, frame: frame() })).ok, true);
+  assert.ok(app.calls.some(call => call.type === 'UCHI_OFF_CANVAS_FRAME'));
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('a delayed absent-offscreen status response cannot erase a newer capture owner', async () => {
+  const app = await harness(), first = await app.ready();
+  let resolveAbsent!: (value: any[]) => void;
+  const reads = app.contextReads();
+  app.blockNextContextRead(new Promise(resolve => { resolveAbsent = resolve; }));
+  const oldStatus = app.send({ type: 'UCHI_STATUS' });
+  await until(() => app.contextReads() > reads);
+  await app.content({ type: 'UCHI_CANVAS_END', sessionId: first.sessionId, reason: 'hidden' });
+  const second = await app.ready();
+  assert.notEqual(second.sessionId, first.sessionId);
+  resolveAbsent([]);
+  const reply = await oldStatus;
+  assert.equal(reply.status.state, 'recording'); assert.equal(reply.status.sessionId, second.sessionId);
+  assert.equal(app.state().state, 'recording'); assert.equal(app.state().sessionId, second.sessionId);
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('navigation before startup publishes an owner cancels the old document and admits the new one', async () => {
+  const app = await harness(); let release!: () => void;
+  app.blockNextTabRead(new Promise(resolve => { release = resolve; }));
+  const opening = app.ready(); await until(() => app.tabReads() === 1);
+  assert.equal(app.state().state, 'idle', 'Navigation happens before the old owner is published');
+  app.listeners.updated(9, { status: 'loading' });
+  app.setLiveDocument('new-document', 'reloaded-token-1234');
+  await delay(); release();
+  assert.equal((await opening).busy, true);
+  assert.equal(app.calls.some(call => call.type === 'UCHI_OFF_START'), false);
+  const next = await app.ready({ ...app.sender, documentId: 'new-document' }, 'reloaded-token-1234');
+  assert.ok(next.sessionId); assert.equal(app.state().documentId, 'new-document');
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('a READY from an iframe document that no longer exists cannot claim startup', async () => {
+  const app = await harness();
+  app.setLiveDocument('replacement-document', 'replacement-token-1234');
+  assert.equal((await app.ready()).busy, true);
+  assert.equal(app.calls.some(call => call.type === 'UCHI_OFF_START'), false);
+  const check = app.contentMessages.find(message => message.type === 'UCHI_CANVAS_CHECK');
+  assert.equal(check.options.documentId, app.sender.documentId);
+  const next = await app.ready({ ...app.sender, documentId: 'replacement-document' }, 'replacement-token-1234');
+  assert.ok(next.sessionId); assert.equal(app.state().documentToken, 'replacement-token-1234');
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('pause releases capture and suppresses automatic restart even when the settings write fails', async t => {
+  const app = await harness(), first = await app.ready();
+  const original = IDBObjectStore.prototype.put;
+  const fail = t.mock.method(IDBObjectStore.prototype, 'put', function(this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+    if (this.name === 'settings') throw new DOMException('Storage is full', 'QuotaExceededError');
+    return original.apply(this, args);
+  });
+  const stopped = await app.send({ type: 'UCHI_STOP' });
+  assert.equal(stopped.ok, false); assert.match(stopped.error, /設定を保存できません/);
+  assert.equal(app.state().state, 'idle'); assert.equal(app.closed(), 1);
+  assert.ok(app.contentMessages.some(message => message.type === 'UCHI_CAPTURE_DISABLE'));
+  assert.ok(app.calls.some(call => call.type === 'UCHI_OFF_STOP'));
+  assert.equal((await getSettings()).autoRecord, true, 'The failure leaves the persisted preference unchanged');
+  assert.deepEqual(await app.ready(), { ok: true, paused: true });
+  fail.mock.restore();
+  assert.equal((await app.send({ type: 'UCHI_RESUME' })).ok, true);
+  const next = await app.ready(); assert.ok(next.sessionId && next.sessionId !== first.sessionId);
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('a shortcut saved during startup is reflected in the READY response', async () => {
+  const app = await harness(); let release!: () => void;
+  app.blockCreation(new Promise(resolve => { release = resolve; }));
+  const opening = app.ready(); await until(() => app.state().state === 'starting');
+  await updateSettings({ replayShortcut: 'F2' });
+  await app.send({ type: 'UCHI_REPLAY_SETTINGS_CHANGED' });
+  const notice = app.contentMessages.find(message => message.type === 'UCHI_REPLAY_SETTINGS');
+  assert.equal(notice.replayShortcut, 'F2');
+  release();
+  const started = await opening;
+  assert.equal(started.replayShortcut, 'F2'); assert.equal(started.sessionId, notice.sessionId);
   await app.send({ type: 'UCHI_STOP' });
 });

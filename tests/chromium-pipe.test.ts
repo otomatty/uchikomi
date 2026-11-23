@@ -114,3 +114,34 @@ test('Download setup has a bounded timeout and closes an unanswered pipe', async
   assert.equal(transport.onmessage, undefined); assert.equal(transport.onclose, undefined);
   assert.throws(() => transport.send({ id: 1 }), /pipe is closed/);
 });
+
+test('an ACK followed by EOF still reaches the close handler registered after download setup', async () => {
+  const { output, transport } = pair();
+  const setup = configureChromiumDownloads(transport, '/qa/downloads');
+  output.write(Buffer.from('{"id":0,"result":{}}\0'));
+  output.emit('end'); // Both deliveries are queued before the ACK restores the handlers.
+  await setup; await turn();
+  let closed = 0;
+  transport.onclose = () => { closed++; };
+  await turn(); await turn();
+  assert.equal(closed, 1);
+});
+
+test('Chrome pipe rejects valid JSON that cannot represent a CDP message before dispatch', async () => {
+  for (const value of [null, [], true, 1, 'message', {}, { id: '1' }, { method: '' }]) {
+    const { output, transport } = pair(), delivered: unknown[] = [];
+    transport.onmessage = (message: unknown) => delivered.push(message);
+    const reason = new Promise(resolve => {
+      const timeout = setTimeout(() => resolve('No close notification'), 100);
+      transport.onclose = value => { clearTimeout(timeout); resolve(value); };
+    });
+    output.write(Buffer.from(JSON.stringify(value) + '\0'));
+    const closed = await reason; transport.close();
+    assert.match(String(closed), /invalid CDP/);
+    assert.deepEqual(delivered, []);
+  }
+  const { output, transport } = pair();
+  const setup = configureChromiumDownloads(transport, '/qa/downloads');
+  output.write(Buffer.from('null\0'));
+  await assert.rejects(setup, /invalid CDP/);
+});

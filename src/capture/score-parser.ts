@@ -22,12 +22,16 @@ function money(token: string): number | null {
   return Number.isSafeInteger(amount) && amount >= 0 && amount <= 1000000 ? amount : null;
 }
 interface Amounts { values: number[]; invalid: boolean; }
-function amounts(text: string, suffix: string): Amounts {
+const totalSuffix = '分(?:のお寿司(?:を(?:ゲット|獲得))?|の[ぁ-んァ-ヶー一-龠]{1,8}を(?:ゲット|獲得))';
+const totalLabelPattern = new RegExp(`[円内]${totalSuffix}|お寿司を(?:ゲット|獲得)`);
+const gainLabelPattern = /[円内]分(?:お|ね)?得(?:でした|です|[!！])/;
+const lossLabelPattern = /[円内]分(?:の)?損(?:でした|です|[!！])/;
+function amounts(text: string, suffix: string, currency = '円'): Amounts {
   const values: number[] = [];
   let invalid = false;
   // Keep OCR-confused letters in the token and reject them, rather than guessing
   // O/0 or I/1, or silently accepting only the end of a corrupted number.
-  const expression = new RegExp(`([+\\-0-9OoIl][0-9OoIl,.]*)円${suffix}`, 'g');
+  const expression = new RegExp(`([+\\-0-9OoIl][0-9OoIl,.]*)${currency}${suffix}`, 'g');
   for (const match of text.matchAll(expression)) {
     const value = money(match[1]);
     if (value === null) invalid = true;
@@ -55,45 +59,51 @@ export function parseResultScore(input: ScoreText): ParsedScore {
     kind: 'none', scoreType: 'total', confidence: 0,
     modeSource: header.includes('正確重視') && confidenceOf(input.headerConfidence) >= 82 ? 'ocr' : 'configured',
   };
-  const total = amounts(totalText, '分のお寿司(?:を(?:ゲット|獲得))?');
+  // The accepted total-row label and its amount use the same spelling rules,
+  // so a confidently read amount is never discarded just for its food noun.
+  const total = amounts(totalText, totalSuffix, '[円内]');
   const gain = amounts(differenceText, '分(?:お)?得(?:でした|です|[!！])');
   const loss = amounts(differenceText, '分(?:の)?損(?:でした|です|[!！])');
   const paid = amounts(paidText, '払って');
   // The semantic anchor is 得でした. A small お is occasionally recognised as
   // ね in the result font; this does not change the independently read amount.
-  const gainLabel = /[円内]分(?:お|ね)?得(?:でした|です|[!！])/.test(label);
-  const lossLabel = /[円内]分(?:の)?損(?:でした|です|[!！])/.test(label);
+  const gainLabel = gainLabelPattern.test(label), lossLabel = lossLabelPattern.test(label);
+  const gainLineLabel = gainLabelPattern.test(differenceText), lossLineLabel = lossLabelPattern.test(differenceText);
+  const trustedGain = (labelConfidence >= 82 && gainLabel) || (lineConfidence('profit') >= 82 && gainLineLabel);
+  const trustedLoss = (labelConfidence >= 82 && lossLabel) || (lineConfidence('profit') >= 82 && lossLineLabel);
   // The small food noun can have imperfect kanji OCR. Its amount suffix and
   // acquisition verb still identify the total row within the verified receipt;
   // no numeral or monetary value is guessed from those glyphs.
-  const hasTotalLabel = /[円内]分のお寿司|お寿司を(?:ゲット|獲得)|[円内]分の[ぁ-んァ-ヶー一-龠]{1,8}を(?:ゲット|獲得)/.test(totalLabel);
-  if (!total.values.length && !gain.values.length && !loss.values.length && !total.invalid && !gain.invalid && !loss.invalid && !gainLabel && !lossLabel && !hasTotalLabel) return result;
+  const hasTotalLabel = totalLabelPattern.test(totalLabel), hasTotalLineLabel = totalLabelPattern.test(totalText);
+  if (!total.values.length && !gain.values.length && !loss.values.length && !total.invalid && !gain.invalid && !loss.invalid && !gainLabel && !lossLabel && !gainLineLabel && !lossLineLabel && !hasTotalLabel && !hasTotalLineLabel) return result;
   const review = (reason: string): ParsedScore => ({ ...result, kind: 'review', reason,
     fingerprint: result.fingerprint ?? `review:total:${reason}:${header}:${body}:${label}`.slice(0,1000) });
   const course = amounts(header, 'コース');
   if (course.values.some(value=>value!==10000) || /普通|ふつう|速度必須|一発勝負|練習/.test(header)) {
     return review('10,000円・正確重視以外の結果が表示されています');
   }
-  if (labelConfidence >= 82 && gainLabel && lossLabel) return review('補助金額の読み取りが一致しませんでした');
+  if (trustedGain && trustedLoss) return review('補助金額の読み取りが一致しませんでした');
 
   const readNumeric = (kind: 'total' | 'paid' | 'profit') => {
     const value = input.numeric?.[kind];
     return value && confidenceOf(value.confidence) >= 85 ? money(compact(value.text)) : null;
   };
   const numericTotal = readNumeric('total'), numericPaid = readNumeric('paid');
-  const anchorConfidence = Math.max(hasTotalLabel ? totalLabelConfidence : 0, gainLabel || lossLabel ? labelConfidence : 0);
-  const structuredNumeric = confidenceOf((input.structureConfidence ?? 0) * 100) >= 90 && anchorConfidence >= 82 && numericTotal !== null && numericPaid !== null;
-  let totalValue: number;
-  if (structuredNumeric) {
-    if (numericPaid !== 10000) return review('支払額が10,000円と一致しませんでした');
-    totalValue = numericTotal;
-    result.confidence = Math.min(anchorConfidence, confidenceOf(input.numeric!.total!.confidence), confidenceOf(input.numeric!.paid!.confidence));
-  } else {
-    result.confidence = Math.min(lineConfidence('total'), lineConfidence('paid'));
-    if (total.invalid || total.values.length !== 1) return review('食べた金額の合計を確認できませんでした');
-    if (paid.invalid || paid.values.length !== 1 || paid.values[0] !== 10000) return review('10,000円の支払額を確認できませんでした');
-    totalValue = total.values[0];
-  }
+  const anchorConfidence = Math.max(hasTotalLabel ? totalLabelConfidence : 0, hasTotalLineLabel ? lineConfidence('total') : 0,
+    gainLabel || lossLabel ? labelConfidence : 0, gainLineLabel || lossLineLabel ? lineConfidence('profit') : 0);
+  const structuredNumeric = confidenceOf((input.structureConfidence ?? 0) * 100) >= 90 && anchorConfidence >= 82;
+  // Each primary row may independently use its clear labelled text or its
+  // numeric crop. A numeric crop still requires the receipt and semantic gates.
+  const primary = (kind: 'total' | 'paid', observed: Amounts, numeric: number | null) => {
+    if (structuredNumeric && numeric !== null) return { value: numeric, confidence: Math.min(anchorConfidence, confidenceOf(input.numeric![kind]!.confidence)) };
+    if (observed.invalid || observed.values.length !== 1) return null;
+    return { value: observed.values[0], confidence: lineConfidence(kind) };
+  };
+  const chosenTotal = primary('total', total, numericTotal), chosenPaid = primary('paid', paid, numericPaid);
+  result.confidence = Math.min(chosenTotal?.confidence ?? lineConfidence('total'), chosenPaid?.confidence ?? lineConfidence('paid'));
+  if (!chosenTotal) return review('食べた金額の合計を確認できませんでした');
+  if (!chosenPaid || chosenPaid.value !== 10000) return review('10,000円の支払額を確認できませんでした');
+  const totalValue = chosenTotal.value;
 
   // Clear primary amounts can stand alone. A weak/unreadable optional line
   // must not prevent saving them, but usable contradictory evidence still does.
@@ -103,7 +113,7 @@ export function parseResultScore(input: ScoreText): ParsedScore {
     return review('2つの文字認識で金額が一致しませんでした');
   }
   const difference = totalValue - 10000;
-  if (labelConfidence >= 82 && ((gainLabel && difference < 0) || (lossLabel && difference > 0))) {
+  if ((trustedGain && difference < 0) || (trustedLoss && difference > 0)) {
     return review('補助金額との計算が一致しませんでした');
   }
   if (lineConfidence('profit') >= 82 && ((gain.values.length && loss.values.length) ||
@@ -112,7 +122,7 @@ export function parseResultScore(input: ScoreText): ParsedScore {
   }
   const numericDifference = readNumeric('profit');
   if (numericDifference !== null && (numericDifference !== Math.abs(difference) ||
-      (labelConfidence >= 82 && ((gainLabel && numericDifference !== difference) || (lossLabel && -numericDifference !== difference))))) {
+      (trustedGain && numericDifference !== difference) || (trustedLoss && -numericDifference !== difference))) {
     return review('補助金額との計算が一致しませんでした');
   }
   if (totalValue < 0 || totalValue % 20 !== 0) return review('合計金額を確認してください');

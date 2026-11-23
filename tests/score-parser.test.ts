@@ -48,6 +48,43 @@ test('clear total and payment remain usable when the optional difference cannot 
   assert.equal(parseResultScore(labelled({bodyText:'29,740円分のお寿司をゲット！10,000円払って…'})).score,29740);
 });
 
+test('every accepted total label also contributes its amount to independent OCR agreement',()=>{
+  for(const suffix of ['円分のお禾弘をゲット！','内分のお禾弘を獲得！','円分のお寿司をゲット！']){
+    const input=numeric({totalLabelText:suffix,totalLabelConfidence:94,labelText:'',labelConfidence:0,
+      amountLines:{total:{text:`29,760${suffix}`,confidence:94},paid:{text:'10,000円払って…',confidence:94},profit:{text:'',confidence:0}},
+      numeric:{total:{text:'29,740',confidence:95},paid:{text:'10,000',confidence:95}}});
+    const parsed=parseResultScore(input);assert.equal(parsed.kind,'review',suffix);
+    const stable=new StableScoreReader();assert.equal(stable.observe(parsed,1000),null);
+    assert.equal(stable.observe(parseResultScore(input),1600)?.kind,'review','a repeated digit misread must remain a review');
+    const agreeing={...input,amountLines:{...input.amountLines,total:{text:`29,740${suffix}`,confidence:94}}};
+    assert.equal(parseResultScore(agreeing).score,29740,'an unreadable optional row does not block agreement');
+  }
+});
+
+test('total and payment can independently use labelled rows or structured numeric crops',()=>{
+  const input=numeric({totalLabelText:'円分のお寿司をゲット！',totalLabelConfidence:94,
+    amountLines:{total:{text:'29,740円分のお寿司をゲット！',confidence:93},paid:{text:'10,000円払つて…',confidence:94},profit:{text:'19,740円分お得でした！',confidence:94}},
+    numeric:{paid:{text:'10,000',confidence:96},profit:{text:'19,740',confidence:96}}});
+  const result=parseResultScore(input);assert.equal(result.kind,'score');assert.equal(result.score,29740);assert.equal(result.confidence,93);
+  const inverse={...input,amountLines:{...input.amountLines,total:{text:'合計数字は不明',confidence:20},paid:{text:'10,000円払って…',confidence:92}},
+    numeric:{total:{text:'29,740',confidence:95}}};
+  assert.equal(parseResultScore(inverse).kind,'score');assert.equal(parseResultScore(inverse).confidence,92);
+  notSaved({...input,structureConfidence:.89},'a mixed numeric payment still requires a verified receipt structure');
+  notSaved({...input,numeric:{paid:{text:'10,000',confidence:84}}},'a mixed numeric payment still requires numeric confidence');
+  notSaved({...input,numeric:{paid:{text:'5,000',confidence:96}}},'the independently selected payment must be 10,000 yen');
+});
+
+test('the difference row supplies its own trusted gain/loss evidence even when its label crop is empty or weak',()=>{
+  const input=numeric({totalLabelText:'円分のお寿司をゲット！',totalLabelConfidence:94,
+    labelText:'',labelConfidence:0,amountLines:{profit:{text:'円分損でした！',confidence:94}},
+    numeric:{total:{text:'29,740',confidence:95},paid:{text:'10,000',confidence:96}}});
+  notSaved(input,'a clearly read loss contradicts a total above the course cost');
+  notSaved({...input,labelText:'円分お得でした！',labelConfidence:40},'a weak crop cannot hide the confident full-row loss');
+  notSaved({...input,labelText:'円分お得でした！',labelConfidence:94},'conflicting reliable directions must be reviewed');
+  assert.equal(parseResultScore({...input,amountLines:{profit:{text:'円分損でした！',confidence:40}}}).score,29740,'weak optional evidence remains optional');
+  notSaved({...input,amountLines:{profit:{text:'円分お得でした！',confidence:94}},numeric:{total:{text:'9,200',confidence:95},paid:{text:'10,000',confidence:96}}},'gain also contradicts a total below the course cost');
+});
+
 test('totals below the course cost, break-even totals and zero remain nonnegative food amounts',()=>{
   const belowCost=parseResultScore(labelled({bodyText:'9,200円分のお寿司をゲット！10,000円払って800円分損でした！'}));
   assert.equal(belowCost.kind,'score');assert.equal(belowCost.score,9200);

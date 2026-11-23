@@ -11,7 +11,8 @@
   const state = globalThis.__uchikomiQaRouting = {
     context, startedAt: clock(), received: {}, sent: {}, imageDecodes: { calls: 0, pending: 0, fulfilled: 0, rejected: 0 },
     bitmaps: { calls: 0, pending: 0, fulfilled: 0, rejected: 0 }, events: [], offscreenEvents: [],
-    frames: { lastAt: null, gaps: [], maxGap: 0 }, scoreStates: [],
+    receivedFrameGaps: { lastAt: null, gaps: [], maxGap: 0 },
+    acceptedFrameGaps: { lastAt: null, gaps: [], maxGap: 0 }, scoreStates: [],
     canvasBlobs: { calls: 0 },
     ocr: { workers: 0, calls: 0, completed: 0, rejected: 0, pending: {}, results: [] },
   };
@@ -19,6 +20,20 @@
   const traced = new Set(['UCHI_CANVAS_READY', 'UCHI_CANVAS_FRAME', 'UCHI_CANVAS_END',
     'UCHI_OFF_START', 'UCHI_OFF_CANVAS_FRAME', 'UCHI_OFF_STOP']);
   const errorText = error => String(error?.message || error);
+  const observeFrame = (observed, message) => {
+    const frame = message.frame;
+    if (!Number.isFinite(frame?.at)) return;
+    if (observed.sessionId !== message.sessionId) { observed.lastAt = null; observed.sessionId = message.sessionId; }
+    const previous = observed.lastAt, at = frame.at;
+    if (previous !== null && at > previous) {
+      const gap = at - previous; observed.maxGap = Math.max(observed.maxGap, gap);
+      if (gap > 300) {
+        observed.gaps.push({ at, gap, sequence: frame.sequence, sessionId: message.sessionId });
+        if (observed.gaps.length > 160) observed.gaps.shift();
+      }
+    }
+    observed.lastAt = at;
+  };
   const messageMeta = message => ({ type: message.type, sessionId: message.sessionId, target: message.target,
     ...(message.frame ? { sequence: message.frame.sequence, frameAt: message.frame.at, width: message.frame.width,
       height: message.frame.height, imageCharacters: message.frame.dataUrl?.length } : {}) });
@@ -62,6 +77,10 @@
     if (!observed || !result?.then) return result;
     return result.then(reply => {
       observed.pending--; observed.fulfilled++; observed.lastReply = { at: clock(), ...responseMeta(reply) };
+      // The background observes the real offscreen acknowledgement: a received
+      // frame dropped during decoding cannot shorten the accepted-frame gap.
+      if (context === 'background' && type === 'UCHI_OFF_CANVAS_FRAME' && reply?.ok && !reply.dropped)
+        observeFrame(state.acceptedFrameGaps, message);
       if (traced.has(type)) record('reply', { type, ...responseMeta(reply) });
       return reply;
     }, error => {
@@ -90,15 +109,7 @@
     observed.calls++; observed.last = { at: clock(), ...messageMeta(message),
       senderUrl: sender.url, hasTab: !!sender.tab, frameId: sender.frameId };
     if (context === 'offscreen' && type === 'UCHI_OFF_CANVAS_FRAME' && Number.isFinite(message.frame?.at)) {
-      const at = message.frame.at, previous = state.frames.lastAt;
-      if (previous !== null && at > previous) {
-        const gap = at - previous; state.frames.maxGap = Math.max(state.frames.maxGap, gap);
-        if (gap > 300) {
-          state.frames.gaps.push({ at, gap, sequence: message.frame.sequence });
-          if (state.frames.gaps.length > 160) state.frames.gaps.shift();
-        }
-      }
-      state.frames.lastAt = at;
+      observeFrame(state.receivedFrameGaps, message);
     }
     if (traced.has(type)) record('receive', messageMeta(message));
   });

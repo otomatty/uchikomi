@@ -52,7 +52,9 @@ export function mergePhraseGroup(group: readonly Phrase[], preferredId?: string,
   const sources = new Map<string, number>();
   for (const phrase of group) for (const source of phraseSeenSources(phrase)) sources.set(source.id, Math.max(sources.get(source.id) ?? 0, source.count));
   const seenSources = [...sources].map(([id, count]) => ({ id, count })).sort((a, b) => a.id.localeCompare(b.id));
-  const images = [...new Set(group.flatMap(phrase => [...(phrase.screenshot ? [phrase.screenshot] : []), ...(phrase.screenshots ?? [])]))];
+  // Once present, the archive identifies the original images. A later live
+  // preview is not another original merely because an old ID is reimported.
+  const images = [...new Set(group.flatMap(phrase => phrase.screenshots ?? (phrase.screenshot ? [phrase.screenshot] : [])))];
   const screenshot = (!archiveImages ? [...group].reverse().find(phrase => phrase.screenshot)?.screenshot : undefined) ?? best.screenshot ?? images[0];
   const result: Phrase = {
     ...best, id: canonicalId, verified: group.some(phrase => phrase.verified),

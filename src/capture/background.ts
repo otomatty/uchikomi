@@ -13,6 +13,8 @@ let creating: Promise<void> | null = null;
 let transitioning = false;
 let transitionDone: Promise<void> | null = null;
 let cancelStart = false;
+let startingTabId: number | undefined;
+let automaticPaused = false;
 let stopping: Promise<any> | null = null;
 let forwardingFrame: { sessionId: string; sequence: number } | null = null;
 let preparingReplay: object | null = null;
@@ -93,7 +95,7 @@ async function currentStatus(forceCheck = false) {
       const result = await offscreen<{ status?: CaptureStatus }>('UCHI_OFF_STATUS').catch(() => null);
       if (result?.status && result.status.sessionId === expectedSession && status.sessionId === expectedSession &&
           status.state === expectedState && (!transitioning || forceCheck)) status = withOwner(result.status);
-    } else {
+    } else if (status.sessionId === expectedSession && status.state === expectedState && (!transitioning || forceCheck)) {
       await publish({ ...EMPTY_CAPTURE, state: 'error', message: '記録が中断されました。もう一度開始してください。' });
     }
   }
@@ -126,6 +128,7 @@ async function startCapture() {
     if (previous.state === 'recording') return { ok: true, status: previous };
     tab = await findGameTab(true);
     if (!tab?.id) return { ok: false, error: '寿司打のタブを開いて、拡張アイコンを押してください。' };
+    startingTabId = tab.id;
     const sessionId = crypto.randomUUID();
     const startedAt = Date.now();
     await publish({ state: 'starting', source: 'tab', tabId: tab.id, sessionId, startedAt, phraseCount: 0, ocrReady: false, message: '記録を準備しています' });
@@ -156,22 +159,31 @@ async function startCapture() {
     const message = conciseError(error);
     await publish({ ...EMPTY_CAPTURE, state: 'error', message });
     return { ok: false, error: message, status };
-  } finally { release(); }
+  } finally { startingTabId = undefined; release(); }
 }
 async function startCanvas(sender: chrome.runtime.MessageSender, documentToken: string) {
+  if (automaticPaused) return { ok: true, paused: true };
   if (transitioning || stopping) return { ok: true, busy: true };
   const release = beginTransition(); cancelStart = false;
+  startingTabId = sender.tab!.id;
   let started = false;
   try {
     const settings = await getSettings();
-    if (!settings.autoRecord) return { ok: true, paused: true };
+    if (!settings.autoRecord || automaticPaused) return { ok: true, paused: true };
+    if (cancelStart) return { ok: true, busy: true };
     const previous = await currentStatus(true);
     if (['recording', 'starting'].includes(previous.state)) {
-      return ownsCanvas(previous, sender, { documentToken }, false)
-        ? { ok: true, sessionId: previous.sessionId, replayShortcut: settings.replayShortcut } : { ok: true, busy: true };
+      if (!ownsCanvas(previous, sender, { documentToken }, false)) return { ok: true, busy: true };
+      const latest = await getSettings();
+      return cancelStart ? { ok: true, busy: true } : { ok: true, sessionId: previous.sessionId, replayShortcut: latest.replayShortcut };
     }
     const tab = await chrome.tabs.get(sender.tab!.id!).catch(() => null);
     if (!tab?.active || !isAllowedGameUrl(tab.url) || cancelStart) return { ok: true, busy: true };
+    // A READY can outlive its sender while preferences or offscreen startup
+    // are pending. Verify the exact document before publishing its ownership.
+    const currentDocument = await chrome.tabs.sendMessage(tab.id!, { type: 'UCHI_CANVAS_CHECK', documentToken },
+      sender.documentId ? { documentId: sender.documentId } : { frameId: sender.frameId ?? 0 }).catch(() => null);
+    if (cancelStart || !currentDocument?.ok || currentDocument.documentToken !== documentToken) return { ok: true, busy: true };
     const sessionId = crypto.randomUUID(), startedAt = Date.now();
     await publish({ ...EMPTY_CAPTURE, state: 'starting', source: 'canvas', tabId: tab.id, frameId: sender.frameId ?? 0,
       documentId: sender.documentId, documentToken, sessionId, startedAt, ocrReady: false, message: '自動記録を準備しています' });
@@ -184,7 +196,8 @@ async function startCanvas(sender: chrome.runtime.MessageSender, documentToken: 
     if (!response?.ok || !response.status) throw new Error(response?.error ?? '自動記録を開始できませんでした。');
     await chrome.storage.session.set({ gameTabId: tab.id });
     await publish(withOwner(response.status));
-    return cancelStart ? { ok: true, busy: true } : { ok: true, sessionId, replayShortcut: settings.replayShortcut };
+    const latest = await getSettings();
+    return cancelStart ? { ok: true, busy: true } : { ok: true, sessionId, replayShortcut: latest.replayShortcut };
   } catch (error) {
     const message = conciseError(error);
     // A competing page's failed preference/status read does not own the
@@ -196,7 +209,7 @@ async function startCanvas(sender: chrome.runtime.MessageSender, documentToken: 
     }
     await publish({ ...EMPTY_CAPTURE, state: 'error', message });
     return { ok: false, error: message };
-  } finally { release(); }
+  } finally { startingTabId = undefined; release(); }
 }
 function stopCapture(message?: string): Promise<any> {
   cancelStart = true;
@@ -249,11 +262,19 @@ async function probeGameTabs(inject = false) {
   }));
 }
 async function pauseCapture() {
-  await updateSettings({ autoRecord: false });
-  return stopCapture('自動記録を一時停止しています。');
+  // Stopping screen/key access must not depend on a successful preferences write.
+  automaticPaused = true;
+  const stopped = stopCapture('自動記録を一時停止しています。');
+  let settingsFailed = false;
+  try { await updateSettings({ autoRecord: false }); } catch { settingsFailed = true; }
+  const result = await stopped;
+  if (settingsFailed) return { ...result, ok: false, error: [result.ok ? undefined : result.error,
+    '記録を停止しましたが、一時停止の設定を保存できませんでした。この実行中は自動再開しません。'].filter(Boolean).join(' ') };
+  return result;
 }
 async function resumeCapture() {
   await updateSettings({ autoRecord: true });
+  automaticPaused = false;
   if (stopping) await stopping;
   await probeGameTabs(true);
   return { ok: true, status };
@@ -303,12 +324,16 @@ chrome.runtime.onInstalled.addListener(details => {
   void probeGameTabs(true).catch(() => {});
 });
 chrome.tabs.onRemoved.addListener(tabId => {
+  if (startingTabId === tabId) cancelStart = true;
   void loadStatus().then(current => { if (current.tabId === tabId && ['starting', 'recording'].includes(current.state)) return stopCapture('タブを閉じたため記録を終了しました。'); });
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!changeInfo.url && changeInfo.status !== 'loading') return;
+  // Allowed same-document URL changes (such as a hash) do not unload the
+  // sender. Cancel startup only when the same event also requires a stop.
+  if (changeInfo.status !== 'loading' && (!changeInfo.url || isAllowedGameUrl(changeInfo.url))) return;
+  if (startingTabId === tabId) cancelStart = true;
   void loadStatus().then(current => {
-    if (current.tabId === tabId && ['starting', 'recording'].includes(current.state) && (changeInfo.status === 'loading' || (changeInfo.url && !isAllowedGameUrl(changeInfo.url)))) return stopCapture('ページが移動したため記録を終了しました。');
+    if (current.tabId === tabId && ['starting', 'recording'].includes(current.state)) return stopCapture('ページが移動したため記録を終了しました。');
   });
 });
 chrome.tabCapture.onStatusChanged.addListener(info => {
@@ -340,6 +365,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         !/^[a-zA-Z0-9-]{16,80}$/.test(message.documentToken)) return;
     const task = message.type === 'UCHI_CANVAS_READY' ? startCanvas(sender, message.documentToken) : (async () => {
       const current = await loadStatus();
+      // END is an idempotent release. A lost acknowledgement can be retried
+      // without allowing an older document to stop the current owner.
+      if (message.type === 'UCHI_CANVAS_END' && (!ownsCanvas(current, sender, message) || !['recording', 'starting'].includes(current.state))) return { ok: true, ended: true };
       if (!ownsCanvas(current, sender, message) || !['recording', 'starting'].includes(current.state)) return { ok: false, error: '記録は終了しています。' };
       if (message.type === 'UCHI_CANVAS_FRAME') {
         if (!validCanvasFrame(message.frame)) return { ok: false, error: '読み取り画像を確認できませんでした。' };
