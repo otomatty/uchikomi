@@ -150,9 +150,22 @@ try {
   await run('Automatic prompt bounds from a full browser screenshot, including page margins', async () => {
     const game = await context.newPage();
     await game.goto('https://sushida.net/play.html');
-    await game.evaluate(() => document.fonts.ready);
-    const image = 'data:image/png;base64,'+(await game.screenshot()).toString('base64');
+    await game.bringToFront();
+    await game.evaluate(async () => {
+      await document.fonts.ready;
+      window.fixture.repaint();
+      await new Promise(resolve => requestAnimationFrame(() => resolve()));
+    });
+    report.promptFixture = await game.evaluate(() => {
+      const canvas = document.querySelector('canvas');
+      const r = canvas.getBoundingClientRect();
+      return { title: document.title, state: window.fixture.state, canvas: { x: r.x, y: r.y, width: r.width, height: r.height }, viewport: { width: innerWidth, height: innerHeight }, devicePixelRatio };
+    });
+    // Persist the exact detector input before asserting, so failures retain the
+    // fixture image, not just a screenshot of the separate extension UI page.
+    const image = 'data:image/png;base64,'+(await game.screenshot({ path: path.join(output, 'prompt-fixture.png') })).toString('base64');
     const detected = await app.evaluate(dataUrl => window.UchiQA.detectPromptFromImage(dataUrl), image);
+    report.promptDetection = detected;
     assert.ok(detected && detected.confidence > .8, 'independent prompt was not detected');
     const expected = await game.evaluate(() => {
       const r=document.querySelector('canvas').getBoundingClientRect();
@@ -161,8 +174,9 @@ try {
     for (const key of ['x','y','width','height']) assert.ok(Math.abs(detected.panel[key]-expected[key])<.015, 'incorrect '+key);
     assert.ok(detected.reading.y<detected.japanese.y && detected.japanese.y<detected.roman.y);
     await game.getByRole('button',{name:'空画面',exact:true}).click();
-    const blank='data:image/png;base64,'+(await game.screenshot()).toString('base64');
-    assert.equal(await app.evaluate(dataUrl => window.UchiQA.detectPromptFromImage(dataUrl), blank),null);
+    const blank='data:image/png;base64,'+(await game.screenshot({ path: path.join(output, 'prompt-blank.png') })).toString('base64');
+    report.blankPromptDetection = await app.evaluate(dataUrl => window.UchiQA.detectPromptFromImage(dataUrl), blank);
+    assert.equal(report.blankPromptDetection,null);
     await game.close();
   });
 

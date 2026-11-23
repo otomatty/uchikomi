@@ -37,9 +37,11 @@
       const ctx = canvas.getContext('2d');
       let index = 0, position = 0, mistakes = 0, blank = false, completeAt = null;
       const paint = () => {
-        ctx.fillStyle = '#fff9e9'; ctx.fillRect(0, 0, 900, 560);
-        ctx.fillStyle = '#eaede5'; ctx.fillRect(0, 410, 900, 150);
-        ctx.fillStyle = '#57645d'; ctx.font = '16px sans-serif'; ctx.textAlign = 'left';
+        // A distinct coloured backdrop is part of this white-border prompt fixture.
+        // An almost-white backdrop joins the border into one viewport-wide white rail.
+        ctx.fillStyle = '#597763'; ctx.fillRect(0, 0, 900, 560);
+        ctx.fillStyle = '#87987d'; ctx.fillRect(0, 410, 900, 150);
+        ctx.fillStyle = '#fff'; ctx.font = '16px sans-serif'; ctx.textAlign = 'left';
         ctx.fillText('TEST FIXTURE', 32, 40);
         ctx.textAlign = 'right'; ctx.fillText('10,000 / 正確重視（テスト表示）', 868, 40);
         if (!blank) {
@@ -70,7 +72,7 @@
       document.getElementById('reset').onclick = () => { select(index); canvas.focus(); };
       document.getElementById('blank').onclick = () => { blank = !blank; paint(); canvas.focus(); };
       window.fixture = {
-        phrases, select, canvas,
+        phrases, select, canvas, repaint: paint,
         get state() { return { index, position, mistakes, blank, completeAt }; },
         get calibration() {
           const r = canvas.getBoundingClientRect(), sx = r.width / 900, sy = r.height / 560;
