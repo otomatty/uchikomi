@@ -140,7 +140,7 @@ try {
     assert.ok(await app.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'desktop overflow');
     await app.keyboard.press('Tab');
     assert.ok(await app.evaluate(() => document.activeElement !== document.body), 'keyboard focus did not advance');
-    await app.screenshot({ path: path.join(output, 'desktop-empty.png'), fullPage: true });
+    await app.screenshot({ animations: 'disabled', path: path.join(output, 'desktop-empty.png'), fullPage: true });
   });
   await run('Packaged OCR worker and WASM work offline under extension CSP', async () => {
     const result = await app.evaluate(() => window.UchiQA.ocrSmoke());
@@ -249,7 +249,7 @@ try {
     assert.equal(wrong[0].actual,'q');assert.deepEqual(wrong[0].expected,['p']);
     const session=data.sessions.find(s=>s.id===practiced[0].sessionId);
     assert.ok(session?.endedAt);assert.equal(session.phraseCount,5);
-    await app.screenshot({path:path.join(output,'practice-complete.png'),fullPage:true});
+    await app.screenshot({ animations: 'disabled',path:path.join(output,'practice-complete.png'),fullPage:true});
   });
   await run('Mistake details show actual keys, correct candidates and per-key history',async()=>{
     await app.getByTestId('nav-phrases').click();
@@ -262,7 +262,7 @@ try {
     await app.locator('.key-history summary').click();
     assert.equal(await app.locator('.trace-key.rejected').count(),1);
     assert.match(await app.locator('.trace-key.rejected').getAttribute('aria-label'),/正解候補 p/);
-    await app.screenshot({path:path.join(output,'mistake-details.png'),fullPage:true});
+    await app.screenshot({ animations: 'disabled',path:path.join(output,'mistake-details.png'),fullPage:true});
     await app.getByRole('button',{name:'閉じる',exact:true}).click();
   });
   await run('Repeated slow intervals filter to actual saved words in the browser UI',async()=>{
@@ -284,7 +284,7 @@ try {
     assert.equal(await app.getByTestId('phrase-row').count(),1);
     assert.match(await app.getByTestId('phrase-row').innerText(),/テスト用のペアルック/);
     assert.ok(await app.getByRole('button',{name:/^kkの語句を見る/}).count());
-    await app.screenshot({path:path.join(output,'slow-patterns.png'),fullPage:true});
+    await app.screenshot({ animations: 'disabled',path:path.join(output,'slow-patterns.png'),fullPage:true});
   });
   await run('An automatic score is saved once and appears in growth without manual entry',async()=>{
     const saved=await app.evaluate(async()=>{
@@ -303,7 +303,7 @@ try {
     await app.getByRole('button',{name:'19,740円の記録を編集',exact:true}).waitFor();
     assert.match(await app.locator('.session-score').innerText(),/自動/);
     assert.match(await app.locator('.growth-stats').innerText(),/19,740/);
-    await app.screenshot({path:path.join(output,'automatic-score.png'),fullPage:true});
+    await app.screenshot({ animations: 'disabled',path:path.join(output,'automatic-score.png'),fullPage:true});
   });
   await run('Backup export is available from the real settings UI',async()=>{
     await app.getByTestId('nav-settings').click();
@@ -319,12 +319,12 @@ try {
     await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
     await panel.waitForFunction(() => document.querySelector('#root')?.childElementCount > 0);
     assert.ok(await panel.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'sidepanel overflow');
-    await panel.screenshot({ path: path.join(output, 'sidepanel-360.png'), fullPage: true });
+    await panel.screenshot({ animations: 'disabled', path: path.join(output, 'sidepanel-360.png'), fullPage: true });
     await panel.locator('.panel-nav button').nth(1).click();
     await panel.getByTestId('filter-slow').click();
     await panel.locator('.slow-pattern').first().waitFor();
     assert.ok(await panel.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'word analysis overflow');
-    await panel.screenshot({ path: path.join(output, 'sidepanel-analysis-360.png'), fullPage: true });
+    await panel.screenshot({ animations: 'disabled', path: path.join(output, 'sidepanel-analysis-360.png'), fullPage: true });
     await panel.close();
   });
   await run('No uncaught application exceptions', async () => assert.deepEqual(report.browserErrors, []));
@@ -339,7 +339,7 @@ try {
   }
   if (context) report.openPagesAtFailure = context.pages().map(page => page.url());
   if (app && !app.isClosed()) {
-    await app.screenshot({ path: path.join(output, 'failure.png'), fullPage: true, timeout: 5000 }).catch(() => {});
+    await app.screenshot({ animations: 'disabled', path: path.join(output, 'failure.png'), fullPage: true, timeout: 5000 }).catch(() => {});
   }
   process.exitCode = 1;
 } finally {

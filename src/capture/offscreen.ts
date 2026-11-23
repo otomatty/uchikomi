@@ -578,6 +578,10 @@ async function finishStop() {
   stream?.getTracks().forEach(track => track.stop()); stream = null;
   video.srcObject = null;
   await initializing;
+  if (!jpWorker || !romanWorker) {
+    for (const candidate of queue) candidate.completionBoundary.settle(null);
+    currentCandidate?.completionBoundary.settle(null);
+  }
   await processQueue();
   if (currentCandidate) await finalizeCandidate(currentCandidate).catch(reportError);
   await Promise.all([...pendingWrites]);
@@ -619,7 +623,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         keyBuffer.push(...message.keys);
         if (keyBuffer.length > MAX_KEY_BUFFER) {
           keyBuffer.splice(0, keyBuffer.length - MAX_KEY_BUFFER);
-          if (currentCandidate) currentCandidate.reliableBoundary = false;
+          for (const candidate of queue) { candidate.reliableBoundary = false; candidate.completionBoundary.settle(null); }
+          if (currentCandidate) { currentCandidate.reliableBoundary = false; currentCandidate.completionBoundary.settle(null); }
         }
       }
       sendResponse({ ok: true }); return;
@@ -630,7 +635,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (status.state === 'recording') resetAutoRegions(Date.now());
       sendResponse({ ok: true, status }); return;
     case 'UCHI_OFF_GAP':
-      if (Number.isFinite(message.at)) focusGaps.push(message.at);
+      if (Number.isFinite(message.at)) {
+        focusGaps.push(message.at);
+        if (currentCandidate && message.at >= currentCandidate.at && (!currentCandidate.endedAt || message.at < currentCandidate.endedAt)) {
+          currentCandidate.completionBoundary.settle(null);
+        }
+      }
       sendResponse({ ok: true }); return;
     case 'UCHI_OFF_CALIBRATE':
       if (!isCalibration(message.calibration)) { sendResponse({ ok: false }); return; }
