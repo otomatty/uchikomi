@@ -24,8 +24,10 @@ function money(token: string): number | null {
 interface Amounts { values: number[]; invalid: boolean; }
 const totalSuffix = '分(?:のお寿司(?:を(?:ゲット|獲得))?|の[ぁ-んァ-ヶー一-龠]{1,8}を(?:ゲット|獲得))';
 const totalLabelPattern = new RegExp(`[円内]${totalSuffix}|お寿司を(?:ゲット|獲得)`);
-const gainLabelPattern = /[円内]分(?:お|ね)?得(?:でした|です|[!！])/;
-const lossLabelPattern = /[円内]分(?:の)?損(?:でした|です|[!！])/;
+const gainSuffix = '分(?:お|ね)?得(?:でした|です|[!！])';
+const lossSuffix = '分(?:の)?損(?:でした|です|[!！])';
+const gainLabelPattern = new RegExp(`[円内]${gainSuffix}`);
+const lossLabelPattern = new RegExp(`[円内]${lossSuffix}`);
 function amounts(text: string, suffix: string, currency = '円'): Amounts {
   const values: number[] = [];
   let invalid = false;
@@ -62,8 +64,8 @@ export function parseResultScore(input: ScoreText): ParsedScore {
   // The accepted total-row label and its amount use the same spelling rules,
   // so a confidently read amount is never discarded just for its food noun.
   const total = amounts(totalText, totalSuffix, '[円内]');
-  const gain = amounts(differenceText, '分(?:お)?得(?:でした|です|[!！])');
-  const loss = amounts(differenceText, '分(?:の)?損(?:でした|です|[!！])');
+  const gain = amounts(differenceText, gainSuffix, '[円内]');
+  const loss = amounts(differenceText, lossSuffix, '[円内]');
   const paid = amounts(paidText, '払って');
   // The semantic anchor is 得でした. A small お is occasionally recognised as
   // ね in the result font; this does not change the independently read amount.

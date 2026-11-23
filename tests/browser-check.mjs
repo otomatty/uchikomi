@@ -72,6 +72,7 @@ try {
       contents: `
         export * from ${JSON.stringify(path.join(root, 'src/core/db.ts'))};
         export { buildAttempt } from ${JSON.stringify(path.join(root, 'src/core/analytics.ts'))};
+        export { visibleGameCanvas } from ${JSON.stringify(path.join(root, 'src/capture/canvas-producer.ts'))};
         import { detectPromptRegions } from ${JSON.stringify(path.join(root, 'src/capture/auto-region.ts'))};
         import { detectResultRegions } from ${JSON.stringify(path.join(root, 'src/capture/auto-result.ts'))};
         async function imageFrame(dataUrl) {
@@ -193,6 +194,67 @@ try {
     // The original screenshot/layout fixtures are not live capture tests. Keep
     // their data unchanged; a separate WebGL check below exercises the default.
     await app.evaluate(() => window.UchiQA.updateSettings({ autoRecord: false }));
+  });
+  await run('Canvas discovery follows actual containing blocks and computed overflow axes', async () => {
+    const layout = await newQaPage();
+    try {
+      await layout.goto(`chrome-extension://${extensionId}/qa-empty.html`);
+      await layout.addScriptTag({ url: `chrome-extension://${extensionId}/qa-harness.js` });
+      await layout.bringToFront();
+      report.canvasVisibility = await layout.evaluate(() => {
+        const cases = [];
+        document.body.style.margin = '0';
+        const measure = (name, expected, { position = 'absolute', wrapper = '', nested = false } = {}) => {
+          document.body.replaceChildren();
+          const host = document.createElement('main'), clipper = document.createElement('div'), canvas = document.createElement('canvas');
+          host.style.cssText = 'position:relative;width:1000px;height:800px;';
+          clipper.style.cssText = 'display:flow-root;width:100px;height:80px;overflow:hidden;' + wrapper;
+          canvas.id = 'game'; canvas.width = 400; canvas.height = 240;
+          canvas.style.cssText = 'display:block;width:400px;height:240px;background:#487366;';
+          if (nested) {
+            const positioned = document.createElement('div');
+            positioned.style.cssText = 'position:absolute;left:320px;top:180px;width:400px;height:240px;';
+            positioned.append(canvas); clipper.append(positioned);
+          } else {
+            canvas.style.position = position;
+            if (position === 'static') canvas.style.margin = '180px 0 0 120px';
+            else { canvas.style.left = '320px'; canvas.style.top = '180px'; }
+            clipper.append(canvas);
+          }
+          host.append(clipper); document.body.append(host);
+          const style = getComputedStyle(clipper), rect = canvas.getBoundingClientRect();
+          const center = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+          cases.push({ name, expected, detected: window.UchiQA.visibleGameCanvas(document) === canvas,
+            hit: document.elementFromPoint(center.x, center.y) === canvas,
+            computed: { position: style.position, overflowX: style.overflowX, overflowY: style.overflowY,
+              transform: style.transform, contain: style.contain },
+            canvas: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          });
+        };
+        measure('absolute / static overflow wrapper / outer positioned containing block', true);
+        measure('absolute / overflow wrapper is the containing block', false, { wrapper: 'position:relative;' });
+        measure('fixed / positioned overflow wrapper / viewport containing block', true, { position: 'fixed', wrapper: 'position:relative;' });
+        measure('fixed / transformed overflow containing block', false, { position: 'fixed', wrapper: 'transform:translateX(0px);' });
+        measure('in-flow canvas / absolute parent escapes static overflow wrapper', true, { nested: true });
+        measure('ordinary in-flow canvas / hidden overflow', false, { position: 'static' });
+        measure('clip / visible clips only the horizontal axis', true, { position: 'static', wrapper: 'width:600px;overflow-x:clip;overflow-y:visible;' });
+        measure('hidden / visible computes to hidden / auto', false, { position: 'static', wrapper: 'width:600px;overflow-x:hidden;overflow-y:visible;' });
+        measure('paint containment also clips the vertical axis', false, { position: 'static', wrapper: 'width:600px;overflow-x:clip;overflow-y:visible;contain:paint;' });
+        return { visible: !document.hidden, cases };
+      });
+      assert.equal(report.canvasVisibility.visible, true, 'The independent layout fixture must be genuinely visible');
+      for (const result of report.canvasVisibility.cases) {
+        assert.equal(result.hit, result.expected, `${result.name}: actual Chrome hit testing disagrees with the fixture`);
+        assert.equal(result.detected, result.expected, `${result.name}: production canvas discovery disagrees with Chrome`);
+      }
+      const axis = report.canvasVisibility.cases.find(result => result.name.startsWith('clip / visible'));
+      assert.deepEqual([axis.computed.overflowX, axis.computed.overflowY], ['clip', 'visible']);
+      const computedAuto = report.canvasVisibility.cases.find(result => result.name.startsWith('hidden / visible'));
+      assert.deepEqual([computedAuto.computed.overflowX, computedAuto.computed.overflowY], ['hidden', 'auto']);
+    } finally {
+      await layout.close();
+      await app.bringToFront();
+    }
   });
   await run('Desktop layout and keyboard focus', async () => {
     assert.ok(await app.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'desktop overflow');
@@ -788,6 +850,9 @@ try {
       await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
       await panel.getByTestId('capture-card').waitFor();
       await app.evaluate(() => window.UchiQA.updateSettings({ autoRecord: true, replayShortcut: 'Escape' }));
+      // Earlier import checks can intentionally restore a paused preference.
+      // Reset through the public synchronization path, not by bypassing its latch.
+      assert.equal((await send('UCHI_SETTINGS_RESTORED'))?.ok, true);
       activeFixture = canvasFixture;
       game = await newQaPage();
       await game.goto('https://sushida.net/play.html');

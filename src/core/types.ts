@@ -55,6 +55,7 @@ export interface WordStat {
 }
 export interface CaptureStatus {
  state:'idle'|'starting'|'recording'|'stopping'|'error'; sessionId?:string; tabId?:number; startedAt?:number;
+ autoRecordPaused?:boolean;
  source?:'canvas'|'tab'; frameId?:number; documentId?:string; documentToken?:string;
  phraseCount:number; message?:string; ocrReady?:boolean; latestPhrase?:string; lastFrameAt?:number;
  regionState?:'searching'|'locked'|'manual'; regionConfidence?:number; region?:Rect;

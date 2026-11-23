@@ -13,6 +13,10 @@ after(() => { globalThis.BroadcastChannel = nativeChannel; });
 beforeEach(async () => { await clearData(); });
 
 const now = 1760000000000;
+function localStorageStub() {
+  const values: Record<string, unknown> = {};
+  return { async get() { return structuredClone(values); }, async set(value: Record<string, unknown>) { Object.assign(values, structuredClone(value)); } };
+}
 function captureSession(): Session {
   return {
     id: 'capture-game', captureId: 'capture-bridge', startedAt: now,
@@ -111,7 +115,7 @@ test('background stop propagates offscreen save failure, cleans up, and permits 
         return { ok: true };
       },
     },
-    storage: { session: {
+    storage: { local: localStorageStub(), session: {
       async get() { return { captureStatus: recording }; },
       async set(value: { captureStatus?: CaptureStatus }) {
         if (value.captureStatus) published.push(structuredClone(value.captureStatus));
@@ -195,7 +199,7 @@ test('initial status-read failure releases both start and stop transition locks'
         onInstalled: ignored, onMessage: { addListener(listener: typeof handler) { handler = listener; } },
         async getContexts() { return []; }, async sendMessage() { return { ok: true }; },
       },
-      storage: { session: {
+      storage: { local: localStorageStub(), session: {
         async get() {
           if (failStatusRead) { failStatusRead = false; throw new Error('temporary session-storage failure'); }
           return {};
@@ -237,7 +241,7 @@ test('background drops legacy score notifications without relabelling them or ch
       async getContexts() { return [{}]; },
       async sendMessage(message: any) { return message.type === 'UCHI_OFF_STATUS' ? { ok: true, status: live } : { ok: true }; },
     },
-    storage: { session: { async get() { return { captureStatus: stored }; }, async set(value: any) { published.push(structuredClone(value.captureStatus)); } } },
+    storage: { local: localStorageStub(), session: { async get() { return { captureStatus: stored }; }, async set(value: any) { published.push(structuredClone(value.captureStatus)); } } },
     action: { onClicked: ignored, async setBadgeText() {}, async setBadgeBackgroundColor() {} },
     tabs: { onRemoved: ignored, onUpdated: ignored, async sendMessage() { return { ok: true }; } },
     tabCapture: { onStatusChanged: ignored }, offscreen: { async closeDocument() {} },

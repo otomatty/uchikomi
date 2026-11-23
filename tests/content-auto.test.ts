@@ -21,6 +21,7 @@ test('a visible game starts itself, resumes after visibility, and respects pause
   let nextSession = 0;
   let allowReplay = true, holdReplay = false;
   let finishReplay: ((reply: any) => void) | undefined;
+  let endFailures = 0;
   let onMessage: ((message: any, sender: any, respond: (value: any) => void) => unknown) | undefined;
   define('chrome', { runtime: {
     id: 'auto-test',
@@ -35,6 +36,7 @@ test('a visible game starts itself, resumes after visibility, and respects pause
         if (holdReplay) return new Promise(resolve => { finishReplay = resolve; });
         return { ok: true, ready: allowReplay, sessionId: message.sessionId };
       }
+      if (message.type === 'UCHI_CANVAS_END' && endFailures > 0) { endFailures--; throw new Error('END delivery failed'); }
       return { ok: true };
     },
     onMessage: { addListener(listener: typeof onMessage) { onMessage = listener; } },
@@ -173,13 +175,20 @@ test('a visible game starts itself, resumes after visibility, and respects pause
   assert.equal(tracks.length, 2, 'a manual pause cannot be undone by automatic discovery');
   mode = 'ready'; request('UCHI_CANVAS_PROBE'); await settle();
   assert.equal(tracks.length, 3);
+  endFailures = 1;
   tracks[2].dispatchEvent(new browser.Event('mute')); await settle();
   assert.equal(stops[2], 1);
   assert.equal(messages.filter(message => message.type === 'UCHI_CANVAS_END').at(-1).reason, 'error');
   const beforeRetry = count('UCHI_CANVAS_READY');
+  const beforeEndRetry = count('UCHI_CANVAS_END');
   for (const { callback, ms } of intervals.values()) if (ms === 2500) callback();
   await settle();
+  assert.equal(count('UCHI_CANVAS_END'), beforeEndRetry + 1, 'A producer error still retries the failed release on the periodic probe');
   assert.equal(count('UCHI_CANVAS_READY'), beforeRetry, 'capture failures do not cause an automatic retry loop');
+  for (const { callback, ms } of intervals.values()) if (ms === 2500) callback();
+  await settle();
+  assert.equal(count('UCHI_CANVAS_END'), beforeEndRetry + 1, 'The release is acknowledged once');
+  assert.equal(count('UCHI_CANVAS_READY'), beforeRetry, 'An END acknowledgement alone does not permit another recording');
   request('UCHI_CANVAS_PROBE'); await settle();
   assert.equal(tracks.length, 4);
 

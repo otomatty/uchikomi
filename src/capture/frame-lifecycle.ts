@@ -4,6 +4,7 @@ import { StableScoreReader, type ParsedScore } from './score-parser';
 
 interface PromptTransition {
   interruptedAt?: number;
+  pendingAt?: number;
   candidate?: { at: number; contiguous: boolean };
 }
 
@@ -23,7 +24,7 @@ export class PromptSignatureTracker {
     }
     if (!this.pending) {
       this.pending = { bytes, at };
-      return { interruptedAt };
+      return { interruptedAt, pendingAt: at };
     }
     const candidate = { at: this.pending.at, contiguous: this.last !== null };
     this.last = bytes; this.pending = null;

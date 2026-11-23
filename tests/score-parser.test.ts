@@ -74,6 +74,23 @@ test('total and payment can independently use labelled rows or structured numeri
   notSaved({...input,numeric:{paid:{text:'5,000',confidence:96}}},'the independently selected payment must be 10,000 yen');
 });
 
+test('mixed primary OCR checks amounts under every accepted gain and loss label',()=>{
+  for(const [total,difference,suffix] of [
+    [29740,19740,'円分得でした！'],[29740,19740,'内分お得です！'],
+    [29740,19740,'円分ね得でした！'],[29740,19740,'内分ね得でした！'],
+    [9200,800,'内分損でした！'],[9200,800,'内分の損です！'],
+  ] as const){
+    const input=numeric({totalLabelText:'円分のお寿司をゲット！',totalLabelConfidence:94,labelText:'',labelConfidence:0,
+      amountLines:{total:{text:`${total}円分のお寿司をゲット！`,confidence:94},paid:{text:'10,000円払つて…',confidence:94},
+        profit:{text:`${difference+20}${suffix}`,confidence:94}},numeric:{paid:{text:'10,000',confidence:96}}});
+    const parsed=parseResultScore(input);assert.equal(parsed.kind,'review',suffix);
+    const reader=new StableScoreReader();assert.equal(reader.observe(parsed,1000),null);
+    assert.equal(reader.observe(parseResultScore(input),1600)?.kind,'review','repeated contradictory auxiliary amounts cannot confirm a score');
+    assert.equal(parseResultScore({...input,amountLines:{...input.amountLines,profit:{text:`${difference}${suffix}`,confidence:94}}}).score,total,'an agreeing auxiliary amount remains usable');
+    assert.equal(parseResultScore({...input,amountLines:{...input.amountLines,profit:{text:`${difference+20}${suffix}`,confidence:40}}}).score,total,'a weak optional row cannot block clear primary amounts');
+  }
+});
+
 test('the difference row supplies its own trusted gain/loss evidence even when its label crop is empty or weak',()=>{
   const input=numeric({totalLabelText:'円分のお寿司をゲット！',totalLabelConfidence:94,
     labelText:'',labelConfidence:0,amountLines:{profit:{text:'円分損でした！',confidence:94}},

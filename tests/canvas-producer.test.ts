@@ -276,8 +276,51 @@ test('canvas discovery intersects clipping ancestors and admits the same canvas 
   bounds = { ...bounds, top: 810, bottom: 1010 };
   assert.equal(visibleGameCanvas(f.document as any), null);
   wrapper.style.overflow = 'visible';
-  wrapper.style.overflowX = 'hidden'; wrapper.style.overflowY = 'visible';
+  wrapper.style.overflowX = 'clip'; wrapper.style.overflowY = 'visible';
   assert.equal(visibleGameCanvas(f.document as any), f.source, 'Only the clipped axis constrains the visible intersection');
   wrapper.style.contain = 'paint';
   assert.equal(visibleGameCanvas(f.document as any), null, 'Paint containment also clips both axes');
+});
+
+test('absolute canvases escape intermediate overflow but remain clipped by their containing block', async t => {
+  const f = fixture(); t.after(() => f.browser.happyDOM.close());
+  const containingBlock = f.document.createElement('div'), wrapper = f.document.createElement('div');
+  const outside = { width: 300, height: 200, left: 980, top: 0, right: 1280, bottom: 200 };
+  for (const element of [containingBlock, wrapper]) Object.defineProperty(element, 'getBoundingClientRect', { value: () => outside });
+  containingBlock.style.position = 'relative'; wrapper.style.overflow = 'hidden'; f.source.style.position = 'absolute';
+  f.document.body.append(containingBlock); containingBlock.append(wrapper); wrapper.append(f.source);
+  assert.equal(visibleGameCanvas(f.document as any) === f.source, true, 'A static wrapper between an absolute canvas and its containing block does not clip it');
+  wrapper.style.position = 'relative';
+  assert.equal(visibleGameCanvas(f.document as any), null, 'The same wrapper clips once it establishes the containing block');
+  wrapper.style.position = 'static'; containingBlock.style.overflow = 'hidden';
+  assert.equal(visibleGameCanvas(f.document as any), null, 'Overflow on the actual containing block still applies');
+});
+
+test('fixed canvases escape positioned overflow until a transform or containment establishes their containing block', async t => {
+  const f = fixture(); t.after(() => f.browser.happyDOM.close());
+  const wrapper = f.document.createElement('div');
+  Object.defineProperty(wrapper, 'getBoundingClientRect', { value: () => ({ width: 300, height: 200, left: 980, top: 0, right: 1280, bottom: 200 }) });
+  wrapper.style.position = 'relative'; wrapper.style.overflow = 'hidden'; f.source.style.position = 'fixed';
+  f.document.body.append(wrapper); wrapper.append(f.source);
+  assert.equal(visibleGameCanvas(f.document as any) === f.source, true, 'Position alone cannot contain a fixed canvas');
+  wrapper.style.transform = 'translateX(0px)';
+  assert.equal(visibleGameCanvas(f.document as any), null, 'A transform makes the ancestor overflow applicable');
+  wrapper.style.transform = 'none'; wrapper.style.contain = 'layout';
+  assert.equal(visibleGameCanvas(f.document as any), null, 'Layout containment also establishes the fixed containing block');
+  wrapper.style.overflow = 'visible'; wrapper.style.contain = 'paint';
+  assert.equal(visibleGameCanvas(f.document as any), null, 'Paint containment cannot be bypassed');
+});
+
+test('an in-flow canvas inherits its positioned ancestor escape from an intermediate overflow wrapper', async t => {
+  const f = fixture(); t.after(() => f.browser.happyDOM.close());
+  const containingBlock = f.document.createElement('div'), wrapper = f.document.createElement('div'), positioned = f.document.createElement('div');
+  Object.defineProperty(wrapper, 'getBoundingClientRect', { value: () => ({ width: 300, height: 200, left: 980, top: 0, right: 1280, bottom: 200 }) });
+  containingBlock.style.position = 'relative'; wrapper.style.overflow = 'hidden';
+  f.document.body.append(containingBlock); containingBlock.append(wrapper); wrapper.append(positioned); positioned.append(f.source);
+  for (const position of ['absolute', 'fixed']) {
+    positioned.style.position = position;
+    assert.equal(visibleGameCanvas(f.document as any) === f.source, true, `The ${position} ancestor and its in-flow contents escape together`);
+  }
+  positioned.style.position = 'static';
+  assert.equal(visibleGameCanvas(f.document as any), null, 'Ordinary in-flow contents remain clipped');
 });

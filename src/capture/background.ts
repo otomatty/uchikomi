@@ -7,6 +7,7 @@ import { isReplayShortcut } from '../core/shortcuts';
 const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
 const ORIGIN = chrome.runtime.getURL('');
 const STOP_ERROR = '最後の記録を保存できませんでした。保存済みの履歴を確認してください。';
+const AUTOMATIC_PAUSE_KEY = 'uchikomiAutomaticPaused';
 let status: CaptureStatus = { ...EMPTY_CAPTURE };
 let stateLoaded = false;
 let creating: Promise<void> | null = null;
@@ -14,7 +15,11 @@ let transitioning = false;
 let transitionDone: Promise<void> | null = null;
 let cancelStart = false;
 let startingTabId: number | undefined;
+let startingCanvas = false;
 let automaticPaused = false;
+let effectiveAutomaticPaused: boolean | undefined;
+let pauseRevision = 0;
+let pauseWrites: Promise<unknown> = Promise.resolve();
 let stopping: Promise<any> | null = null;
 let forwardingFrame: { sessionId: string; sequence: number } | null = null;
 let preparingReplay: object | null = null;
@@ -25,10 +30,14 @@ function beginTransition() {
   transitionDone = new Promise<void>(resolve => { release = resolve; });
   return () => { transitioning = false; transitionDone = null; release(); };
 }
+function withAutomaticPause(next: CaptureStatus, previous = status): CaptureStatus {
+  const paused = effectiveAutomaticPaused ?? previous.autoRecordPaused;
+  return paused === undefined ? next : { ...next, autoRecordPaused: paused };
+}
 function withOwner(next: CaptureStatus, previous = status): CaptureStatus {
-  if (!next.sessionId || next.sessionId !== previous.sessionId) return totalOnlyStatus(next);
-  return totalOnlyStatus({ ...next, source: previous.source ?? next.source, tabId: previous.tabId ?? next.tabId,
-    frameId: previous.frameId, documentId: previous.documentId, documentToken: previous.documentToken });
+  if (!next.sessionId || next.sessionId !== previous.sessionId) return totalOnlyStatus(withAutomaticPause(next, previous));
+  return totalOnlyStatus(withAutomaticPause({ ...next, source: previous.source ?? next.source, tabId: previous.tabId ?? next.tabId,
+    frameId: previous.frameId, documentId: previous.documentId, documentToken: previous.documentToken }, previous));
 }
 function ownsCanvas(current: CaptureStatus, sender: chrome.runtime.MessageSender, message: { documentToken?: string; sessionId?: string }, requireSession = true) {
   return current.source === 'canvas' && current.tabId === sender.tab?.id && current.frameId === (sender.frameId ?? 0) &&
@@ -42,6 +51,30 @@ function validCanvasFrame(frame: any): boolean {
   return frame && Number.isInteger(frame.width) && Number.isInteger(frame.height) && frame.width >= 1 && frame.width <= 1920 && frame.height >= 1 && frame.height <= 1440 &&
     Number.isSafeInteger(frame.sequence) && frame.sequence >= 0 && Number.isFinite(frame.at) && Math.abs(Date.now() - frame.at) < 30000 &&
     typeof frame.dataUrl === 'string' && frame.dataUrl.length <= 3000000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(frame.dataUrl);
+}
+async function isAutomaticPaused() {
+  const stored = await chrome.storage.local.get(AUTOMATIC_PAUSE_KEY);
+  return automaticPaused || stored[AUTOMATIC_PAUSE_KEY] === true;
+}
+async function refreshAutomaticPauseStatus() {
+  const revision = pauseRevision;
+  const paused = automaticPaused || await isAutomaticPaused() || !(await getSettings()).autoRecord;
+  // Storage reads may finish after a newer pause/resume/restore intent. They
+  // describe the old preference and must not overwrite its current UI state.
+  if (revision !== pauseRevision) return;
+  effectiveAutomaticPaused = paused;
+  status = { ...status, autoRecordPaused: paused };
+}
+function writeAutomaticPause(paused: boolean, revision: number): Promise<boolean> {
+  // Serialize durable intents, so a slow earlier pause write cannot arrive
+  // after a later explicit resume. A newer intent always wins in memory too.
+  const write = pauseWrites.catch(() => {}).then(async () => {
+    if (revision !== pauseRevision) return false;
+    await chrome.storage.local.set({ [AUTOMATIC_PAUSE_KEY]: paused });
+    return revision === pauseRevision;
+  });
+  pauseWrites = write;
+  return write;
 }
 
 function totalOnlyStatus(value: CaptureStatus): CaptureStatus {
@@ -66,7 +99,7 @@ async function loadStatus() {
   return status;
 }
 async function publish(next: CaptureStatus) {
-  status = totalOnlyStatus(next);
+  status = totalOnlyStatus(withAutomaticPause(next));
   stateLoaded = true;
   await chrome.storage.session.set({ captureStatus: status });
   void chrome.action.setBadgeText({ text: status.state === 'recording' ? '●' : '' });
@@ -99,6 +132,7 @@ async function currentStatus(forceCheck = false) {
       await publish({ ...EMPTY_CAPTURE, state: 'error', message: '記録が中断されました。もう一度開始してください。' });
     }
   }
+  await refreshAutomaticPauseStatus();
   return status;
 }
 async function findGameTab(requireActive = false): Promise<chrome.tabs.Tab | null> {
@@ -166,12 +200,14 @@ async function startCanvas(sender: chrome.runtime.MessageSender, documentToken: 
   if (transitioning || stopping) return { ok: true, busy: true };
   const release = beginTransition(); cancelStart = false;
   startingTabId = sender.tab!.id;
+  startingCanvas = true;
   let started = false;
   try {
     const settings = await getSettings();
-    if (!settings.autoRecord || automaticPaused) return { ok: true, paused: true };
+    if (!settings.autoRecord || automaticPaused || await isAutomaticPaused()) return { ok: true, paused: true };
     if (cancelStart) return { ok: true, busy: true };
     const previous = await currentStatus(true);
+    if (previous.autoRecordPaused) return { ok: true, paused: true };
     if (['recording', 'starting'].includes(previous.state)) {
       if (!ownsCanvas(previous, sender, { documentToken }, false)) return { ok: true, busy: true };
       const latest = await getSettings();
@@ -209,7 +245,7 @@ async function startCanvas(sender: chrome.runtime.MessageSender, documentToken: 
     }
     await publish({ ...EMPTY_CAPTURE, state: 'error', message });
     return { ok: false, error: message };
-  } finally { startingTabId = undefined; release(); }
+  } finally { startingTabId = undefined; startingCanvas = false; release(); }
 }
 function stopCapture(message?: string): Promise<any> {
   cancelStart = true;
@@ -263,20 +299,67 @@ async function probeGameTabs(inject = false) {
 }
 async function pauseCapture() {
   // Stopping screen/key access must not depend on a successful preferences write.
+  const revision = ++pauseRevision;
   automaticPaused = true;
+  effectiveAutomaticPaused = true;
   const stopped = stopCapture('自動記録を一時停止しています。');
-  let settingsFailed = false;
-  try { await updateSettings({ autoRecord: false }); } catch { settingsFailed = true; }
+  // local storage survives both service-worker eviction and browser restarts.
+  // It is independent of the IndexedDB write that may have just failed.
+  const [settings, latch] = await Promise.allSettled([
+    updateSettings({ autoRecord: false }), writeAutomaticPause(true, revision),
+  ]);
   const result = await stopped;
-  if (settingsFailed) return { ...result, ok: false, error: [result.ok ? undefined : result.error,
-    '記録を停止しましたが、一時停止の設定を保存できませんでした。この実行中は自動再開しません。'].filter(Boolean).join(' ') };
+  if (settings.status === 'rejected') return { ...result, ok: false, error: [result.ok ? undefined : result.error,
+    latch.status === 'fulfilled' && latch.value ? '記録を停止しましたが、一時停止の設定を保存できませんでした。一時停止は保持されています。'
+      : '記録を停止しましたが、一時停止状態を保存できませんでした。'].filter(Boolean).join(' ') };
   return result;
 }
 async function resumeCapture() {
+  const revision = ++pauseRevision;
+  automaticPaused = true;
+  effectiveAutomaticPaused = true;
+  // Keep a durable guard before enabling the DB preference. If clearing the
+  // guard later fails, a worker restart must still see the paused state.
+  if (!await writeAutomaticPause(true, revision)) return { ok: true, status };
   await updateSettings({ autoRecord: true });
-  automaticPaused = false;
   if (stopping) await stopping;
+  if (!await writeAutomaticPause(false, revision)) return { ok: true, status };
+  automaticPaused = false;
+  effectiveAutomaticPaused = false;
+  await publish(status);
   await probeGameTabs(true);
+  return { ok: true, status };
+}
+async function restoreSettings() {
+  const revision = ++pauseRevision;
+  automaticPaused = true;
+  effectiveAutomaticPaused = true;
+  const settings = await getSettings();
+  if (revision !== pauseRevision) return { ok: true, status };
+  if (settings.autoRecord) {
+    if (stopping) await stopping;
+    if (!await writeAutomaticPause(false, revision)) return { ok: true, status };
+    automaticPaused = false;
+    effectiveAutomaticPaused = false;
+    await publish(status);
+    await refreshReplaySettings();
+    await probeGameTabs(true);
+  } else {
+    // Handle a local-store failure immediately even while draining capture;
+    // the imported autoRecord:false is already durable in IndexedDB.
+    const saved = writeAutomaticPause(true, revision).catch(() => false);
+    const current = await loadStatus();
+    let result: { ok: boolean; error?: string } = { ok: true };
+    // Restored auto preferences govern the canvas path only; an explicitly
+    // started tabCapture continues while its shortcut is synchronized below.
+    if (revision === pauseRevision && (startingCanvas || current.source === 'canvas' && ['starting', 'recording'].includes(current.state))) {
+      result = await stopCapture('自動記録を一時停止しています。');
+    }
+    await saved;
+    await publish(status);
+    await refreshReplaySettings();
+    if (!result.ok) return { ...result, status };
+  }
   return { ok: true, status };
 }
 function ownsReplay(current: CaptureStatus, sender: chrome.runtime.MessageSender, message: { sessionId?: string; documentToken?: string }) {
@@ -411,6 +494,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'UCHI_STOP': task = pauseCapture(); break;
     case 'UCHI_RESUME': task = resumeCapture(); break;
     case 'UCHI_REPLAY_SETTINGS_CHANGED': task = refreshReplaySettings(); break;
+    case 'UCHI_SETTINGS_RESTORED': task = restoreSettings(); break;
     case 'UCHI_FRAME': task = (async () => {
       if (!(await hasOffscreen())) return { ok: false, error: '記録を開始してから読み取り範囲を設定してください。' };
       return offscreen('UCHI_OFF_FRAME');

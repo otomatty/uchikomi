@@ -37,15 +37,15 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
   const load = createRequire(filename);
   let listener: ((message: any, sender: any, reply: (result: any) => void) => unknown) | undefined;
   const states: any[] = [], images: any[] = [], bitmapInputs: Blob[] = [];
-  const pngInputs = new Map<string, any>(), ocrInputs: { input: string; width: number; height: number }[] = [];
+  const pngInputs = new Map<string, any>(), ocrInputs: { input: string; width: number; height: number; frameSequence?: number }[] = [];
   const intervals = new Map<unknown, { callback: () => void; delay: number }>();
   const replayTimeouts = new Map<unknown, () => void>();
   const decodeTimeouts = new Map<unknown, () => void>();
   const videoCallbacks = new Map<number, (now: number, metadata: { presentedFrames: number }) => void>();
   let videoCallbackId = 0, presentedFrames = 0;
-  let stoppedTracks = 0, mediaCalls = 0;
+  let stoppedTracks = 0, mediaCalls = 0, incomingFrameSequence: number | undefined;
   const video = {
-    muted: false, playsInline: false, readyState: 0, videoWidth: 0, videoHeight: 0, srcObject: null, async play() {},
+    muted: false, playsInline: false, readyState: 0, videoWidth: 0, videoHeight: 0, srcObject: null, fixtureFrameSequence: 0, async play() {},
     requestVideoFrameCallback(callback: (now: number, metadata: { presentedFrames: number }) => void) { videoCallbacks.set(++videoCallbackId, callback); return videoCallbackId; },
     cancelVideoFrameCallback(id: number) { videoCallbacks.delete(id); },
     getVideoPlaybackQuality() { return { totalVideoFrames: presentedFrames }; },
@@ -61,6 +61,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     async createImageBitmap(blob: Blob) {
       bitmapInputs.push(blob);
       const bitmap = { width: 1280, height: 800, closeCalls: 0, fixtureFrame: options.scene?.prompt ? 'prompt' : options.scene?.receipt ? 'receipt' : 'blank',
+        fixtureFrameSequence: incomingFrameSequence,
         close() { this.closeCalls++; } };
       images.push(bitmap);
       await options.decode?.();
@@ -83,12 +84,14 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
           toDataURL(type: string) {
             if (type !== 'image/png') return 'data:image/jpeg;base64,AA==';
             const input = 'data:image/png;base64,' + Buffer.from(`crop:${pngInputs.size}`).toString('base64');
-            pngInputs.set(input, { width: canvas.width, height: canvas.height, fixtureFrame: canvas.fixtureFrame, fixtureCropY: canvas.fixtureCropY });
+            pngInputs.set(input, { width: canvas.width, height: canvas.height, fixtureFrame: canvas.fixtureFrame, fixtureCropY: canvas.fixtureCropY,
+              fixtureFrameSequence: canvas.fixtureFrameSequence });
             return input;
           },
           getContext: () => ({
             drawImage(image: any, ...coordinates: number[]) {
               canvas.fixtureFrame = image.fixtureFrame;
+              canvas.fixtureFrameSequence = image.fixtureFrameSequence;
               canvas.fixtureCropY = coordinates.length === 8 ? coordinates[1] : image.fixtureCropY;
             }, fillRect() {}, putImageData() {},
             getImageData(_x: number, _y: number, width: number, height: number) {
@@ -124,7 +127,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
           assert.equal(typeof input, 'string', 'OCR must receive pre-encoded PNG instead of a canvas');
           const crop = pngInputs.get(input);
           assert.ok(crop, 'OCR must receive the prepared PNG text crop');
-          ocrInputs.push({ input, width: crop.width, height: crop.height });
+          ocrInputs.push({ input, width: crop.width, height: crop.height, frameSequence: crop.fixtureFrameSequence });
           return worker.recognize(crop, ...rest);
         } };
       }) };
@@ -152,9 +155,16 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
   const request = (type: string, extra: object = {}) => new Promise<any>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error(`${type} did not settle`)), 1000);
     let replied = false;
-    const keepAlive = listener?.({ target: 'offscreen', type, ...extra }, { id: 'offscreen-test' }, result => {
-      replied = true; clearTimeout(timeout); resolve(result);
-    });
+    // Associate decoded fixture pixels with the actual incoming frame, then
+    // carry that identity through every crop and PNG conversion.
+    const previousSequence = incomingFrameSequence;
+    incomingFrameSequence = type === 'UCHI_OFF_CANVAS_FRAME' ? (extra as { frame?: { sequence?: number } }).frame?.sequence : undefined;
+    let keepAlive: unknown;
+    try {
+      keepAlive = listener?.({ target: 'offscreen', type, ...extra }, { id: 'offscreen-test' }, result => {
+        replied = true; clearTimeout(timeout); resolve(result);
+      });
+    } finally { incomingFrameSequence = previousSequence; }
     assert.ok(keepAlive === true || replied, `${type} must reply or keep its channel open`);
   });
   return {
@@ -162,6 +172,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     stoppedTracks: () => stoppedTracks, mediaCalls: () => mediaCalls,
     presentTabFrame(notify = true) {
       video.readyState = 2; video.videoWidth = 1280; video.videoHeight = 800; presentedFrames++;
+      video.fixtureFrameSequence = presentedFrames;
       if (notify) for (const [id, callback] of [...videoCallbacks]) {
         videoCallbacks.delete(id); callback(0, { presentedFrames });
       }
@@ -518,6 +529,8 @@ test('pre-encoded PNG text crops reach OCR and preserve automatic score agreemen
   const run = await resultFixture();
   for (let i = 0; i < 15; i++) await run.send();
   assert.equal(run.app.ocrInputs.length, 8, 'two independent receipts each recognize four text lines in this fixture');
+  assert.deepEqual(run.app.ocrInputs.map(image => image.frameSequence), [2, 2, 2, 2, 17, 17, 17, 17],
+    'each set of four crops comes from its own actual receipt frame, including after PNG preprocessing');
   for (const image of run.app.ocrInputs) {
     assert.match(image.input, /^data:image\/png;base64,/);
     assert.ok(image.width > 0 && image.height > 0 && image.width * image.height < 1280 * 800,
@@ -937,6 +950,28 @@ test('failed attempt writes remain retryable after replacement and block replay 
   assert.equal((await db.getData()).sessions[0].correctKeys, 8);
 });
 
+test('one permanently failed candidate cannot prevent later recoverable candidates from being saved', async () => {
+  let recover = false, permanentlyFailedId: string | undefined;
+  const app = await typedResultFixture({ saveAttempt: async attempt => {
+    permanentlyFailedId ??= attempt.id;
+    if (!recover || attempt.id === permanentlyFailedId) throw new Error('This history row cannot be saved');
+    await db.saveAttempt(attempt);
+  } });
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 2);
+  assert.equal((await db.getData()).attempts.length, 0);
+  recover = true;
+  assert.equal((await replay(app)).ready, false, 'the permanent failure must still be reported after retrying the others');
+  const data = await db.getData();
+  assert.equal(data.attempts.length, 1, 'the later recovered row is saved even though the first retry rejects');
+  assert.notEqual(data.attempts[0].id, permanentlyFailedId);
+  assert.equal(data.attempts[0].typed, 'pearukku');
+  assert.equal(data.sessions[0].correctKeys, 8);
+  assert.equal(app.evaluate('unfinishedCandidates.size'), 1);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, false);
+  assert.equal((await db.getData()).attempts.length, 1);
+  assert.equal(app.terminatedWorkers(), 2);
+});
+
 test('retrying a session write after its attempt was saved cannot write or aggregate that attempt twice', async () => {
   let fail = true;
   const writtenIds: string[] = [];
@@ -1053,6 +1088,22 @@ test('a continuous result boundary includes late final gameplay keys and exclude
   assert.deepEqual((await db.getData()).sessions[0].activity, measured);
 });
 
+test('a late final key retains its interval within the confirmed window even after another receipt scan', async () => {
+  const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'));
+  run.scene.prompt = true;
+  await run.observed(80); await run.observed(160); await run.observed(240);
+  await run.keys([[300, 'a']]); await run.observed(320);
+  run.scene.prompt = false; run.scene.receipt = true;
+  await run.observed(560); await run.observed(640);
+  await run.keys([[540, 'b'], [560, 'x'], [650, ' ']]);
+  await run.checkpoint();
+  const measured = [{ date: '2026-12-25', activeMs: 240, keys: 2, phrases: 1 }];
+  assert.deepEqual((await db.getData()).sessions[0].activity, measured,
+    'the late 540ms key follows the already-recorded 300ms key, while result keys stay excluded');
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  assert.deepEqual((await db.getData()).sessions[0].activity, measured);
+});
+
 test('result detection cannot extend activity over a missing frame, focus gap or viewport change', async () => {
   for (const gap of ['frame', 'UCHI_OFF_GAP', 'UCHI_OFF_VIEW_CHANGE'] as const) {
     await db.clearData();
@@ -1068,6 +1119,38 @@ test('result detection cannot extend activity over a missing frame, focus gap or
     assert.deepEqual((await db.getData()).sessions[0].activity,
       [{ date: '2026-12-25', activeMs: 0, keys: 1, phrases: 1 }], gap);
   }
+});
+
+test('keys during a pending visual change count only toward the new word after confirmation', async () => {
+  const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'));
+  run.scene.prompt = true;
+  await run.observed(80); await run.observed(160); // The old word has no input.
+  run.scene.variant = 1;
+  await run.keys([[320, 'a']]); await run.observed(320); // First changed sample, also a region scan.
+  await run.checkpoint();
+  assert.deepEqual((await db.getData()).sessions[0].activity, [{ date: '2026-12-25', activeMs: 0, keys: 1, phrases: 0 }]);
+  await run.keys([[350, 'b']]); await run.observed(560); // Confirmation after buffered input.
+  await run.checkpoint();
+  assert.deepEqual((await db.getData()).sessions[0].activity, [{ date: '2026-12-25', activeMs: 30, keys: 2, phrases: 1 }]);
+  assert.equal(run.app.evaluate('activeGame.activityOccurrences[0].counted'), undefined, 'the same keys must not mark the untyped old word as practiced');
+  assert.equal(run.app.evaluate('activeGame.activityOccurrences[1].counted'), true);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('keys from a cancelled visual change retain physical volume but belong to neither word', async () => {
+  const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'));
+  run.scene.prompt = true;
+  await run.observed(80); await run.observed(160);
+  run.scene.variant = 1;
+  await run.keys([[320, 'a']]); await run.observed(320);
+  await run.keys([[350, 'b']]);
+  run.scene.variant = 0; await run.observed(560); await run.observed(640);
+  await run.checkpoint();
+  const measured = [{ date: '2026-12-25', activeMs: 30, keys: 2, phrases: 0 }];
+  assert.deepEqual((await db.getData()).sessions[0].activity, measured);
+  assert.equal(run.app.evaluate('activeGame.activityOccurrences.every(occurrence => !occurrence.counted)'), true);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  assert.deepEqual((await db.getData()).sessions[0].activity, measured);
 });
 
 test('visual phrase activity survives OCR startup and is not counted again when OCR becomes ready', async () => {

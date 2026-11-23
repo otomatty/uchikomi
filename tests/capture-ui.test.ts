@@ -19,6 +19,7 @@ define('IS_REACT_ACT_ENVIRONMENT', true);
 
 const messages: string[] = [];
 const replayUpdates: string[] = [];
+let failStop = false, failRestore = false;
 const listeners = new Set<(message: unknown) => void>();
 let status: CaptureStatus = { state: 'idle', phraseCount: 0 };
 const publish = (patch: Partial<CaptureStatus>) => {
@@ -32,10 +33,13 @@ define('chrome', {
     onMessage: { addListener: (fn: (m: unknown) => void) => listeners.add(fn), removeListener: (fn: (m: unknown) => void) => listeners.delete(fn) },
     async sendMessage(message: { type: string }) {
       messages.push(message.type);
-      if (message.type === 'UCHI_RESUME') { await db.updateSettings({ autoRecord: true }); publish({ state: 'idle' }); }
+      if (message.type === 'UCHI_STOP' && failStop) return { ok: false, error: '停止通知を送れませんでした' };
+      if (message.type === 'UCHI_SETTINGS_RESTORED' && failRestore) return { ok: false, error: '設定通知を送れませんでした' };
+      if (message.type === 'UCHI_RESUME') { await db.updateSettings({ autoRecord: true }); publish({ state: 'idle', autoRecordPaused: false }); }
       if (message.type === 'UCHI_AUTO_REGION') publish({ regionState: 'searching', region: undefined, regionConfidence: undefined });
-      if (message.type === 'UCHI_STOP') { await db.updateSettings({ autoRecord: false }); publish({ state: 'idle' }); }
-      if (message.type === 'UCHI_REPLAY_SETTINGS_CHANGED') replayUpdates.push((await db.getSettings()).replayShortcut);
+      if (message.type === 'UCHI_STOP') { await db.updateSettings({ autoRecord: false }); publish({ state: 'idle', autoRecordPaused: true }); }
+      if (message.type === 'UCHI_SETTINGS_RESTORED') publish({ autoRecordPaused: !(await db.getSettings()).autoRecord });
+      if (message.type === 'UCHI_REPLAY_SETTINGS_CHANGED' || message.type === 'UCHI_SETTINGS_RESTORED') replayUpdates.push((await db.getSettings()).replayShortcut);
       return { ok: true, status, sessionId: status.activeSessionId||status.sessionId };
     },
   },
@@ -208,15 +212,96 @@ test('saving an unrelated setting preserves a pause made after opening the form'
   assert.equal(messages.filter(type => type === 'UCHI_RESUME').length, resumeCount + 1);
 });
 
-test('saving an unchanged disabled auto-record setting stops an active manual capture', async () => {
+test('saving an unrelated target while auto-record is disabled keeps an active manual capture', async () => {
   await act(async () => { await db.updateSettings({ autoRecord: false }); publish({ state: 'recording', source: 'tab' }); await delay(20); });
   const before = messages.filter(type => type === 'UCHI_STOP').length;
   const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
   await act(async () => { open.click(); await delay(0); });
   const toggle = document.querySelector<HTMLInputElement>('[role="switch"]'); assert.ok(toggle); assert.equal(toggle.checked, false);
+  const target = document.querySelector<HTMLInputElement>('[role="dialog"] input[type="number"]'); assert.ok(target);
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(browser.HTMLInputElement.prototype, 'value')!.set!.call(target, '33000');
+    target.dispatchEvent(new browser.Event('input', { bubbles: true })); await delay(0);
+  });
   const save = document.querySelector<HTMLButtonElement>('[role="dialog"] button[type="submit"]'); assert.ok(save);
   await act(async () => { save.click(); await delay(0); });
   await settle(() => !document.querySelector('[role="dialog"]'));
+  assert.equal(messages.filter(type => type === 'UCHI_STOP').length, before);
+  assert.equal(status.state, 'recording'); assert.equal(status.source, 'tab');
+  assert.equal((await db.getSettings()).autoRecord, false); assert.equal((await db.getSettings()).targetScore, 33000);
+});
+
+test('an explicit auto-record disable retries its failed stop notification without another switch change', async t => {
+  t.after(() => { failStop = false; });
+  await act(async () => { await db.updateSettings({ autoRecord: true }); publish({ state: 'recording', source: 'tab' }); await delay(20); });
+  const before = messages.filter(type => type === 'UCHI_STOP').length;
+  const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
+  await act(async () => { open.click(); await delay(0); });
+  const toggle = document.querySelector<HTMLInputElement>('[role="switch"]'); assert.ok(toggle); assert.equal(toggle.checked, true);
+  await act(async () => { toggle.click(); await delay(0); });
+  failStop = true;
+  const save = document.querySelector<HTMLButtonElement>('[role="dialog"] button[type="submit"]'); assert.ok(save);
+  await act(async () => { save.click(); await delay(20); });
+  await settle(() => Boolean(document.querySelector('[role="dialog"] [role="alert"]')));
+  assert.equal((await db.getSettings()).autoRecord, false); assert.equal(status.state, 'recording');
   assert.equal(messages.filter(type => type === 'UCHI_STOP').length, before + 1);
+  failStop = false;
+  await act(async () => { save.click(); await delay(20); });
+  await settle(() => !document.querySelector('[role="dialog"]'));
   assert.equal(status.state, 'idle'); assert.equal((await db.getSettings()).autoRecord, false);
+  assert.equal(messages.filter(type => type === 'UCHI_STOP').length, before + 2);
+});
+
+test('a committed backup remains visible when runtime synchronization fails and retry never imports it again', async t => {
+  t.after(() => { failRestore = false; });
+  const before = await db.exportData(), now = Date.now();
+  const restored = { ...before, settings: { ...before.settings, targetScore: 35000, autoRecord: true, replayShortcut: 'F2' },
+    phrases: [...before.phrases, { id: 'restored-phrase', text: 'ペアルック', reading: 'ぺあるっく', roman: 'pearukku', source: 'capture', confidence: 96, verified: true, capturedAt: now, lastSeenAt: now, seenCount: 1 }] };
+  const file = new browser.File([JSON.stringify(restored)], 'restore-settings.json', { type: 'application/json' });
+  const transfer = new browser.DataTransfer(); transfer.items.add(file);
+  const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
+  await act(async () => { open.click(); await delay(0); });
+  const upload = document.querySelector<HTMLInputElement>('[data-testid="import-file"]'); assert.ok(upload);
+  const notices = messages.filter(type => type === 'UCHI_SETTINGS_RESTORED').length;
+  failRestore = true;
+  await act(async () => { upload.files = transfer.files as unknown as FileList; upload.dispatchEvent(new browser.Event('change', { bubbles: true })); await delay(20); });
+  await settle(() => Boolean(document.querySelector('[data-testid="retry-restored-settings"]')));
+  const data = await db.getData();
+  assert.equal(data.phrases.length, before.phrases.length + 1); assert.equal(data.settings.targetScore, 35000);
+  assert.equal(data.settings.autoRecord, true); assert.equal(data.settings.replayShortcut, 'F2');
+  assert.match(document.querySelector('.settings-data .microcopy')?.textContent ?? '', new RegExp(`${data.phrases.length}語`));
+  assert.equal(document.querySelector<HTMLInputElement>('[role="dialog"] input[type="number"]')?.value, '35000');
+  assert.equal(document.querySelector<HTMLInputElement>('[role="switch"]')?.checked, true);
+  assert.match(document.querySelector('[role="dialog"] [role="alert"]')?.textContent ?? '', /バックアップは読み込み済み.*記録設定/);
+  assert.match(document.querySelector('.toast.success')?.textContent ?? '', /バックアップを読み込みました/);
+  assert.equal(upload.value, '');
+  assert.equal(messages.filter(type => type === 'UCHI_SETTINGS_RESTORED').length, notices + 1);
+  await act(async () => { await db.updateSettings({ targetScore: 36000 }); await delay(20); });
+  failRestore = false;
+  const retry = document.querySelector<HTMLButtonElement>('[data-testid="retry-restored-settings"]'); assert.ok(retry);
+  await act(async () => { retry.click(); await delay(20); });
+  await settle(() => !document.querySelector('[role="dialog"]'));
+  assert.equal(messages.filter(type => type === 'UCHI_SETTINGS_RESTORED').length, notices + 2);
+  assert.equal((await db.getSettings()).targetScore, 36000, 'retry must not reapply the imported settings');
+  assert.equal((await db.getData()).phrases[0].seenCount, 1);
+  assert.equal(replayUpdates.at(-1), 'F2');
+});
+
+test('a durable pause exposes resume and an off switch even when the settings database still says enabled', async () => {
+  await act(async () => { await db.updateSettings({ autoRecord: true }); publish({ state: 'idle', autoRecordPaused: true }); await delay(20); });
+  const card = document.querySelector('[data-testid="capture-card"]'); assert.ok(card);
+  assert.match(card.textContent ?? '', /自動記録を一時停止中/);
+  assert.doesNotMatch(card.textContent ?? '', /開くだけで、記録/);
+  const open = document.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]'); assert.ok(open);
+  await act(async () => { open.click(); await delay(0); });
+  assert.equal(document.querySelector<HTMLInputElement>('[role="switch"]')?.checked, false);
+  const close = document.querySelector<HTMLButtonElement>('[role="dialog"] button[aria-label="閉じる"]'); assert.ok(close);
+  await act(async () => { close.click(); await delay(0); });
+  const before = messages.filter(type => type === 'UCHI_RESUME').length;
+  const resume = [...card.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.includes('自動記録を再開')); assert.ok(resume);
+  await act(async () => { resume.click(); await delay(20); });
+  await settle(() => Boolean(card.textContent?.includes('自動記録を待機')));
+  assert.equal(messages.filter(type => type === 'UCHI_RESUME').length, before + 1);
+  assert.equal(status.autoRecordPaused, false);
+  assert.equal((await db.getSettings()).autoRecord, true);
 });

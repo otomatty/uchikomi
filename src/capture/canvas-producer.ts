@@ -19,6 +19,15 @@ const MAX_WIDTH = 1920;
 const MAX_HEIGHT = 1440;
 type TrackProcessorConstructor = new (options: { track: MediaStreamTrack; maxBufferSize: number }) => { readable: ReadableStream<VideoFrame> };
 
+function establishesContainingBlock(style: CSSStyleDeclaration, position: 'absolute' | 'fixed'): boolean {
+  if (style.display === 'contents') return false;
+  if (position === 'absolute' && style.position && style.position !== 'static') return true;
+  const properties = ['transform', 'translate', 'rotate', 'scale', 'perspective', 'filter', 'backdrop-filter'];
+  return properties.some(property => { const value = style.getPropertyValue(property); return value !== '' && value !== 'none'; }) ||
+    /\b(layout|paint|strict|content)\b/.test(style.contain) || style.contentVisibility === 'auto' ||
+    style.willChange.split(',').some(property => properties.includes(property.trim()));
+}
+
 export function visibleGameCanvas(document: Document): HTMLCanvasElement | null {
   const view = document.defaultView;
   if (!view || document.visibilityState !== 'visible') return null;
@@ -28,12 +37,17 @@ export function visibleGameCanvas(document: Document): HTMLCanvasElement | null 
     if (rect.width <= 200 || rect.height <= 100 || rect.bottom <= 0 || rect.right <= 0 || rect.top >= view.innerHeight || rect.left >= view.innerWidth) return false;
     let left = Math.max(0, rect.left), right = Math.min(view.innerWidth, rect.right);
     let top = Math.max(0, rect.top), bottom = Math.min(view.innerHeight, rect.bottom);
+    let outsideFlow: 'absolute' | 'fixed' | null = null;
     // A canvas hidden by an ancestor is not a visible game surface yet.
     // No canvas pixels or game state are read during discovery.
     for (let element: Element | null = canvas; element; element = element.parentElement) {
       const style = view.getComputedStyle(element);
       if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
-      if (element !== canvas) {
+      // Overflow between an out-of-flow box and its containing block cannot
+      // clip that box or its descendants. Resume at the containing block, then
+      // follow any positioning of that ancestor in turn (CSS 2.2 section 11.1).
+      if (element !== canvas && outsideFlow && establishesContainingBlock(style, outsideFlow)) outsideFlow = null;
+      if (element !== canvas && !outsideFlow) {
         const clips = (value: string) => /^(hidden|clip|auto|scroll)$/.test(value);
         const clipsPaint = /\b(paint|strict|content)\b/.test(style.contain);
         const clipX = clipsPaint || clips(style.overflowX || style.overflow);
@@ -45,6 +59,7 @@ export function visibleGameCanvas(document: Document): HTMLCanvasElement | null 
           if (left >= right || top >= bottom) return false;
         }
       }
+      if (!outsideFlow && (style.position === 'absolute' || style.position === 'fixed')) outsideFlow = style.position;
     }
     return true;
   });

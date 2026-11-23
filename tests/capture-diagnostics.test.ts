@@ -17,7 +17,7 @@ test('QA distinguishes received frames from accepted frames and does not bridge 
     chrome: { runtime: { id: 'fixture', getURL: (path: string) => `chrome-extension://fixture/${path}`,
       sendMessage: async (message: any) => {
         for (const listener of listeners) listener(message, { id: 'fixture' }, () => {});
-        return { ok: true, ...(message.frame.sequence === 2 ? { dropped: true } : {}) };
+        return { ok: true, ...(message.sessionId === 'first' && message.frame.sequence === 2 ? { dropped: true } : {}) };
       }, onMessage: { addListener() {} } } },
   });
   vm.runInContext(source, background);
@@ -32,4 +32,8 @@ test('QA distinguishes received frames from accepted frames and does not bridge 
     sessionId: 'second', frame: { at: 10000, sequence: 1 } });
   assert.equal(read(background, 'acceptedFrameGaps').maxGap, 500);
   assert.equal(read(offscreen, 'receivedFrameGaps').maxGap, 250);
+  await background.chrome.runtime.sendMessage({ type: 'UCHI_OFF_CANVAS_FRAME', target: 'offscreen',
+    sessionId: 'second', frame: { at: 10750, sequence: 2 } });
+  assert.equal(read(background, 'acceptedFrameGaps').maxGap, 750);
+  assert.equal(read(offscreen, 'receivedFrameGaps').maxGap, 750);
 });

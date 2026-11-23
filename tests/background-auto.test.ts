@@ -2,7 +2,7 @@
 import test, { beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import 'fake-indexeddb/auto';
-import { clearData, getSettings, updateSettings } from '../src/core/db';
+import { clearData, getData, getSettings, importData, updateSettings } from '../src/core/db';
 import type { CaptureStatus } from '../src/core/types';
 
 const nativeChrome = globalThis.chrome, nativeChannel = globalThis.BroadcastChannel;
@@ -16,14 +16,17 @@ async function until(predicate: () => boolean) {
   for (let i = 0; i < 300 && !predicate(); i++) await delay(5);
   assert.ok(predicate(), 'The asynchronous capture lifecycle did not settle');
 }
-async function harness() {
+async function harness(localStorage: Record<string, unknown> = {}) {
   const id = 'automatic-background', origin = `chrome-extension://${id}/`;
   let handler: (message: any, sender: any, reply: (value: any) => void) => unknown;
   let contexts = false, failContextRead = false, status: CaptureStatus = { state: 'idle', phraseCount: 0 };
   let live: CaptureStatus = { ...status }, closed = 0, mediaRequests = 0;
   let creation: Promise<void> | undefined, frameReply: Promise<any> | undefined, replayReply: Promise<any> | undefined;
   let contextReply: Promise<any[]> | undefined, tabRead: Promise<void> | undefined;
+  let localRead: Promise<Record<string, unknown>> | undefined;
   let contextReads = 0, tabReads = 0;
+  let localReads = 0;
+  let localWriteError = false, localClearError = false;
   let liveDocument = 'actual-document', liveToken = token;
   const calls: any[] = [], contentMessages: any[] = [];
   const listeners: Record<string, (...args: any[]) => void> = {};
@@ -53,7 +56,10 @@ async function harness() {
         return { ok: true };
       },
     },
-    storage: { session: {
+    storage: { local: {
+      async get() { localReads++; if (localRead) { const pending = localRead; localRead = undefined; return pending; } return structuredClone(localStorage); },
+      async set(value: any) { if (localWriteError || localClearError && value.uchikomiAutomaticPaused === false) throw new Error('Local storage write failed'); Object.assign(localStorage, structuredClone(value)); },
+    }, session: {
       async get() { return { captureStatus: structuredClone(status) }; },
       async set(value: any) { if (value.captureStatus) status = structuredClone(value.captureStatus); },
     } },
@@ -85,7 +91,7 @@ async function harness() {
     try { if (handler(message, from, resolve) !== true) resolve(undefined); } catch (error) { reject(error); }
   });
   return {
-    sender, send, calls, contentMessages, listeners,
+    sender, send, calls, contentMessages, listeners, localStorage,
     ready: (from = sender, documentToken = token) => send({ type: 'UCHI_CANVAS_READY', documentToken }, from),
     content: (message: any, from = sender) => send({ documentToken: token, ...message }, from),
     state: () => status, closed: () => closed, mediaRequests: () => mediaRequests,
@@ -97,6 +103,10 @@ async function harness() {
     contextReads: () => contextReads, tabReads: () => tabReads,
     setLiveDocument: (id: string, value: string) => { liveDocument = id; liveToken = value; },
     failNextContextRead: () => { failContextRead = true; },
+    failLocalWrites: (fail: boolean) => { localWriteError = fail; },
+    failLocalClear: (fail: boolean) => { localClearError = fail; },
+    blockNextLocalRead: (pending: Promise<Record<string, unknown>>) => { localRead = pending; },
+    localReads: () => localReads,
     notify: (value: CaptureStatus) => send({ type: 'UCHI_OFF_STATE', status: value }, { id, url: origin + 'offscreen.html' }),
   };
 }
@@ -346,5 +356,107 @@ test('a shortcut saved during startup is reflected in the READY response', async
   release();
   const started = await opening;
   assert.equal(started.replayShortcut, 'F2'); assert.equal(started.sessionId, notice.sessionId);
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('a pause survives worker restart after a failed DB write and clears only after a successful explicit resume', async t => {
+  let app = await harness(); await app.ready();
+  const original = IDBObjectStore.prototype.put;
+  const fail = t.mock.method(IDBObjectStore.prototype, 'put', function(this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+    if (this.name === 'settings') throw new DOMException('Storage is full', 'QuotaExceededError');
+    return original.apply(this, args);
+  });
+  assert.equal((await app.send({ type: 'UCHI_STOP' })).ok, false);
+  assert.equal(app.state().autoRecordPaused, true);
+  assert.equal((await getSettings()).autoRecord, true);
+  app = await harness(app.localStorage); // New module state, same durable extension storage.
+  assert.equal((await app.send({ type: 'UCHI_STATUS' })).status.autoRecordPaused, true, 'A status-only read after worker restart exposes the durable pause');
+  assert.deepEqual(await app.ready(), { ok: true, paused: true });
+  assert.equal((await app.send({ type: 'UCHI_REPLAY_SETTINGS_CHANGED' })).ok, true);
+  assert.deepEqual(await app.ready(), { ok: true, paused: true }, 'Ordinary shortcut saves cannot release a pause');
+  assert.equal((await app.send({ type: 'UCHI_RESUME' })).ok, false, 'A failed settings write cannot release the latch');
+  fail.mock.restore();
+  app.failLocalWrites(true);
+  assert.equal((await app.send({ type: 'UCHI_RESUME' })).ok, false, 'A failed durable guard update cannot release the pause');
+  app.failLocalWrites(false); app.failLocalClear(true);
+  assert.equal((await app.send({ type: 'UCHI_RESUME' })).ok, false, 'A failed latch clear after the DB write also leaves the pause intact');
+  assert.equal((await getSettings()).autoRecord, true);
+  app = await harness(app.localStorage);
+  assert.deepEqual(await app.ready(), { ok: true, paused: true });
+  assert.equal((await app.send({ type: 'UCHI_RESUME' })).ok, true);
+  assert.equal(app.state().autoRecordPaused, false, 'A successful resume also broadcasts the unpaused state');
+  const started = await app.ready(); assert.ok(started.sessionId);
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('explicit restored settings enable auto recording after a pause and synchronize the restored shortcut', async () => {
+  const app = await harness(); await app.ready(); await app.send({ type: 'UCHI_STOP' });
+  const backup = await getData();
+  await importData({ ...backup, version: 1, settings: { ...backup.settings, autoRecord: true, replayShortcut: 'F2' } });
+  await app.send({ type: 'UCHI_REPLAY_SETTINGS_CHANGED' });
+  assert.deepEqual(await app.ready(), { ok: true, paused: true });
+  assert.equal(await app.content({ type: 'UCHI_SETTINGS_RESTORED' }), undefined, 'Only trusted extension UI may apply a restored pause preference');
+  app.failLocalWrites(true);
+  assert.equal((await app.send({ type: 'UCHI_SETTINGS_RESTORED' })).ok, false);
+  assert.deepEqual(await app.ready(), { ok: true, paused: true }, 'A failed restore notification must leave the pause in place');
+  app.failLocalWrites(false);
+  assert.equal((await app.send({ type: 'UCHI_SETTINGS_RESTORED' })).ok, true);
+  assert.equal(app.state().autoRecordPaused, false);
+  assert.ok(app.contentMessages.some(message => message.type === 'UCHI_CANVAS_PROBE'));
+  const started = await app.ready(); assert.ok(started.sessionId); assert.equal(started.replayShortcut, 'F2');
+  await app.send({ type: 'UCHI_STOP' });
+});
+
+test('restoring autoRecord false stops automatic capture but preserves a manual tab capture', async () => {
+  const app = await harness(); await app.ready();
+  const backup = await getData();
+  await importData({ ...backup, version: 1, settings: { ...backup.settings, autoRecord: false } });
+  app.failLocalWrites(true); // The successfully imported false preference still provides durable pause.
+  assert.equal((await app.send({ type: 'UCHI_SETTINGS_RESTORED' })).ok, true);
+  assert.equal(app.state().state, 'idle'); assert.equal(app.closed(), 1);
+  assert.deepEqual(await app.ready(), { ok: true, paused: true });
+  assert.equal((await app.send({ type: 'UCHI_START' })).ok, true);
+  const manualId = app.state().sessionId, stops = app.calls.filter(call => call.type === 'UCHI_OFF_STOP').length;
+  await importData({ ...backup, version: 1, settings: { ...backup.settings, autoRecord: false, replayShortcut: 'F2' } });
+  assert.equal((await app.send({ type: 'UCHI_SETTINGS_RESTORED' })).ok, true);
+  assert.equal(app.state().source, 'tab'); assert.equal(app.state().state, 'recording'); assert.equal(app.state().sessionId, manualId);
+  assert.equal(app.state().autoRecordPaused, true);
+  const { autoRecordPaused: _paused, ...offscreenStatus } = app.state();
+  await app.notify(offscreenStatus);
+  assert.equal(app.state().autoRecordPaused, true, 'An offscreen status lacking the UI flag cannot erase the effective pause');
+  assert.equal(app.calls.filter(call => call.type === 'UCHI_OFF_STOP').length, stops, 'A restored automatic preference does not stop manual media access');
+  const notice = app.contentMessages.findLast(message => message.type === 'UCHI_REPLAY_SETTINGS');
+  assert.equal(notice.sessionId, manualId); assert.equal(notice.replayShortcut, 'F2');
+  await app.send({ type: 'UCHI_STOP' });
+  assert.equal((await app.send({ type: 'UCHI_RESUME' })).ok, false);
+  assert.equal((await getSettings()).autoRecord, false, 'A failed local guard must not re-enable a durable DB-only pause');
+});
+
+test('restoring autoRecord false also cancels automatic startup before offscreen is ready', async () => {
+  const app = await harness(); let release!: () => void;
+  app.blockCreation(new Promise(resolve => { release = resolve; }));
+  const opening = app.ready(); await until(() => app.state().state === 'starting');
+  const backup = await getData();
+  await importData({ ...backup, version: 1, settings: { ...backup.settings, autoRecord: false } });
+  const restored = app.send({ type: 'UCHI_SETTINGS_RESTORED' });
+  await delay(5); release(); await opening;
+  assert.equal((await restored).ok, true); assert.equal(app.state().state, 'idle');
+  assert.equal(app.calls.some(call => call.type === 'UCHI_OFF_START'), false);
+  assert.deepEqual(await app.ready(), { ok: true, paused: true });
+});
+
+test('a slow durable pause read cannot replace the state of a newer explicit resume', async () => {
+  let app = await harness(); await app.ready(); await app.send({ type: 'UCHI_STOP' });
+  app = await harness(app.localStorage);
+  const pausedSnapshot = structuredClone(app.localStorage), reads = app.localReads();
+  let release!: (value: Record<string, unknown>) => void;
+  app.blockNextLocalRead(new Promise(resolve => { release = resolve; }));
+  const oldStatus = app.send({ type: 'UCHI_STATUS' });
+  await until(() => app.localReads() > reads);
+  assert.equal((await app.send({ type: 'UCHI_RESUME' })).ok, true);
+  assert.equal(app.state().autoRecordPaused, false);
+  release(pausedSnapshot);
+  assert.equal((await oldStatus).status.autoRecordPaused, false);
+  assert.equal((await app.send({ type: 'UCHI_STATUS' })).status.autoRecordPaused, false);
   await app.send({ type: 'UCHI_STOP' });
 });

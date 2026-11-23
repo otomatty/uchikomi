@@ -37,6 +37,7 @@ UCHI_START -> {ok:true,status} or {ok:false,error}; explicit manual tabCapture f
 UCHI_STOP -> {ok:true,status,sessionId?}; persists autoRecord:false, stops media and saves queued records. Does not restart on navigation/visibility changes.
 UCHI_RESUME -> {ok:true,status}; persists autoRecord:true and probes permitted game tabs. A visible canvas starts itself; no tabCapture permission is requested.
 UCHI_REPLAY_SETTINGS_CHANGED -> {ok:true}; trusted extension UI only. Reads the saved shortcut and awaits delivery to the current content owner, without starting or stopping recording.
+UCHI_SETTINGS_RESTORED -> {ok:true,status}; trusted extension UI after a committed backup import. Reads the saved autoRecord and shortcut, synchronizes automatic recording, and delivers the shortcut. Restoring autoRecord:true explicitly releases pause and probes visible games; false stops automatic canvas capture without stopping a manual tabCapture. A notification failure does not roll back the import; UI shows restored data and can retry this notification without reimporting the file.
 UCHI_FRAME -> {ok:true,frame:FrameSnapshot} (snapshot for calibration, recording active)
 UCHI_CALIBRATE {calibration} -> {ok:true}
 UCHI_OPEN_GAME -> {ok:true} activates/opens official https://sushida.net/play.html
@@ -46,6 +47,8 @@ UI uses db directly for CRUD; service worker/offscreen same origin IndexedDB. Ag
 ## Automatic visible-canvas recording
 
 `Settings.autoRecord:boolean` defaults to true; backups and stored preferences without it use that default. A user pause is persistent and resume is explicit. Merely hiding/closing/navigating away from the game stops the current capture without changing the preference. No game Session is created until the first detected prompt; reopening a visible game starts a fresh capture rather than extending a partially observed typing interval.
+
+The background also persists pause intent in `chrome.storage.local` so an IndexedDB settings failure does not undo a pause after worker restart. `CaptureStatus.autoRecordPaused` exposes that effective pause to the UI; it can still offer Resume when the saved setting could not be changed. Only an explicit Resume or an explicit restored `autoRecord:true` releases the pause intent.
 
 The permitted content script selects the largest visible game canvas and uses the standard origin-clean `captureStream(15)` API. Where available, `MediaStreamTrackProcessor` consumes actual source `VideoFrame` objects with a one-frame queue. Each frame is closed before waiting for its JPEG acknowledgement. Source timestamps reject repeats. A detached muted video with `requestVideoFrameCallback` is the compatibility fallback and is sampled at most once per 80 ms. Both paths keep one outstanding JPEG message, cap the image at 1920×1440, and report an error if the first frame is not acknowledged within ten seconds. It neither changes the WebGL context nor reads game internals. The game video/audio is not forwarded through tabCapture in the default path. Tainted/muted/ended streams fail closed and need a new visibility event or an explicit retry. Hidden documents do not submit frames or observe keys.
 

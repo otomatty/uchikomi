@@ -111,21 +111,22 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
 
   async function probe() {
     if (probing) { probeAgain = true; return; }
-    if (pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
+    if ((pageHidden || document.visibilityState !== 'visible' || retryBlocked) && !unconfirmedEnd) return;
     probing = true;
     try {
       // A fast return to the tab must not reuse the session whose final keys
       // and END are still in flight: that late END would stop the new producer.
       await pendingEnd;
-      if (pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
       // A failed message is not an END acknowledgement. Reusing its session
       // would reset the producer's sequence while offscreen still expects the
       // previous producer's larger sequence. Retry release before any READY.
       if (unconfirmedEnd) {
         pendingEnd = pendingEnd.then(acknowledgeEnd);
         await pendingEnd;
-        if (unconfirmedEnd || pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
       }
+      // Cleanup is independent of permission to restart. In particular, a
+      // producer error must release the old owner even while retries are blocked.
+      if (unconfirmedEnd || pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
       const canvas = visibleGameCanvas(document);
       if (captureMode === 'tab' && sessionId && captureCanvas !== canvas) {
         // Manual tabCapture keeps the same media owner when the page replaces

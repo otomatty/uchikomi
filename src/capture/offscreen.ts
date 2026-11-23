@@ -25,7 +25,7 @@ interface ReplayRequest {
   game: CaptureGame; captureId: string; token: number; initial: ReplayFrame;
   cancelled: boolean; cancel(reason: string): void;
 }
-interface ActivityWindow { from: number; through: number; until?: number; }
+interface ActivityWindow { from: number; through: number; until?: number; confirmedEnd?: boolean; }
 interface ActivityOccurrence { id: string; from: number; until?: number; counted?: boolean; }
 interface CaptureGame {
   activity: TrainingActivity; activityWindows: ActivityWindow[]; activityWindow?: ActivityWindow;
@@ -164,7 +164,7 @@ function recordActivityOccurrence(game: CaptureGame, occurrence: ActivityOccurre
   if (!key) return;
   game.activity.recordPhrase(occurrence.id, key.at); occurrence.counted = true; game.activityRevision++;
 }
-function recordObservedActivity(game: CaptureGame, keys = keyBuffer) {
+function recordObservedActivity(game: CaptureGame, keys = keyBuffer, assignPhrases = true) {
   // A buffered key contributes only after an actual prompt frame has confirmed
   // its time window. Start-menu/result keys outside that window stay excluded.
   const pending = keys.filter(key => key.at >= game.session.startedAt && !game.activityKeys.has(physicalKeyId(key))).sort((a, b) => a.at - b.at);
@@ -175,7 +175,7 @@ function recordObservedActivity(game: CaptureGame, keys = keyBuffer) {
     game.activityLastWindow = window;
     game.activity.recordKey(key.at); game.activityKeys.add(physicalKeyId(key)); game.activityStrokes.push(key); game.activityRevision++;
     const occurrence = game.activityOccurrences.find(value => key.at >= value.from && (value.until === undefined || key.at < value.until));
-    if (occurrence) recordActivityOccurrence(game, occurrence);
+    if (assignPhrases && occurrence) recordActivityOccurrence(game, occurrence);
   }
 }
 function confirmActivityPrompt(game: CaptureGame, at: number) {
@@ -184,12 +184,15 @@ function confirmActivityPrompt(game: CaptureGame, at: number) {
     game.activityWindow = { from: at, through: at };
     game.activityWindows.push(game.activityWindow);
   } else game.activityWindow.through = Math.max(game.activityWindow.through, at);
-  recordObservedActivity(game);
+  // This frame's signature has not been inspected yet. Preserve physical
+  // volume now, but wait for that observation before assigning its word.
+  recordObservedActivity(game, keyBuffer, false);
 }
 function breakActivity(game: CaptureGame | null, at: number, confirmedResult = false) {
   if (!game) return;
   if (game.activityWindow) {
     game.activityWindow.until = at;
+    game.activityWindow.confirmedEnd = confirmedResult;
     // A continuous prompt-to-receipt transition confirms the final input
     // interval, including keys delivered later by the content-script batch.
     // Unknown losses close the window first and must never extend it here.
@@ -198,26 +201,37 @@ function breakActivity(game: CaptureGame | null, at: number, confirmedResult = f
     game.activityWindow = undefined;
   }
   game.activityResumeAfter = Math.max(game.activityResumeAfter, at);
-  game.activityLastWindow = undefined;
-  game.activity.break();
+  // A final batch can arrive after the receipt (and its next region scan).
+  // Keep only this closed, confirmed window's predecessor. Its until bound
+  // still excludes result keys; switching windows always breaks the chain.
+  const previous = game.activityLastWindow;
+  if (!previous?.confirmedEnd || previous.until === undefined || at < previous.until) {
+    game.activityLastWindow = undefined;
+    game.activity.break();
+  }
 }
 function endActivityOccurrence(game: CaptureGame | null, at: number) {
   if (!game?.activityOccurrence) return;
   game.activityOccurrence.until = at;
+  recordActivityOccurrence(game, game.activityOccurrence);
   game.activityOccurrence = undefined;
 }
 function observeActivityPhrase(bytes: Uint8Array, now: number) {
   const game = activeGame;
   if (!game) return;
   const transition = activitySignatures.observe(bytes, now);
+  // The first changed sample already ends the old word's assignment range.
+  // Keys in the pending range remain unassigned unless a second sample agrees.
+  if (transition.pendingAt !== undefined) endActivityOccurrence(game, transition.pendingAt);
   if (transition.interruptedAt !== undefined) endActivityOccurrence(game, transition.interruptedAt);
-  if (!transition.candidate) return;
-  const at = transition.candidate.at;
-  endActivityOccurrence(game, at);
-  const occurrence = { id: `${game.session.id}:visual:${game.activityOccurrences.length}`, from: at };
-  game.activityOccurrence = occurrence;
-  game.activityOccurrences.push(occurrence);
-  recordActivityOccurrence(game, occurrence);
+  if (transition.candidate) {
+    const at = transition.candidate.at;
+    endActivityOccurrence(game, at);
+    const occurrence = { id: `${game.session.id}:visual:${game.activityOccurrences.length}`, from: at };
+    game.activityOccurrence = occurrence;
+    game.activityOccurrences.push(occurrence);
+  }
+  if (game.activityOccurrence) recordActivityOccurrence(game, game.activityOccurrence);
 }
 function checkpointActivity() {
   for (const game of games) {
@@ -355,7 +369,14 @@ function finalizeCandidate(candidate: Candidate): Promise<void> {
   return task;
 }
 async function retryCandidateWrites() {
-  for (const candidate of [...unfinishedCandidates]) await finalizeCandidate(candidate);
+  const failures: unknown[] = [];
+  for (const candidate of [...unfinishedCandidates]) {
+    try { await finalizeCandidate(candidate); }
+    catch (error) { failures.push(error); }
+  }
+  // One irrecoverable row must not discard unrelated recoverable history when
+  // the offscreen document closes. Still reject replay/STOP after all retries.
+  if (failures.length) throw failures[0];
 }
 function endCurrent(at: number, observedExit = true) {
   if (!currentCandidate || !closeObservedBoundary(currentCandidate, at, observedExit)) return;
