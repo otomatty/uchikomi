@@ -26,6 +26,7 @@ interface FixtureOptions {
   decode?: () => Promise<void>;
   saveSession?: typeof db.saveSession;
   controlReplayTimeout?: boolean;
+  controlDecodeTimeout?: boolean;
 }
 
 async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt?: boolean, options: FixtureOptions = {}) {
@@ -33,9 +34,10 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
   const source = await transform(await readFile(filename, 'utf8'), { loader: 'ts', format: 'cjs', target: 'node22' });
   const load = createRequire(filename);
   let listener: ((message: any, sender: any, reply: (result: any) => void) => unknown) | undefined;
-  const states: any[] = [], images: any[] = [];
+  const states: any[] = [], images: any[] = [], bitmapInputs: Blob[] = [];
   const intervals = new Map<unknown, { callback: () => void; delay: number }>();
   const replayTimeouts = new Map<unknown, () => void>();
+  const decodeTimeouts = new Map<unknown, () => void>();
   const videoCallbacks = new Map<number, (now: number, metadata: { presentedFrames: number }) => void>();
   let videoCallbackId = 0, presentedFrames = 0;
   let stoppedTracks = 0, mediaCalls = 0;
@@ -48,18 +50,24 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
   const track = { stop() { stoppedTracks++; }, addEventListener() {} };
   const stream = { getTracks: () => [track], getVideoTracks: () => [track] };
   const context = {
-    module: { exports: {} }, exports: {}, console, crypto: globalThis.crypto, AbortController,
+    module: { exports: {} }, exports: {}, console, crypto: globalThis.crypto, AbortController, Blob, atob,
     Date: class extends Date { static now() { return options.clock?.() ?? Date.now(); } },
     Image: class {
-      src = ''; naturalWidth = 1280; naturalHeight = 800;
-      constructor() { images.push(this); }
-      async decode() { await options.decode?.(); }
+      constructor() { throw new Error('Offscreen capture must not rely on a hidden image element'); }
+    },
+    async createImageBitmap(blob: Blob) {
+      bitmapInputs.push(blob);
+      const bitmap = { width: 1280, height: 800, closeCalls: 0, close() { this.closeCalls++; } };
+      images.push(bitmap);
+      await options.decode?.();
+      return bitmap;
     },
     setTimeout(callback: () => void, delay: number) {
       if (options.controlReplayTimeout && delay === 8000) { const id = {}; replayTimeouts.set(id, callback); return id; }
+      if (options.controlDecodeTimeout && delay === 3000) { const id = {}; decodeTimeouts.set(id, callback); return id; }
       return setTimeout(callback, delay);
     },
-    clearTimeout(id: ReturnType<typeof setTimeout>) { if (!replayTimeouts.delete(id)) clearTimeout(id); },
+    clearTimeout(id: ReturnType<typeof setTimeout>) { if (!replayTimeouts.delete(id) && !decodeTimeouts.delete(id)) clearTimeout(id); },
     setInterval(callback: () => void, delay: number) { const id = {}; intervals.set(id, { callback, delay }); return id; },
     clearInterval(id: unknown) { intervals.delete(id); },
     document: {
@@ -124,7 +132,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     assert.ok(keepAlive === true || replied, `${type} must reply or keep its channel open`);
   });
   return {
-    request, states, intervals, images, replayTimeouts, evaluate: (code: string) => vm.runInContext(code, runtime),
+    request, states, intervals, images, bitmapInputs, replayTimeouts, decodeTimeouts, evaluate: (code: string) => vm.runInContext(code, runtime),
     stoppedTracks: () => stoppedTracks, mediaCalls: () => mediaCalls,
     presentTabFrame(notify = true) {
       video.readyState = 2; video.videoWidth = 1280; video.videoHeight = 800; presentedFrames++;
@@ -285,8 +293,67 @@ test('canvas input rejects foreign, stale, oversized and incorrectly decoded fra
   assert.equal(snapshot.frame.width, 1280);
   assert.equal(snapshot.frame.at, now - 100);
   assert.equal((await send(frame(now, 2))).ok, true);
+  assert.ok(app.images.every(bitmap => bitmap.closeCalls === 1), 'success and a dimension mismatch both release the native bitmap');
   assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
   assert.equal((await send(frame(now + 80, 3))).dropped, true);
+});
+
+test('canvas decoding receives the original in-memory JPEG bytes and releases its bitmap before acknowledging', async () => {
+  const now = 1700000000000;
+  const app = await fixture(() => new Promise(() => {}), false, { clock: () => now });
+  await app.start(canvasStart);
+  const bytes = Uint8Array.from([255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 255, 217]);
+  const dataUrl = 'data:image/jpeg;base64,' + Buffer.from(bytes).toString('base64');
+  const result = await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 1, { dataUrl }) });
+  assert.equal(result.ok, true);
+  assert.equal(app.bitmapInputs.length, 1); assert.equal(app.bitmapInputs[0].type, 'image/jpeg');
+  assert.deepEqual(new Uint8Array(await app.bitmapInputs[0].arrayBuffer()), bytes);
+  assert.equal(app.images[0].closeCalls, 1);
+  assert.equal((await app.request('UCHI_OFF_FRAME')).frame.at, now);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('a stalled native decode returns a bounded failure, releases its slot and closes any late bitmap', async () => {
+  let now = 1700000000000, calls = 0;
+  const late = deferred<void>();
+  const app = await fixture(() => new Promise(() => {}), false, {
+    clock: () => now, controlDecodeTimeout: true, decode: () => ++calls === 1 ? late.promise : Promise.resolve(),
+  });
+  await app.start(canvasStart);
+  const stalled = app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 1) });
+  assert.equal(app.decodeTimeouts.size, 1);
+  for (const expire of app.decodeTimeouts.values()) expire();
+  const failure = await stalled;
+  assert.equal(failure.ok, false); assert.match(failure.error, /タイムアウト/);
+  assert.equal(app.decodeTimeouts.size, 0);
+  assert.equal((await app.request('UCHI_OFF_FRAME')).ok, false);
+  assert.equal((await db.getData()).sessions.length, 0);
+  now += 80;
+  assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 2) })).ok, true);
+  assert.equal(app.images[0].closeCalls, 0); assert.equal(app.images[1].closeCalls, 1);
+  late.resolve(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.images[0].closeCalls, 1);
+  assert.equal((await app.request('UCHI_OFF_FRAME')).frame.at, now, 'the late first decode cannot replace the newer accepted image');
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('an invalid payload or rejected native decode replies with failure and does not retain its frame slot', async () => {
+  const now = 1700000000000;
+  let fail = true;
+  const app = await fixture(() => new Promise(() => {}), false, {
+    clock: () => now, controlDecodeTimeout: true, decode: async () => { if (fail) throw new Error('Native decoder rejected the JPEG'); },
+  });
+  await app.start(canvasStart);
+  const send = (dataUrl?: string) => app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 1, dataUrl ? { dataUrl } : {}) });
+  assert.equal((await send('data:image/jpeg;base64,not valid !')).ok, false);
+  assert.equal(app.bitmapInputs.length, 0); assert.equal(app.decodeTimeouts.size, 0);
+  assert.equal((await send()).ok, false);
+  assert.equal(app.decodeTimeouts.size, 0);
+  assert.equal((await app.request('UCHI_OFF_FRAME')).ok, false);
+  fail = false;
+  assert.equal((await send()).ok, true);
+  assert.equal(app.decodeTimeouts.size, 0);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
 });
 
 test('parallel or pre-stop canvas decodes never overwrite the current capture generation', async () => {
@@ -294,24 +361,29 @@ test('parallel or pre-stop canvas decodes never overwrite the current capture ge
   const decodes = [deferred<void>(), deferred<void>()];
   let decodeIndex = 0;
   const scene = { prompt: true, receipt: false };
-  const app = await fixture(() => new Promise(() => {}), undefined, { scene, clock: () => now, decode: () => decodes[decodeIndex++].promise });
+  const app = await fixture(() => new Promise(() => {}), undefined, { scene, clock: () => now, controlDecodeTimeout: true, decode: () => decodes[decodeIndex++].promise });
   await app.start(canvasStart);
   const first = app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 1) });
   now += 80;
   assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, 2) })).dropped, true);
   assert.equal(decodeIndex, 1);
   assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+  assert.equal((await first).dropped, true, 'stop settles the old ACK before native decoding finishes');
+  assert.equal(app.decodeTimeouts.size, 0);
   await app.start({ ...canvasStart, sessionId: 'next-capture' });
   now += 80;
   const current = app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'next-capture', frame: frame(now, 1) });
   assert.equal(decodeIndex, 2);
   decodes[0].resolve();
-  assert.equal((await first).dropped, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.images[0].closeCalls, 1); assert.equal(app.images[1].closeCalls, 0);
+  assert.equal(app.decodeTimeouts.size, 1, 'an old decode must not clear the new generation’s deadline');
   now += 80;
   assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'next-capture', frame: frame(now, 2) })).dropped, true);
   assert.equal(decodeIndex, 2, 'an old decode must not release the new generation’s in-flight lock');
   decodes[1].resolve();
   assert.equal((await current).ok, true);
+  assert.equal(app.images[1].closeCalls, 1); assert.equal(app.decodeTimeouts.size, 0);
   const sessions = (await db.getData()).sessions;
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].id, 'next-capture');

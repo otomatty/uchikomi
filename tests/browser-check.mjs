@@ -35,6 +35,15 @@ try {
   // before any production module opens it. This exists only in the temp copy.
   await writeFile(path.join(extension,'qa-empty.html'),'<!doctype html><meta charset="utf-8"><title>Database migration fixture</title>');
   const manifest = JSON.parse(await readFile(path.join(extension, 'manifest.json'), 'utf8'));
+  const routingDiagnostics = await readFile(path.join(root, 'tests/capture-routing-diagnostics.js'), 'utf8');
+  const offscreenDocument = await readFile(path.join(extension, 'offscreen.html'), 'utf8');
+  const offscreenScript = offscreenDocument.match(/<script\b[^>]*\bsrc=["']([^"']+)["']/)?.[1];
+  assert.ok(offscreenScript, 'The production offscreen entry script is missing');
+  for (const entry of [manifest.background.service_worker, offscreenScript]) {
+    const file = path.resolve(extension, entry);
+    assert.ok(file.startsWith(extension + path.sep), 'Diagnostics must stay in the temporary extension copy');
+    await writeFile(file, routingDiagnostics + '\n' + await readFile(file, 'utf8'));
+  }
   await run('MV3 manifest / locally packaged OCR assets', async () => {
     assert.equal(manifest.manifest_version, 3);
     assert.ok(manifest.content_security_policy.extension_pages.includes('wasm-unsafe-eval'));
@@ -660,10 +669,10 @@ try {
     let game, panel;
     let observedTabId;
     const result = report.automaticCanvas = { preserveDrawingBuffer: false, phases: {}, diagnostics: {} };
-    const send = type => app.evaluate(type => new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`${type} did not respond within 30 seconds`)), 30000);
+    const send = (type, timeout = 30000) => app.evaluate(({ type, timeout }) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${type} did not respond within ${timeout} ms`)), timeout);
       chrome.runtime.sendMessage({ type }).then(reply => { clearTimeout(timer); resolve(reply); }, error => { clearTimeout(timer); reject(error); });
-    }), type);
+    }), { type, timeout });
     const readStatus = async () => {
       const reply = await send('UCHI_STATUS');
       assert.equal(reply?.ok, true, 'The real background status handler failed');
@@ -673,7 +682,19 @@ try {
     };
     const diagnose = async label => {
       const details = result.diagnostics[label] = {};
-      details.status = await send('UCHI_STATUS').catch(error => ({ error: String(error.message || error) }));
+      const [routing, status] = await Promise.all([
+        app.evaluate(async () => {
+          const read = context => new Promise(resolve => {
+            const timeout = setTimeout(() => resolve([context, { error: 'QA context did not respond within 1200 ms' }]), 1200);
+            chrome.runtime.sendMessage({ type: 'UCHI_QA_ROUTING_DIAGNOSTICS', context }).then(reply => {
+              clearTimeout(timeout); resolve([context, reply ?? { error: 'QA context is unavailable' }]);
+            }, error => { clearTimeout(timeout); resolve([context, { error: String(error.message || error) }]); });
+          });
+          return Object.fromEntries(await Promise.all(['background', 'offscreen'].map(read)));
+        }).catch(error => ({ error: String(error.message || error) })),
+        send('UCHI_STATUS', 1500).catch(error => ({ error: String(error.message || error) })),
+      ]);
+      details.routing = routing; details.status = status;
       const tabId = details.status?.status?.tabId ?? observedTabId ?? await app.evaluate(async () => {
         const tabs = await chrome.tabs.query({ url: 'https://sushida.net/play.html' });
         return tabs.find(tab => tab.active)?.id ?? tabs[0]?.id;
@@ -689,7 +710,7 @@ try {
       })).catch(error => ({ error: String(error.message || error) }));
       // A real offscreen snapshot proves that a message was accepted and its
       // JPEG decoded, even when no prompt region has been found or published.
-      const snapshot = await send('UCHI_FRAME').catch(error => ({ error: String(error.message || error) }));
+      const snapshot = await send('UCHI_FRAME', 1500).catch(error => ({ error: String(error.message || error) }));
       details.snapshot = { ok: snapshot?.ok, error: snapshot?.error };
       if (snapshot?.ok && snapshot.frame?.dataUrl?.startsWith('data:image/jpeg;base64,')) {
         const { dataUrl, ...metadata } = snapshot.frame;
@@ -707,7 +728,12 @@ try {
       } while (Date.now() < deadline);
       throw new Error(`${label} timed out; last observation: ${JSON.stringify(last)}`);
     };
-    const waitRecording = label => poll(label, readStatus, state => state.state === 'recording' && state.source === 'canvas' && state.lastFrameAt >= state.startedAt);
+    const waitRecording = label => poll(label, async () => {
+      const state = await readStatus();
+      if (!result.diagnostics.waiting && state.state === 'recording' && state.source === 'canvas' &&
+          !state.lastFrameAt && Date.now() - state.startedAt >= 1500) await diagnose('waiting');
+      return state;
+    }, state => state.state === 'recording' && state.source === 'canvas' && state.lastFrameAt >= state.startedAt);
     const assertPaused = async label => {
       // Observe for longer than the content observer's discovery interval, so
       // a delayed, unwanted restart cannot pass an immediate idle assertion.

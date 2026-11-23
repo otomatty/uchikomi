@@ -61,7 +61,7 @@ const externalCanvas = document.createElement('canvas');
 const externalContext = externalCanvas.getContext('2d', { willReadFrequently: true })!;
 let lastCanvasAt = 0;
 let lastCanvasSequence = -1;
-let pendingCanvasDecode: object | null = null;
+let pendingCanvasDecode: AbortController | null = null;
 let lastCanvasResultSequence = -1;
 let lastCanvasResultFound = false;
 let lastTabFrameAt = 0, lastTabPresentation = -1, lastTabDecoded = -1;
@@ -110,6 +110,8 @@ const REGION_SCAN_MS = 240;
 const RESULT_SCAN_MS = 1200;
 const MAX_CANVAS_GAP_MS = 300;
 const MAX_CANVAS_DATA_LENGTH = 3_000_000;
+const CANVAS_DECODE_TIMEOUT_MS = 3000;
+const CANVAS_JPEG_PREFIX = 'data:image/jpeg;base64,';
 const REPLAY_MAX_FRAME_AGE_MS = 1000, REPLAY_DEADLINE_MS = 8000, REPLAY_COOLDOWN_MS = 1000;
 const ROMAN_CHARACTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.,-'/():;[]";
 
@@ -747,13 +749,43 @@ async function prepareReplay(message: { sessionId?: unknown }) {
     if (replayRequest === request) replayRequest = null;
   }
 }
+function decodeCanvasBitmap(dataUrl: string, signal: AbortSignal): Promise<ImageBitmap> {
+  // Decode bytes directly, without HTMLImageElement's rendering lifecycle.
+  // The offscreen document has no visible rendering opportunity; its frame ACK
+  // must not depend on an image being prepared for a future document paint.
+  // This stays in memory and does not fetch a data URL or loosen extension CSP.
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => { clearTimeout(timeout); signal.removeEventListener('abort', abort); };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true; cleanup(); reject(error);
+    };
+    const abort = () => fail(new Error('ゲーム画面の読み込みを中止しました。'));
+    if (signal.aborted) { abort(); return; }
+    signal.addEventListener('abort', abort, { once: true });
+    timeout = setTimeout(() => fail(new Error('ゲーム画面の読み込みがタイムアウトしました。寿司打を再読み込みしてください。')), CANVAS_DECODE_TIMEOUT_MS);
+    try {
+      const binary = atob(dataUrl.slice(CANVAS_JPEG_PREFIX.length));
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+      void createImageBitmap(new Blob([bytes], { type: 'image/jpeg' })).then(bitmap => {
+        // Native decoding itself is not cancellable. Discard and release a
+        // late bitmap rather than letting it replace a newer recording frame.
+        if (settled) { bitmap.close(); return; }
+        settled = true; cleanup(); resolve(bitmap);
+      }, fail);
+    } catch (error) { fail(error); }
+  });
+}
 async function receiveCanvasFrame(message: { sessionId?: unknown; frame?: Partial<CanvasFrame> }) {
   if (stopped || status.source !== 'canvas' || status.state !== 'recording' || message.sessionId !== status.sessionId) {
     return { ok: true, dropped: true };
   }
   const frame = message.frame;
-  if (!frame || typeof frame.dataUrl !== 'string' || frame.dataUrl.length <= 23 || frame.dataUrl.length > MAX_CANVAS_DATA_LENGTH ||
-      !frame.dataUrl.startsWith('data:image/jpeg;base64,') ||
+  if (!frame || typeof frame.dataUrl !== 'string' || frame.dataUrl.length <= CANVAS_JPEG_PREFIX.length || frame.dataUrl.length > MAX_CANVAS_DATA_LENGTH ||
+      !frame.dataUrl.startsWith(CANVAS_JPEG_PREFIX) ||
       !Number.isInteger(frame.width) || !Number.isInteger(frame.height) ||
       frame.width! < 1 || frame.width! > 1920 || frame.height! < 1 || frame.height! > 1440 ||
       !Number.isSafeInteger(frame.sequence) || frame.sequence! < 0 || !Number.isFinite(frame.at)) {
@@ -762,17 +794,16 @@ async function receiveCanvasFrame(message: { sessionId?: unknown; frame?: Partia
   const at = frame.at!, sequence = frame.sequence!;
   if (pendingCanvasDecode || sequence <= lastCanvasSequence || at <= lastCanvasAt ||
       at < (status.startedAt ?? 0) || at > Date.now() + 1000) return { ok: true, dropped: true };
-  const token = generation, captureId = status.sessionId, decode = {};
+  const token = generation, captureId = status.sessionId, decode = new AbortController();
   pendingCanvasDecode = decode;
-  const image = new Image();
+  let bitmap: ImageBitmap | undefined;
   try {
-    image.src = frame.dataUrl;
-    await image.decode();
+    bitmap = await decodeCanvasBitmap(frame.dataUrl, decode.signal);
     if (stopped || token !== generation || captureId !== status.sessionId || status.source !== 'canvas' ||
         status.state !== 'recording' || pendingCanvasDecode !== decode || sequence <= lastCanvasSequence || at <= lastCanvasAt) {
       return { ok: true, dropped: true };
     }
-    if (image.naturalWidth !== frame.width || image.naturalHeight !== frame.height) {
+    if (bitmap.width !== frame.width || bitmap.height !== frame.height) {
       return { ok: false, error: 'ゲーム画面の大きさを確認できませんでした。' };
     }
     if (lastCanvasAt && at - lastCanvasAt > MAX_CANVAS_GAP_MS) {
@@ -785,7 +816,7 @@ async function receiveCanvasFrame(message: { sessionId?: unknown; frame?: Partia
     if (externalCanvas.width !== frame.width || externalCanvas.height !== frame.height) {
       externalCanvas.width = frame.width!; externalCanvas.height = frame.height!;
     }
-    externalContext.drawImage(image, 0, 0);
+    externalContext.drawImage(bitmap, 0, 0);
     lastCanvasAt = at; lastCanvasSequence = sequence;
     status = { ...status, lastFrameAt: at };
     sampleFrame(at);
@@ -794,7 +825,7 @@ async function receiveCanvasFrame(message: { sessionId?: unknown; frame?: Partia
     if (stopped || token !== generation || captureId !== status.sessionId) return { ok: true, dropped: true };
     return { ok: false, error: error instanceof Error ? error.message : 'ゲーム画面を読み取れませんでした。' };
   } finally {
-    image.src = '';
+    bitmap?.close();
     if (pendingCanvasDecode === decode) pendingCanvasDecode = null;
   }
 }
@@ -813,7 +844,7 @@ async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; ta
   games = []; activeGame = null; session = null; lastResultScan = 0;
   promptSignatures.reset(); sequence = 0;
   lastCanvasAt = 0; lastCanvasSequence = lastCanvasResultSequence = -1; lastCanvasResultFound = false;
-  pendingCanvasDecode = null; externalCanvas.width = externalCanvas.height = 1;
+  pendingCanvasDecode?.abort(); pendingCanvasDecode = null; externalCanvas.width = externalCanvas.height = 1;
   captureWarning = undefined; lastFrameWidth = lastFrameHeight = 0;
   status = { state: 'starting', source, tabId: message.tabId, sessionId: message.sessionId, startedAt: message.startedAt, phraseCount: 0, ocrReady: false, regionState: 'searching', scoreState: 'watching' };
   try {
@@ -891,7 +922,7 @@ async function finishStop() {
   // Stop the media tracks immediately; only already-cropped text awaits OCR.
   stream?.getTracks().forEach(track => track.stop()); stream = null;
   video.srcObject = null; stopTabFrameWatch();
-  pendingCanvasDecode = null; lastCanvasAt = 0; externalCanvas.width = externalCanvas.height = 1;
+  pendingCanvasDecode?.abort(); pendingCanvasDecode = null; lastCanvasAt = 0; externalCanvas.width = externalCanvas.height = 1;
   // A Tesseract startup error can leave its underlying createWorker promise
   // pending forever. Abort our startup ownership and do not await that promise;
   // background closes this document after stop returns, releasing raw workers
