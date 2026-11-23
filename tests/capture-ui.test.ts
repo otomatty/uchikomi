@@ -33,7 +33,8 @@ define('chrome', {
       messages.push(message.type);
       if (message.type === 'UCHI_START') publish({ state: 'recording', ocrReady: true, regionState: 'searching', startedAt: Date.now(), sessionId: 'first-session' });
       if (message.type === 'UCHI_AUTO_REGION') publish({ regionState: 'searching', region: undefined, regionConfidence: undefined });
-      return { ok: true, status };
+      if (message.type === 'UCHI_STOP') publish({ state: 'idle' });
+      return { ok: true, status, sessionId: status.activeSessionId||status.sessionId };
     },
   },
   tabs: { create: async () => ({}) },
@@ -86,4 +87,20 @@ test('automatic lock is visible and retry returns to searching without losing ca
   assert.match(document.querySelector('[data-testid="capture-region"]')?.textContent ?? '', /お題を探しています/);
   assert.equal(document.querySelector('.captured-count strong')?.textContent, '3');
   assert.equal(document.querySelector('[role="dialog"]'), null);
+});
+
+test('an automatically recorded score is visible and stopping does not force manual score entry', async () => {
+  const now=Date.now();
+  await act(async()=>{
+    await db.saveSession({id:'first-session',source:'capture',startedAt:now-120000,endedAt:now,score:22000,scoreType:'profit',scoreSource:'ocr',scoreConfidence:96,scoreObservedAt:now,scoreTotal:32000,scoreProfit:22000,course:10000,mode:'accuracy',phraseCount:3,correctKeys:30,mistakes:1,durationMs:120000});
+    publish({state:'recording',activeSessionId:'first-session',scoreState:'saved',latestScore:{sessionId:'first-session',score:22000,scoreType:'profit',confidence:96}});
+    await delay(20);
+  });
+  await settle(()=>Boolean(document.querySelector('[data-testid="auto-score"]')));
+  assert.match(document.querySelector('[data-testid="auto-score"]')?.textContent??'',/22,000/);
+  const stop=[...document.querySelectorAll<HTMLButtonElement>('button')].find(button=>button.textContent?.includes('記録を終了'));
+  assert.ok(stop);await act(async()=>{stop.click();await delay(30);});
+  await settle(()=>messages.includes('UCHI_STOP'));
+  assert.equal(document.querySelector('[role="dialog"]'),null);
+  assert.equal((await db.getData()).sessions[0].score,22000);
 });

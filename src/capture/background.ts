@@ -113,6 +113,8 @@ async function stopCapture(message?: string) {
   await loadStatus();
   const ended = { ...status };
   let finalWarning: string | undefined;
+  let stoppedSessionId = ended.activeSessionId ?? ended.sessionId;
+  let stoppedStatus: CaptureStatus | undefined;
   try {
     if (ended.tabId) {
       await chrome.tabs.sendMessage(ended.tabId, { type: 'UCHI_CAPTURE_DISABLE' }).catch(() => {});
@@ -121,12 +123,16 @@ async function stopCapture(message?: string) {
     }
     if (await hasOffscreen()) {
       await publish({ ...status, state: 'stopping', message: '最後のお題を保存しています' });
-      const stopped = await offscreen<{ status?: CaptureStatus }>('UCHI_OFF_STOP');
+      const stopped = await offscreen<{ status?: CaptureStatus; sessionId?: string }>('UCHI_OFF_STOP');
       finalWarning = stopped?.status?.message;
+      stoppedSessionId = stopped?.sessionId ?? stoppedSessionId;
+      stoppedStatus = stopped?.status;
       await chrome.offscreen.closeDocument().catch(() => {});
     }
-    await publish({ ...EMPTY_CAPTURE, sessionId: ended.sessionId, phraseCount: status.phraseCount, message: finalWarning ?? message });
-    return { ok: true, status, sessionId: ended.sessionId };
+    await publish({ ...EMPTY_CAPTURE, sessionId: ended.sessionId, activeSessionId: stoppedSessionId, phraseCount: status.phraseCount,
+      latestScore: stoppedStatus?.latestScore, scoreState: stoppedStatus?.scoreState, scoreReviewSessionId: stoppedStatus?.scoreReviewSessionId,
+      message: finalWarning ?? message });
+    return { ok: true, status, sessionId: stoppedSessionId };
   } catch (error) {
     await chrome.offscreen.closeDocument().catch(() => {});
     await publish({ ...EMPTY_CAPTURE, state: 'error', message: conciseError(error) });

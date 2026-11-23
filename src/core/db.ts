@@ -1,6 +1,7 @@
 import { DEFAULT_SETTINGS } from './types';
-import type { AppData, Attempt, Calibration, Phrase, Rect, Session, Settings, Source, StrokeSample } from './types';
+import type { AppData, Attempt, Calibration, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
 import { normalizeRoman } from './romaji';
+import { isErrorTerminatedAttempt } from './analytics';
 const DB_NAME='uchikomi-v1', VERSION=1;
 const STORE_NAMES=['phrases','attempts','sessions','settings'] as const;
 let database:Promise<IDBDatabase>|undefined;
@@ -84,7 +85,58 @@ export async function saveAttempt(value:Attempt):Promise<void> {
   tx.objectStore('attempts').put(attempt);await done;notify();
 }
 export async function saveSession(value:Session):Promise<void> {
-  const session=validateSession(value),database=await db(),tx=database.transaction('sessions','readwrite'),done=complete(tx);tx.objectStore('sessions').put(session);await done;notify();
+  let session=validateSession(value);
+  const database=await db(),tx=database.transaction('sessions','readwrite'),done=complete(tx),store=tx.objectStore('sessions');
+  const existing=await request<Session|undefined>(store.get(session.id));
+  if(session.score!==undefined&&session.scoreSource==='manual'){
+    session={...session,scoreTotal:session.scoreType==='total'?session.score:session.score+10000,
+      scoreProfit:session.scoreType==='profit'?session.score:session.score-10000,scoreObservedAt:Date.now()};
+    delete session.scoreConfidence;delete session.scoreEvidence;delete session.scoreReview;
+  }else if(existing?.score!==undefined&&(
+    existing.scoreSource!=='ocr'||session.score===undefined||session.scoreSource!=='ocr'||
+    (existing.scoreObservedAt??0)>(session.scoreObservedAt??0)
+  )){
+    // Capture counts are saved asynchronously. A stale session object must not
+    // erase an automatic score, or overwrite an explicit/manual correction.
+    session=withScoreFrom(session,existing);
+  }else if(existing?.scoreReview&&session.score===undefined&&(!session.scoreReview||existing.scoreReview.observedAt>session.scoreReview.observedAt)){
+    session.scoreReview=existing.scoreReview;
+  }
+  store.put(session);await done;notify();
+}
+const scoreFields=['score','scoreType','scoreSource','scoreConfidence','scoreObservedAt','scoreEvidence','scoreModeSource','scoreTotal','scoreProfit','scoreReview'] as const;
+function withScoreFrom(session:Session,existing:Session):Session {
+  const result={...session};
+  for(const field of scoreFields){if(existing[field]!==undefined)(result as unknown as Record<string,unknown>)[field]=existing[field];else delete (result as unknown as Record<string,unknown>)[field];}
+  return result;
+}
+export interface AutomaticScore {
+  score:number;scoreType:'profit'|'total';scoreConfidence:number;scoreObservedAt:number;
+  scoreEvidence?:string;scoreTotal?:number;scoreProfit?:number;scoreModeSource?:'configured'|'ocr';
+}
+/** Atomically record OCR results without overwriting a manual/legacy score. */
+export async function saveAutomaticScore(sessionId:string,patch:AutomaticScore):Promise<boolean> {
+  identifier(sessionId);
+  const type=scoreType(patch.scoreType),score=number(patch.score,'スコア',type==='profit'?-10000:0,10000000);
+  const confidence=number(patch.scoreConfidence,'スコア認識率',0,100),at=number(patch.scoreObservedAt,'スコア確認時刻');
+  const total=patch.scoreTotal===undefined?(type==='total'?score:score+10000):number(patch.scoreTotal,'合計金額',0,10010000);
+  const profit=patch.scoreProfit===undefined?(type==='profit'?score:score-10000):number(patch.scoreProfit,'お得金額',-10000,10000000);
+  if(total-profit!==10000||(type==='total'?total:profit)!==score)throw new Error('合計金額とお得金額が一致しません。');
+  const evidence=patch.scoreEvidence===undefined?undefined:imageData(patch.scoreEvidence,'スコア画像');
+  const modeSource=patch.scoreModeSource===undefined?undefined:validateScoreModeSource(patch.scoreModeSource);
+  const database=await db(),tx=database.transaction('sessions','readwrite'),done=complete(tx),store=tx.objectStore('sessions');
+  const existing=await request<Session|undefined>(store.get(sessionId));
+  if(!existing){await done;throw new Error('スコアを保存するセッションが見つかりません。');}
+  if(existing.score!==undefined&&(existing.scoreSource!=='ocr'||
+      (existing.score===score&&existing.scoreType===type)||
+      (existing.scoreObservedAt??0)>=at||(existing.scoreConfidence??0)>confidence)){
+    await done;return false;
+  }
+  const next:Session={...existing,score,scoreType:type,scoreSource:'ocr',scoreConfidence:confidence,scoreObservedAt:at,scoreTotal:total,scoreProfit:profit};
+  if(evidence!==undefined)next.scoreEvidence=evidence;else delete next.scoreEvidence;
+  if(modeSource!==undefined)next.scoreModeSource=modeSource;
+  delete next.scoreReview;
+  store.put(next);await done;notify();return true;
 }
 export async function updateSettings(patch:Partial<Settings>):Promise<Settings> {
   const database=await db(),tx=database.transaction('settings','readwrite'),done=complete(tx),store=tx.objectStore('settings');
@@ -121,12 +173,17 @@ function source(value:unknown):Source {if(value==='demo')throw new Error('デモ
 function identifier(value:unknown):string {return text(value,'ID',200);}
 function scoreType(value:unknown):'profit'|'total' {if(value!=='profit'&&value!=='total')throw new Error('スコアの種類を確認してください。');return value;}
 function list(value:unknown,label:string,max:number):unknown[] {if(!Array.isArray(value)||value.length>max)throw new Error(`${label}の件数が多すぎるか、形式が正しくありません。`);return value;}
+function imageData(value:unknown,label:string):string {
+  const result=text(value,label,3000000);
+  if(!/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/.test(result))throw new Error('画像の形式が正しくありません。');
+  return result;
+}
 function validatePhrase(value:unknown):Phrase {
   const p=object(value,'語句');
   const result:Phrase={id:identifier(p.id),text:text(p.text,'語句',300),reading:text(p.reading,'よみ',500,true),roman:normalizeRoman(text(p.roman,'ローマ字',1000,true)),source:source(p.source),confidence:number(p.confidence,'認識率',0,100),verified:bool(p.verified,'確認状態'),capturedAt:number(p.capturedAt,'出題時刻'),lastSeenAt:number(p.lastSeenAt,'出題時刻'),seenCount:number(p.seenCount,'出題回数',0,1000000)};
   if(result.roman&&!/^[\x21-\x7e]+$/.test(result.roman))throw new Error('ローマ字は半角英数・記号で入力してください。');
   if(result.verified&&!result.roman)throw new Error('確認済みの語句にはローマ字が必要です。');
-  if(p.screenshot!==undefined){result.screenshot=text(p.screenshot,'画像',3000000);if(!/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/.test(result.screenshot))throw new Error('画像の形式が正しくありません。');}
+  if(p.screenshot!==undefined)result.screenshot=imageData(p.screenshot,'画像');
   if(p.tags!==undefined)result.tags=list(p.tags,'タグ',20).map(x=>text(x,'タグ',60));
   return result;
 }
@@ -135,13 +192,57 @@ function validateSample(value:unknown):StrokeSample {
 }
 function validateAttempt(value:unknown):Attempt {
   const a=object(value,'練習結果');const result:Attempt={id:identifier(a.id),phraseId:identifier(a.phraseId),sessionId:identifier(a.sessionId),source:source(a.source),startedAt:number(a.startedAt,'開始時刻'),endedAt:number(a.endedAt,'終了時刻'),durationMs:number(a.durationMs,'練習時間',0,86400000),correctKeys:number(a.correctKeys,'正しい入力数',0,10000),mistakes:number(a.mistakes,'ミス数',0,10000),accuracy:number(a.accuracy,'正確率',0,100),kps:number(a.kps,'入力速度',0,1000),samples:list(a.samples,'入力間隔',2000).map(validateSample),complete:bool(a.complete,'完了状態'),reliable:bool(a.reliable,'測定状態'),typed:text(a.typed,'入力内容',10000,true)};
-  if(result.endedAt<result.startedAt)throw new Error('終了時刻が開始時刻より前です。');return result;
+  if(result.endedAt<result.startedAt)throw new Error('終了時刻が開始時刻より前です。');
+  if(a.judgements!==undefined){
+    result.judgements=list(a.judgements,'打鍵の詳細',20000).map(validateJudgement);
+    let position=0,at=result.startedAt;
+    for(const key of result.judgements){
+      if(key.at<result.startedAt||key.at>result.endedAt||key.position!==position||(result.reliable&&key.at<at))throw new Error('打鍵の順序・時刻を確認してください。');
+      const normalized=normalizeRoman(key.actual);
+      if(key.accepted!==key.expected.includes(normalized))throw new Error('打鍵の正誤と正解キーが一致しません。');
+      if(key.accepted)position++;at=key.at;
+    }
+    if(position!==result.correctKeys||result.judgements.length-position!==result.mistakes)throw new Error('打鍵の詳細と入力数が一致しません。');
+  }
+  if(a.errorTerminated!==undefined){
+    result.errorTerminated=bool(a.errorTerminated,'ミスによる終了状態');
+    if(result.errorTerminated&&!isErrorTerminatedAttempt(result))throw new Error('ミスによる終了と打鍵の詳細が一致しません。');
+  }
+  return result;
+}
+function validateJudgement(value:unknown):KeyJudgement {
+  const k=object(value,'打鍵の詳細'),actual=text(k.actual,'実際のキー',1,true),expected=list(k.expected,'正解キー',94).map(x=>text(x,'正解キー',1));
+  if(!/^[\x20-\x7e]$/.test(actual)||!expected.length||expected.some(key=>!/^[\x21-\x7e]$/.test(key))||new Set(expected).size!==expected.length)throw new Error('打鍵キーの形式が正しくありません。');
+  const position=number(k.position,'打鍵位置',0,10000);if(!Number.isInteger(position))throw new Error('打鍵位置を確認してください。');
+  const result:KeyJudgement={actual,expected,accepted:bool(k.accepted,'入力結果'),position,at:number(k.at,'打鍵時刻')};
+  if(k.intervalMs!==undefined)result.intervalMs=number(k.intervalMs,'入力間隔',15,2000);
+  if(k.pattern!==undefined){result.pattern=text(k.pattern,'組み合わせ',3);if(!/^[\x21-\x7e]{1,3}$/.test(result.pattern))throw new Error('組み合わせを確認してください。');}
+  return result;
+}
+function validateScoreReview(value:unknown):ScoreReview {
+  const r=object(value,'スコアの確認'),type=scoreType(r.scoreType);
+  const result:ScoreReview={scoreType:type,confidence:number(r.confidence,'スコア認識率',0,100),observedAt:number(r.observedAt,'スコア確認時刻'),reason:text(r.reason,'確認理由',500)};
+  if(r.score!==undefined)result.score=number(r.score,'スコア候補',type==='profit'?-10000:0,10000000);
+  if(r.evidence!==undefined)result.evidence=imageData(r.evidence,'スコア画像');
+  return result;
+}
+function validateScoreModeSource(value:unknown):'configured'|'ocr' {
+  if(value!=='configured'&&value!=='ocr')throw new Error('モードの確認元を確認してください。');return value;
 }
 function validateSession(value:unknown):Session {
   const s=object(value,'セッション');if(s.course!==10000||s.mode!=='accuracy')throw new Error('10,000円・正確重視の記録のみ読み込めます。');
   const result:Session={id:identifier(s.id),startedAt:number(s.startedAt,'開始時刻'),source:source(s.source),scoreType:scoreType(s.scoreType),course:10000,mode:'accuracy',phraseCount:number(s.phraseCount,'語句数',0,1000000),correctKeys:number(s.correctKeys,'正しい入力数',0,10000000),mistakes:number(s.mistakes,'ミス数',0,10000000),durationMs:number(s.durationMs,'セッション時間',0,86400000)};
   if(s.endedAt!==undefined)result.endedAt=number(s.endedAt,'終了時刻',result.startedAt);
   if(s.score!==undefined)result.score=number(s.score,'スコア',result.scoreType==='profit'?-10000:0,10000000);
+  if(s.captureId!==undefined)result.captureId=identifier(s.captureId);
+  if(s.scoreSource!==undefined){if(s.scoreSource!=='ocr'&&s.scoreSource!=='manual')throw new Error('スコアの記録元を確認してください。');result.scoreSource=s.scoreSource;}
+  if(s.scoreConfidence!==undefined)result.scoreConfidence=number(s.scoreConfidence,'スコア認識率',0,100);
+  if(s.scoreObservedAt!==undefined)result.scoreObservedAt=number(s.scoreObservedAt,'スコア確認時刻');
+  if(s.scoreEvidence!==undefined)result.scoreEvidence=imageData(s.scoreEvidence,'スコア画像');
+  if(s.scoreModeSource!==undefined)result.scoreModeSource=validateScoreModeSource(s.scoreModeSource);
+  if(s.scoreTotal!==undefined)result.scoreTotal=number(s.scoreTotal,'合計金額',0,10010000);
+  if(s.scoreProfit!==undefined)result.scoreProfit=number(s.scoreProfit,'お得金額',-10000,10000000);
+  if(s.scoreReview!==undefined)result.scoreReview=validateScoreReview(s.scoreReview);
   return result;
 }
 function validateRect(value:unknown):Rect {

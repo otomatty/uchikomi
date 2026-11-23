@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import test,{beforeEach,after} from 'node:test';
 import assert from 'node:assert/strict';
-import { clearData,getData,savePhrase,updatePhrase,deletePhrase,saveAttempt,saveSession,updateSettings,exportData,importData,subscribe } from '../src/core/db';
+import { clearData,getData,savePhrase,updatePhrase,deletePhrase,saveAttempt,saveSession,saveAutomaticScore,updateSettings,exportData,importData,subscribe } from '../src/core/db';
+import { buildAttempt, summarize } from '../src/core/analytics';
 import { DEFAULT_SETTINGS } from '../src/core/types';
 import type { Phrase,Attempt,Session } from '../src/core/types';
 // The Node BroadcastChannel would keep the test process alive. This deterministic peer channel
@@ -84,5 +85,86 @@ test('demo data cannot be persisted or imported into actual records',async()=>{
   await seed();const before=await getData();
   await assert.rejects(saveAttempt({...attempt('demoAttempt'),source:'demo'}));
   await assert.rejects(importData({...before,version:1,phrases:[{...phrase('demoWord'),source:'demo'}]}));
+  assert.deepEqual(await getData(),before);
+});
+
+test('detailed actual and expected keystrokes survive backup and malformed detail rolls back atomically',async()=>{
+  const p=phrase();await savePhrase(p);await saveSession(session());
+  const detailed=buildAttempt({phrase:p,strokes:[...'peaqrukku'].map((key,i)=>({key,at:now+(i+1)*100})),startedAt:now,endedAt:now+2000,sessionId:'s1',source:'practice',complete:true,reliable:true});
+  await saveAttempt(detailed);const backup=await exportData();
+  assert.equal(backup.attempts[0].judgements?.[3].actual,'q');assert.deepEqual(backup.attempts[0].judgements?.[3].expected,['r']);
+  await clearData();await importData(JSON.parse(JSON.stringify(backup)));assert.deepEqual((await getData()).attempts[0].judgements,detailed.judgements);
+  const before=await getData();
+  const malformed=JSON.parse(JSON.stringify(backup));malformed.attempts[0].judgements[3].accepted=true;
+  await assert.rejects(importData(malformed));assert.deepEqual(await getData(),before);
+});
+
+test('automatic scores retain total/profit and survive asynchronous session-count writes',async()=>{
+  const captured:Session={...session(),source:'capture',captureId:'recording-1',scoreReview:{score:18000,scoreType:'profit',confidence:64,observedAt:now+1500,reason:'数値を確認'}};
+  await saveSession(captured);assert.equal(summarize(await getData()).best,null);
+  assert.equal(await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:94,scoreObservedAt:now+2000,scoreEvidence:'data:image/png;base64,AA==',scoreModeSource:'configured'}),true);
+  await saveSession({...captured,phraseCount:7});
+  const saved=(await getData()).sessions[0];assert.equal(saved.score,18000);assert.equal(saved.scoreSource,'ocr');assert.equal(saved.scoreTotal,28000);assert.equal(saved.scoreProfit,18000);assert.equal(saved.phraseCount,7);assert.equal(saved.scoreReview,undefined);
+  assert.equal(saved.scoreModeSource,'configured');
+  assert.equal(await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:99,scoreObservedAt:now+3000}),false);
+  const backup=await exportData();await clearData();await importData(JSON.parse(JSON.stringify(backup)));assert.deepEqual((await getData()).sessions,backup.sessions);
+});
+
+test('manual and legacy score corrections cannot be overwritten by OCR or stale capture objects',async()=>{
+  const captured:Session={...session(),source:'capture'};await saveSession(captured);
+  await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+2000});
+  const automatic=(await getData()).sessions[0];await saveSession({...automatic,score:19000,scoreSource:'manual'});
+  assert.equal(await saveAutomaticScore('s1',{score:20000,scoreType:'profit',scoreConfidence:99,scoreObservedAt:now+4000}),false);
+  await saveSession({...automatic,phraseCount:10,score:22000,scoreObservedAt:Date.now()+1000});
+  let saved=(await getData()).sessions[0];assert.equal(saved.score,19000);assert.equal(saved.scoreSource,'manual');assert.equal(saved.scoreConfidence,undefined);assert.equal(saved.scoreEvidence,undefined);assert.equal(saved.scoreTotal,29000);assert.equal(saved.phraseCount,10);
+  await saveSession({...captured,id:'legacy',score:17000});
+  assert.equal(await saveAutomaticScore('legacy',{score:21000,scoreType:'profit',scoreConfidence:99,scoreObservedAt:now+4000}),false);
+  saved=(await getData()).sessions.find(s=>s.id==='legacy')!;assert.equal(saved.score,17000);
+});
+
+test('pending score review persists without affecting graphs and invalid score evidence is rejected',async()=>{
+  const captured:Session={...session(),source:'capture'};await saveSession(captured);
+  await saveSession({...captured,scoreReview:{score:18000,scoreType:'profit',confidence:60,observedAt:now+1000,reason:'数値が一致しません',evidence:'data:image/png;base64,AA=='}});
+  await saveSession({...captured,phraseCount:5});const before=await getData();
+  assert.equal(before.sessions[0].scoreReview?.score,18000);assert.equal(before.sessions[0].score,undefined);assert.equal(summarize(before).best,null);
+  await assert.rejects(saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+3000,scoreTotal:30000,scoreProfit:18000}));
+  await assert.rejects(importData({...before,version:1,sessions:[{...before.sessions[0],scoreReview:{...before.sessions[0].scoreReview,evidence:'https://example.com/image.png'}}]}));
+  await assert.rejects(importData({...before,version:1,sessions:[{...before.sessions[0],scoreModeSource:'inferred'}]}));
+  assert.deepEqual(await getData(),before);
+});
+
+test('concurrent manual and automatic score saves always preserve the manual correction',async()=>{
+  const captured:Session={...session(),source:'capture'};await saveSession(captured);
+  await Promise.all([
+    saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+2000}),
+    saveSession({...captured,score:19500,scoreSource:'manual'}),
+  ]);
+  const saved=(await getData()).sessions[0];assert.equal(saved.score,19500);assert.equal(saved.scoreSource,'manual');
+});
+
+test('terminal-miss captures roundtrip and forged termination flags are rejected before any import mutation',async()=>{
+  const p=phrase();await savePhrase(p);await saveSession({...session(),source:'capture'});
+  const terminal=buildAttempt({phrase:p,strokes:[...'peaqnextplate'].map((key,i)=>({key,at:now+(i+1)*100})),startedAt:now,endedAt:now+2000,sessionId:'s1',source:'capture',complete:false,reliable:true,endOnMistake:true});
+  await saveAttempt(terminal);const backup=await exportData();
+  await clearData();await importData(JSON.parse(JSON.stringify(backup)));
+  assert.deepEqual((await getData()).attempts[0],terminal);
+  const before=await getData();
+  const wrongPatches=[
+    {errorTerminated:'true'},
+    {source:'practice'},
+    {complete:true},
+    {judgements:undefined},
+    {endedAt:terminal.endedAt+100,durationMs:terminal.durationMs+100},
+    {durationMs:terminal.durationMs+100},
+    {typed:'pear'},
+    {samples:[...terminal.samples,{pattern:'ru',intervalMs:100,error:false,at:terminal.endedAt+100}]},
+    {judgements:terminal.judgements!.slice(0,-1),mistakes:0},
+  ];
+  for(const patch of wrongPatches){
+    await assert.rejects(importData({...backup,attempts:[{...terminal,...patch}],settings:{...backup.settings,targetScore:99999}}));
+    assert.deepEqual(await getData(),before);
+  }
+  const corrected=buildAttempt({phrase:p,strokes:[...'peaqrukku'].map((key,i)=>({key,at:now+(i+1)*100})),startedAt:now,endedAt:now+1000,sessionId:'s1',source:'practice',complete:true,reliable:true});
+  await assert.rejects(saveAttempt({...corrected,source:'capture',complete:false,errorTerminated:true}));
   assert.deepEqual(await getData(),before);
 });

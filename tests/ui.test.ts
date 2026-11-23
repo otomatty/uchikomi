@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { Window } from 'happy-dom';
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 import type { Phrase } from '../src/core/types';
+import { buildAttempt } from '../src/core/analytics';
 
 const browserWindow=new Window({url:'https://uchikomi.test/index.html',width:1440,height:1000});
 const define=(name:string,value:unknown)=>Object.defineProperty(globalThis,name,{configurable:true,writable:true,value});
@@ -114,8 +115,19 @@ test('filtered visible vocabulary drives actual practice; completed words and er
   await settled(()=>!!document.querySelector('[data-testid="practice-complete"]'));
   const data=await db.getData();assert.equal(data.attempts.length,5);assert.ok(data.attempts.every(a=>a.phraseId==='ui-pair'&&a.reliable&&a.complete));
   assert.equal(data.attempts.reduce((n,a)=>n+a.mistakes,0),1);
+  const mistaken=data.attempts.find(a=>a.mistakes===1)!;
+  assert.equal(mistaken.judgements?.[0].actual,'q');
+  assert.equal(mistaken.judgements?.[0].accepted,false);
+  assert.ok(mistaken.judgements?.[0].expected.includes('p'));
   const session=data.sessions.find(s=>s.id===data.attempts[0].sessionId)!;assert.ok(session.endedAt);assert.equal(session.phraseCount,5);
   assert.ok(data.attempts.some(a=>a.samples.some(s=>s.pattern==='kk')));
+  await navigateWords();
+  await click(query('[data-testid="filter-mistakes"]'));
+  assert.equal(document.querySelectorAll('[data-testid="phrase-row"]').length,1);
+  await click(query('button[aria-label="テスト用のペアルックを編集"]'));
+  assert.equal(query('.confusion-row .key-wrong').textContent,'q');
+  assert.equal(query('.confusion-row .key-correct').textContent,'p');
+  assert.ok(document.querySelector('.trace-key.rejected'));
 });
 
 test('opening settings pauses practice and a partial run remains a valid restorable backup',async()=>{
@@ -148,4 +160,49 @@ test('the actual import form rejects malformed JSON without changing records',as
   await act(async()=>{const el=query<HTMLInputElement>('[data-testid="import-file"]');el.files=transfer.files as unknown as FileList;el.dispatchEvent(new browserWindow.Event('change',{bubbles:true}));await delay(20);});
   await settled(()=>!!document.querySelector('[role="dialog"] [role="alert"]'));
   assert.equal((await db.getData()).phrases.length,1);assert.match(query('[role="dialog"] [role="alert"]').textContent??'',/バックアップ/);
+});
+
+test('correct but slow letter combinations show the personal baseline and lead to five real-word repetitions',async()=>{
+  const pair=phrase('ui-slow-pair'),photo=phrase('ui-fast-photo','テスト用の写真','しゃしん','syasinn');
+  await db.savePhrase(pair);await db.savePhrase(photo);await db.updateSettings({sessionLength:5});
+  const start=Date.now()-120000,sessionId='ui-speed-observations';
+  await db.saveSession({id:sessionId,startedAt:start,endedAt:start+60000,source:'practice',scoreType:'profit',course:10000,mode:'accuracy',phraseCount:12,correctKeys:90,mistakes:0,durationMs:60000});
+  for(let round=0;round<6;round++){
+    for(const [p,offset] of [[pair,0],[photo,2000]] as const){
+      const startedAt=start+round*5000+offset;let at=startedAt;
+      const strokes=[...p.roman].map((key,index)=>{at+=p.id===pair.id&&index===6?320:80;return{key,at};});
+      const observation=buildAttempt({phrase:p,strokes,startedAt,endedAt:at+80,sessionId,source:'practice',complete:true,reliable:true});
+      assert.ok(observation.reliable&&observation.complete);assert.equal(observation.mistakes,0);
+      await db.saveAttempt(observation);
+    }
+  }
+  await mount();await navigateWords();
+  // 42 intervals for the pair + 36 baseline intervals: (6*800+36*80)/78 = 98.46ms.
+  assert.match(query('.baseline-strip').textContent??'',/10\.2/);
+  assert.match(query('.baseline-detail').textContent??'',/98 ms \/ 打鍵 · 78 区間/);
+  await click(query('[data-testid="filter-mistakes"]'));
+  assert.equal(document.querySelectorAll('[data-testid="phrase-row"]').length,0);
+  assert.match(document.body.textContent??'',/記録されたミスは、まだありません/);
+  await click(query('[data-testid="filter-slow"]'));
+  const slowPatterns=[...document.querySelectorAll('.slow-pattern strong')].map(el=>el.textContent);
+  assert.ok(slowPatterns.includes('kk'));assert.ok(slowPatterns.includes('ukk'));assert.ok(slowPatterns.includes('kku'));
+  assert.equal(document.querySelectorAll('[data-testid="phrase-row"]').length,1);
+  assert.match(query('[data-testid="phrase-row"]').textContent??'',/テスト用のペアルック/);
+  assert.ok([...document.querySelectorAll('.slow-mark')].some(el=>el.textContent?.includes('kk')));
+  const kk=[...document.querySelectorAll<HTMLButtonElement>('button.slow-pattern')].find(el=>el.querySelector('strong')?.textContent==='kk');assert.ok(kk);
+  await click(kk);assert.equal(query('.pattern-summary strong').textContent,'kk');
+  assert.match(query('.pattern-summary').textContent??'',/ミスを含む 0区間/);
+  assert.equal(document.querySelectorAll('[data-testid="phrase-row"]').length,1);
+  await click(query('[data-testid="nav-practice"]'));await settled(()=>!!document.querySelector('[data-testid="practice-start"]'));
+  await click(query('[data-testid="practice-start"]'));
+  for(let i=0;i<5;i++){
+    await settled(()=>Number(document.querySelector('.practice-count > span')?.textContent)===i+1&&!!document.querySelector('.roman-line .cursor'));
+    assert.equal(query('.typing-phrase h1').textContent,pair.text);
+    assert.equal(query('.roman-line').textContent,pair.roman);
+    assert.equal(document.querySelectorAll('.roman-line .focus-letter').length,2);
+    await type(pair.roman);
+  }
+  await settled(()=>!!document.querySelector('[data-testid="practice-complete"]'));
+  const practiced=(await db.getData()).attempts.filter(a=>a.sessionId!==sessionId);
+  assert.equal(practiced.length,5);assert.ok(practiced.every(a=>a.phraseId===pair.id&&a.complete&&a.reliable&&a.mistakes===0));
 });

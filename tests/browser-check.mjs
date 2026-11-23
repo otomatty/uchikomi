@@ -42,6 +42,7 @@ try {
     stdin: {
       contents: `
         export * from ${JSON.stringify(path.join(root, 'src/core/db.ts'))};
+        export { buildAttempt } from ${JSON.stringify(path.join(root, 'src/core/analytics.ts'))};
         import { detectPromptRegions } from ${JSON.stringify(path.join(root, 'src/capture/auto-region.ts'))};
         export async function detectPromptFromImage(dataUrl) {
           const image=new Image(); image.src=dataUrl; await image.decode();
@@ -235,6 +236,7 @@ try {
       }, i+1);
       const target=(await app.locator('.roman-line').innerText()).replace(/\s+/g,'');
       assert.ok(target.length>0);
+      if(i===0)await app.keyboard.type('q',{delay:25});
       await app.keyboard.type(target,{delay:25});
     }
     await app.getByTestId('practice-complete').waitFor({timeout:10000});
@@ -242,9 +244,66 @@ try {
     const practiced=data.attempts.filter(a=>a.phraseId==='qa-phrase-1');
     assert.equal(practiced.length,5);
     assert.ok(practiced.every(a=>a.complete&&a.reliable));
+    const wrong=practiced.flatMap(a=>a.judgements??[]).filter(key=>!key.accepted);
+    assert.equal(wrong.length,1);
+    assert.equal(wrong[0].actual,'q');assert.deepEqual(wrong[0].expected,['p']);
     const session=data.sessions.find(s=>s.id===practiced[0].sessionId);
     assert.ok(session?.endedAt);assert.equal(session.phraseCount,5);
     await app.screenshot({path:path.join(output,'practice-complete.png'),fullPage:true});
+  });
+  await run('Mistake details show actual keys, correct candidates and per-key history',async()=>{
+    await app.getByTestId('nav-phrases').click();
+    await app.getByTestId('filter-mistakes').click();
+    assert.equal(await app.getByTestId('phrase-row').count(),1);
+    await app.getByRole('button',{name:'テスト用のペアルックを編集',exact:true}).click();
+    await app.locator('.confusion-row').waitFor();
+    assert.equal(await app.locator('.confusion-row .key-wrong').innerText(),'q');
+    assert.equal(await app.locator('.confusion-row .key-correct').innerText(),'p');
+    await app.locator('.key-history summary').click();
+    assert.equal(await app.locator('.trace-key.rejected').count(),1);
+    assert.match(await app.locator('.trace-key.rejected').getAttribute('aria-label'),/正解候補 p/);
+    await app.screenshot({path:path.join(output,'mistake-details.png'),fullPage:true});
+    await app.getByRole('button',{name:'閉じる',exact:true}).click();
+  });
+  await run('Repeated slow intervals filter to actual saved words in the browser UI',async()=>{
+    await app.evaluate(async()=>{
+      const data=await window.UchiQA.getData(),startedAt=Date.now();
+      const session={id:'qa-measurements',startedAt,endedAt:startedAt+30000,source:'practice',scoreType:'profit',course:10000,mode:'accuracy',phraseCount:12,correctKeys:90,mistakes:0,durationMs:30000};
+      await window.UchiQA.saveSession(session);
+      for(const phrase of data.phrases)for(let i=0;i<6;i++){
+        const start=startedAt+i*2000;let at=start;
+        const strokes=[...phrase.roman].map((key,index)=>{
+          at+=phrase.roman.slice(index-1,index+1)==='kk'?320:80;
+          return{key,at};
+        });
+        await window.UchiQA.saveAttempt(window.UchiQA.buildAttempt({phrase,strokes,startedAt:start,endedAt:at+80,sessionId:session.id,source:'practice',complete:true,reliable:true}));
+      }
+    });
+    await app.getByTestId('filter-slow').click();
+    await app.locator('.slow-pattern').first().waitFor();
+    assert.equal(await app.getByTestId('phrase-row').count(),1);
+    assert.match(await app.getByTestId('phrase-row').innerText(),/テスト用のペアルック/);
+    assert.ok(await app.getByRole('button',{name:/^kkの語句を見る/}).count());
+    await app.screenshot({path:path.join(output,'slow-patterns.png'),fullPage:true});
+  });
+  await run('An automatic score is saved once and appears in growth without manual entry',async()=>{
+    const saved=await app.evaluate(async()=>{
+      const startedAt=Date.now();
+      const session={id:'qa-auto-score',captureId:'qa-capture',startedAt,endedAt:startedAt+120000,source:'capture',scoreType:'profit',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:120000};
+      await window.UchiQA.saveSession(session);
+      const score={score:19740,scoreType:'profit',scoreConfidence:94,scoreObservedAt:startedAt+120000,scoreTotal:29740,scoreProfit:19740,scoreModeSource:'configured'};
+      const first=await window.UchiQA.saveAutomaticScore(session.id,score);
+      const duplicate=await window.UchiQA.saveAutomaticScore(session.id,score);
+      const data=await window.UchiQA.getData();
+      return{first,duplicate,sessions:data.sessions.filter(s=>s.id===session.id)};
+    });
+    assert.equal(saved.first,true);assert.equal(saved.duplicate,false);assert.equal(saved.sessions.length,1);
+    assert.equal(saved.sessions[0].scoreSource,'ocr');assert.equal(saved.sessions[0].score,19740);
+    await app.getByTestId('nav-growth').click();
+    await app.getByRole('button',{name:'19,740円の記録を編集',exact:true}).waitFor();
+    assert.match(await app.locator('.session-score').innerText(),/自動/);
+    assert.match(await app.locator('.growth-stats').innerText(),/19,740/);
+    await app.screenshot({path:path.join(output,'automatic-score.png'),fullPage:true});
   });
   await run('Backup export is available from the real settings UI',async()=>{
     await app.getByTestId('nav-settings').click();
@@ -261,6 +320,11 @@ try {
     await panel.waitForFunction(() => document.querySelector('#root')?.childElementCount > 0);
     assert.ok(await panel.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'sidepanel overflow');
     await panel.screenshot({ path: path.join(output, 'sidepanel-360.png'), fullPage: true });
+    await panel.locator('.panel-nav button').nth(1).click();
+    await panel.getByTestId('filter-slow').click();
+    await panel.locator('.slow-pattern').first().waitFor();
+    assert.ok(await panel.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'word analysis overflow');
+    await panel.screenshot({ path: path.join(output, 'sidepanel-analysis-360.png'), fullPage: true });
     await panel.close();
   });
   await run('No uncaught application exceptions', async () => assert.deepEqual(report.browserErrors, []));

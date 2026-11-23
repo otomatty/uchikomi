@@ -1,6 +1,11 @@
 export type Source = 'capture' | 'practice' | 'manual' | 'demo';
 export interface KeyStroke { key: string; code?: string; at: number; repeat?: boolean; }
 export interface StrokeSample { pattern: string; intervalMs: number; error: boolean; at: number; }
+/** The expected alternatives are captured before feeding the actual key to the local matcher. */
+export interface KeyJudgement {
+ actual:string; expected:string[]; accepted:boolean; position:number; at:number; intervalMs?:number; pattern?:string;
+}
+export interface KeyConfusion { actual:string; expected:string[]; count:number; }
 export interface Phrase {
  id: string; text: string; reading: string; roman: string; source: Source;
  confidence: number; verified: boolean; capturedAt: number; lastSeenAt: number; seenCount: number;
@@ -9,12 +14,17 @@ export interface Phrase {
 export interface Attempt {
  id: string; phraseId: string; sessionId: string; source: Source; startedAt: number; endedAt: number;
  durationMs: number; correctKeys: number; mistakes: number; accuracy: number; kps: number;
- samples: StrokeSample[]; complete: boolean; reliable: boolean; typed: string;
+ samples: StrokeSample[]; complete: boolean; reliable: boolean; typed: string; judgements?:KeyJudgement[];
+ /** Accuracy-mode capture ended on its first rejected key; never implies a complete phrase. */
+ errorTerminated?:boolean;
 }
+export interface ScoreReview { score?:number; scoreType:'profit'|'total'; confidence:number; observedAt:number; evidence?:string; reason:string; }
 export interface Session {
  id: string; startedAt: number; endedAt?: number; source: 'capture'|'practice'|'manual'|'demo';
  score?: number; scoreType: 'profit'|'total'; course: 10000; mode: 'accuracy';
  phraseCount: number; correctKeys: number; mistakes: number; durationMs: number;
+ captureId?:string; scoreSource?:'ocr'|'manual'; scoreConfidence?:number; scoreObservedAt?:number; scoreEvidence?:string; scoreModeSource?:'configured'|'ocr';
+ scoreTotal?:number; scoreProfit?:number; scoreReview?:ScoreReview;
 }
 export interface Rect { x:number; y:number; width:number; height:number; }
 export interface Calibration { japanese:Rect; reading?:Rect; roman:Rect; viewport?:{width:number;height:number}; updatedAt:number; }
@@ -25,11 +35,19 @@ export interface Settings {
 export interface PatternStat {
  pattern:string; count:number; errors:number; errorRate:number; medianMs:number; p90Ms:number;
  previousMedianMs:number|null; improvement:number|null; priority:number; phraseIds:string[]; confidence:'low'|'medium'|'high';
+ meanMs:number|null; timedCount:number; baselineMs:number|null; baselineCount:number; slowdownPct:number|null; lostMs:number; slow:boolean;
+}
+export interface WordStat {
+ phraseId:string; attempts:number; correctKeys:number; mistakes:number; errorRate:number;
+ meanMs:number|null; timedCount:number; baselineMs:number|null; baselineCount:number; slowdownPct:number|null; lostMs:number; slow:boolean;
+ confusions:KeyConfusion[]; slowPatterns:string[];
 }
 export interface CaptureStatus {
  state:'idle'|'starting'|'recording'|'stopping'|'error'; sessionId?:string; tabId?:number; startedAt?:number;
  phraseCount:number; message?:string; ocrReady?:boolean; latestPhrase?:string; lastFrameAt?:number;
  regionState?:'searching'|'locked'|'manual'; regionConfidence?:number; region?:Rect;
+ activeSessionId?:string; latestScore?:{sessionId:string;score:number;scoreType:'profit'|'total';confidence?:number};
+ scoreState?:'watching'|'reading'|'saved'|'review'; scoreReviewSessionId?:string;
 }
 export interface AppData { phrases:Phrase[]; attempts:Attempt[]; sessions:Session[]; settings:Settings; }
 export interface FrameSnapshot { dataUrl:string; width:number; height:number; at:number; }

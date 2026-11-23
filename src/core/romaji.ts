@@ -99,6 +99,7 @@ export interface MatchResult { accepted:boolean; complete:boolean; position:numb
 export interface RomanMatcher {
   feed(key:string):MatchResult; reset():void;
   readonly typed:string; readonly display:string; readonly complete:boolean; readonly position:number;
+  readonly expectedKeys:string[];
 }
 export function createMatcher(reading:string, fallbackRoman:string):RomanMatcher {
   const fallback=normalizeRoman(fallbackRoman);
@@ -122,6 +123,12 @@ export function createMatcher(reading:string, fallbackRoman:string):RomanMatcher
     let rest:string|null=null;for(const state of active){const s=shortest(state);if(s!==null&&(rest===null||s.length<rest.length))rest=s;}
     return typed+(rest??'');
   };
+  const expectedKeys=()=>{
+    if(active.has(end))return [];
+    const preferred=display()[typed.length];
+    const keys=[...new Set([...active].flatMap(state=>[...nodes[state].keys()]))];
+    return keys.sort((a,b)=>Number(b===preferred)-Number(a===preferred)||a.localeCompare(b));
+  };
   return {
     feed(key:string):MatchResult {
       const normalized=normalizeRoman(key);
@@ -131,7 +138,7 @@ export function createMatcher(reading:string, fallbackRoman:string):RomanMatcher
       return {accepted,complete:active.has(end),position:typed.length,display:display()};
     },
     reset(){active=new Set([0]);typed='';},
-    get typed(){return typed;},get display(){return display();},get complete(){return active.has(end);},get position(){return typed.length;}
+    get typed(){return typed;},get display(){return display();},get complete(){return active.has(end);},get position(){return typed.length;},get expectedKeys(){return expectedKeys();}
   };
 }
 export function kanaToRoman(kana:string):string {
