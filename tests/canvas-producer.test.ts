@@ -14,6 +14,7 @@ function fixture() {
   const image = document.createElement('canvas');
   const callbacks = new Map<number, (now: number, metadata: any) => void>();
   const intervals = new Map<number, () => void>();
+  const timeouts = new Map<number, () => void>();
   const draws: unknown[][] = [];
   const track = new browser.EventTarget() as any;
   let stopped = 0;
@@ -39,11 +40,14 @@ function fixture() {
   Object.defineProperties(browser, {
     setInterval: { value: (fn: () => void, ms: number) => { assert.equal(ms, 80); const id = ++nextId; intervals.set(id, fn); return id; } },
     clearInterval: { value: (id: number) => intervals.delete(id) },
+    setTimeout: { value: (fn: () => void, ms: number) => { assert.equal(ms, 10000); const id = ++nextId; timeouts.set(id, fn); return id; } },
+    clearTimeout: { value: (id: number) => timeouts.delete(id) },
   });
   return {
-    browser, document, source, video, image, track, draws, callbacks, intervals,
+    browser, document, source, video, image, track, draws, callbacks, intervals, timeouts,
     stopped: () => stopped, paused: () => paused,
     tick() { for (const fn of intervals.values()) fn(); },
+    timeout() { for (const [id, fn] of timeouts) { timeouts.delete(id); fn(); } },
     frame(count: number, now = count * 80) {
       const entry = callbacks.entries().next().value;
       assert.ok(entry);
@@ -91,6 +95,105 @@ test('canvas capture samples only fresh frames, bounds image size and waits for 
   assert.equal(f.callbacks.size, 0);
   assert.equal(f.intervals.size, 0);
   assert.equal(f.video.srcObject, null);
+});
+
+function trackFixture() {
+  const f = fixture();
+  let pending: { resolve: (value: any) => void; reject: (error: unknown) => void } | undefined;
+  let reads = 0, cancelled = 0, released = 0;
+  const reader = {
+    read() { reads++; return new Promise<any>((resolve, reject) => { pending = { resolve, reject }; }); },
+    async cancel() { cancelled++; pending?.resolve({ done: true }); pending = undefined; },
+    releaseLock() { released++; },
+  };
+  Object.defineProperty(f.browser, 'MediaStreamTrackProcessor', { value: class {
+    readable = { getReader: () => reader };
+    constructor(options: any) { assert.equal(options.track, f.track); assert.equal(options.maxBufferSize, 1); }
+  } });
+  return {
+    ...f,
+    reads: () => reads, cancelled: () => cancelled, released: () => released,
+    deliver(timestamp: number) {
+      assert.ok(pending, 'The producer must be waiting for an actual source frame');
+      let closed = 0;
+      const frame = { timestamp, displayWidth: 3840, displayHeight: 3200, close() { closed++; } };
+      const waiting = pending; pending = undefined; waiting.resolve({ value: frame, done: false });
+      return { frame, closed: () => closed };
+    },
+  };
+}
+const settleFrames = async () => { for (let index = 0; index < 8; index++) await Promise.resolve(); };
+
+test('track frames arrive without video playback, close before acknowledgement and reject repeated timestamps', async t => {
+  const f = trackFixture();
+  t.after(() => f.browser.happyDOM.close());
+  const frames: CanvasFrame[] = [];
+  let acknowledge!: () => void;
+  const producer = createCanvasProducer(f.source as any, {
+    onFrame(frame) { frames.push(frame); return new Promise(resolve => { acknowledge = resolve; }); },
+    onError(error) { throw error; },
+  });
+  t.after(() => producer.stop());
+  await producer.ready;
+  assert.equal(f.reads(), 1); assert.equal(f.callbacks.size, 0); assert.equal(f.intervals.size, 0);
+  assert.equal(f.document.body.children.length, 1, 'No media element or overlay is added to the game');
+  assert.equal(f.video.srcObject, null, 'The track processor does not require playback');
+  const first = f.deliver(100000); await settleFrames();
+  assert.equal(frames.length, 1); assert.equal(first.closed(), 1, 'Release the VideoFrame before waiting for the networkless message');
+  assert.equal(f.draws[0][0], first.frame, 'Encode the received VideoFrame, never the WebGL backbuffer');
+  assert.deepEqual([frames[0].width, frames[0].height], [1728, 1440]);
+  assert.ok(Math.abs(frames[0].at - Date.now()) < 1000);
+  assert.equal(f.reads(), 1, 'Only one JPEG may be in flight');
+  acknowledge(); await settleFrames();
+  assert.equal(f.timeouts.size, 0);
+  const repeated = f.deliver(100000); await settleFrames();
+  assert.equal(repeated.closed(), 1); assert.equal(frames.length, 1, 'A repeated source timestamp is not fresh evidence');
+  const next = f.deliver(180000); await settleFrames();
+  assert.equal(next.closed(), 1); assert.equal(frames.length, 2); assert.equal(frames[1].sequence, 2);
+  acknowledge(); await settleFrames();
+  producer.stop(); producer.stop(); await settleFrames();
+  assert.equal(f.cancelled(), 1); assert.equal(f.released(), 1); assert.equal(f.stopped(), 1);
+  assert.equal(f.paused(), 0);
+});
+
+test('stopping a pending track read closes a late frame without sending it', async t => {
+  const f = trackFixture(); t.after(() => f.browser.happyDOM.close());
+  const frames: CanvasFrame[] = [];
+  const producer = createCanvasProducer(f.source as any, { async onFrame(frame) { frames.push(frame); }, onError(error) { throw error; } });
+  await producer.ready;
+  const late = f.deliver(100000);
+  producer.stop(); await settleFrames();
+  assert.equal(late.closed(), 1); assert.equal(frames.length, 0);
+  assert.equal(f.cancelled(), 1); assert.equal(f.released(), 1); assert.equal(f.stopped(), 1);
+});
+
+test('a failed frame acknowledgement releases the reader and reports the failure once', async t => {
+  const f = trackFixture(); t.after(() => f.browser.happyDOM.close());
+  const errors: Error[] = [];
+  const producer = createCanvasProducer(f.source as any, {
+    async onFrame() { throw new Error('Offscreen unavailable'); }, onError(error) { errors.push(error); },
+  });
+  await producer.ready;
+  const frame = f.deliver(100000); await settleFrames();
+  assert.equal(frame.closed(), 1); assert.equal(errors.length, 1); assert.equal(errors[0].message, 'Offscreen unavailable');
+  assert.equal(f.cancelled(), 1); assert.equal(f.released(), 1); assert.equal(f.stopped(), 1);
+});
+
+test('a suspended video or a silent source times out, and stopping cancels pending startup', async t => {
+  for (const processor of [false, true]) {
+    const f = processor ? trackFixture() : fixture(); t.after(() => f.browser.happyDOM.close());
+    const errors: Error[] = [];
+    const producer = createCanvasProducer(f.source as any, { async onFrame() {}, onError(error) { errors.push(error); } });
+    await producer.ready;
+    f.timeout(); await settleFrames();
+    assert.equal(errors.length, 1); assert.match(errors[0].message, /ゲーム画面を読み取れません/);
+    assert.equal(f.stopped(), 1); assert.equal(f.timeouts.size, 0);
+  }
+  const f = fixture(); t.after(() => f.browser.happyDOM.close());
+  Object.defineProperty(f.video, 'play', { value: () => new Promise(() => {}) });
+  const producer = createCanvasProducer(f.source as any, { async onFrame() {}, onError(error) { throw error; } });
+  producer.stop(); await producer.ready;
+  assert.equal(f.stopped(), 1); assert.equal(f.timeouts.size, 0);
 });
 
 test('a muted canvas or lost WebGL context stops capture once without changing the game', async t => {

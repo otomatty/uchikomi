@@ -1,5 +1,6 @@
 import { PSM, type Worker as OcrWorker } from 'tesseract.js';
 import { saveAttempt, savePhrase, saveSession } from '../core/db';
+import { TrainingActivity } from '../core/activity';
 import type { Calibration, CaptureStatus, KeyStroke, Phrase, Rect, Session, Settings } from '../core/types';
 import { EMPTY_CAPTURE } from '../core/types';
 import { isCalibration, MAX_CANDIDATES, MAX_KEY_BUFFER, normalizeJapanese, normalizeOcrRoman, pixelRect, preprocessOcrPixels, SAMPLE_MS, unionRects, validJapanese, validRoman } from './helpers';
@@ -16,7 +17,13 @@ interface CanvasFrame {
   dataUrl: string; width: number; height: number; at: number; sequence: number;
 }
 
+interface ActivityWindow { from: number; through: number; until?: number; }
+interface ActivityOccurrence { id: string; from: number; until?: number; counted?: boolean; }
 interface CaptureGame {
+  activity: TrainingActivity; activityWindows: ActivityWindow[]; activityWindow?: ActivityWindow;
+  activityLastWindow?: ActivityWindow; activityResumeAfter: number;
+  activityKeys: Set<string>; activityStrokes: KeyStroke[]; activityOccurrences: ActivityOccurrence[];
+  activityRevision: number; savedActivityRevision: number; activityCheckpoint?: Promise<void>;
   session: Session; writes: Promise<void>; observedPrompt: boolean; resultSeen: boolean; scoreSaved: boolean;
   reader: ResultFrameSequence; lastResult?: { parsed: ParsedScore; at: number; evidence: string };
 }
@@ -28,6 +35,7 @@ interface ResultCandidate {
 interface Candidate {
   game: CaptureGame;
   precedingBoundary?: CompletionBoundary; completionBoundary: CompletionBoundary;
+  activityOccurrence?: ActivityOccurrence;
   id: number; at: number; endedAt?: number;
   japanese: HTMLCanvasElement; reading?: HTMLCanvasElement; roman: HTMLCanvasElement;
   screenshot: string; signature: Uint8Array; phrase?: Phrase;
@@ -56,7 +64,9 @@ let initializing: Promise<void> | null = null;
 let initializationController: AbortController | null = null;
 let sampleTimer: ReturnType<typeof setInterval> | undefined;
 let heartbeat: ReturnType<typeof setInterval> | undefined;
+let activityTimer: ReturnType<typeof setInterval> | undefined;
 let keyBuffer: KeyStroke[] = [];
+let seenKeyEvents = new Set<string>();
 let focusGaps: number[] = [];
 let queue: Candidate[] = [];
 let scoreQueue: ResultCandidate[] = [];
@@ -104,9 +114,13 @@ function announce(patch: Partial<CaptureStatus> = {}) {
 function makeGame(at: number, id: string = crypto.randomUUID()): CaptureGame {
   const data: Session = {
     id, captureId: status.sessionId, startedAt: at, source: 'capture', scoreType: 'total',
-    course: 10000, mode: 'accuracy', phraseCount: 0, correctKeys: 0, mistakes: 0, durationMs: 0,
+    course: 10000, mode: 'accuracy', phraseCount: 0, correctKeys: 0, mistakes: 0, durationMs: 0, activity: [],
   };
-  const game: CaptureGame = { session: data, writes: saveSession(data), observedPrompt: false, resultSeen: false, scoreSaved: false, reader: new ResultFrameSequence() };
+  const game: CaptureGame = {
+    session: data, writes: saveSession(data), observedPrompt: false, resultSeen: false, scoreSaved: false, reader: new ResultFrameSequence(),
+    activity: new TrainingActivity(), activityWindows: [], activityResumeAfter: 0, activityKeys: new Set(), activityStrokes: [], activityOccurrences: [],
+    activityRevision: 0, savedActivityRevision: 0,
+  };
   // Every queued OCR job keeps its own game, so a quick retry cannot attach an
   // old phrase or result to the next game in the same continuous recording.
   games.push(game); activeGame = game; session = data;
@@ -115,8 +129,61 @@ function makeGame(at: number, id: string = crypto.randomUUID()): CaptureGame {
   return game;
 }
 function persistGame(game: CaptureGame): Promise<void> {
-  game.writes = game.writes.catch(() => {}).then(() => saveSession(game.session));
+  game.writes = game.writes.catch(() => {}).then(async () => {
+    const revision = game.activityRevision;
+    game.session.activity = game.activity.snapshot();
+    await saveSession(game.session);
+    game.savedActivityRevision = Math.max(game.savedActivityRevision, revision);
+  });
   return game.writes;
+}
+function physicalKeyId(key: KeyStroke): string { return `${key.at}\0${key.code ?? ''}\0${key.key.toLowerCase()}`; }
+function recordActivityOccurrence(game: CaptureGame, occurrence: ActivityOccurrence) {
+  if (occurrence.counted) return;
+  const key = game.activityStrokes.find(stroke => stroke.at >= occurrence.from && (occurrence.until === undefined || stroke.at < occurrence.until));
+  if (!key) return;
+  game.activity.recordPhrase(occurrence.id, key.at); occurrence.counted = true; game.activityRevision++;
+}
+function recordObservedActivity(game: CaptureGame, keys = keyBuffer) {
+  // A buffered key contributes only after an actual prompt frame has confirmed
+  // its time window. Start-menu/result keys outside that window stay excluded.
+  const pending = keys.filter(key => key.at >= game.session.startedAt && !game.activityKeys.has(physicalKeyId(key))).sort((a, b) => a.at - b.at);
+  for (const key of pending) {
+    const window = game.activityWindows.find(value => key.at >= value.from && key.at <= value.through && (value.until === undefined || key.at < value.until));
+    if (!window) continue;
+    if (game.activityLastWindow !== window) game.activity.break();
+    game.activityLastWindow = window;
+    game.activity.recordKey(key.at); game.activityKeys.add(physicalKeyId(key)); game.activityStrokes.push(key); game.activityRevision++;
+    const occurrence = game.activityOccurrences.find(value => key.at >= value.from && (value.until === undefined || key.at < value.until));
+    if (occurrence) recordActivityOccurrence(game, occurrence);
+  }
+}
+function confirmActivityPrompt(game: CaptureGame, at: number) {
+  if (game.resultSeen || at < game.activityResumeAfter) return;
+  if (!game.activityWindow) {
+    game.activityWindow = { from: at, through: at };
+    game.activityWindows.push(game.activityWindow);
+  } else game.activityWindow.through = Math.max(game.activityWindow.through, at);
+  recordObservedActivity(game);
+}
+function breakActivity(game: CaptureGame | null, at: number) {
+  if (!game) return;
+  if (game.activityWindow) {
+    game.activityWindow.until = at;
+    game.activityWindow.through = Math.min(game.activityWindow.through, at);
+    game.activityWindow = undefined;
+  }
+  game.activityResumeAfter = Math.max(game.activityResumeAfter, at);
+  game.activityLastWindow = undefined;
+  game.activity.break();
+}
+function checkpointActivity() {
+  for (const game of games) {
+    if (game.activityRevision <= game.savedActivityRevision || game.activityCheckpoint) continue;
+    const task = persistGame(game).catch(reportError);
+    game.activityCheckpoint = task;
+    void task.finally(() => { if (game.activityCheckpoint === task) game.activityCheckpoint = undefined; });
+  }
 }
 function observePrompt(at: number) {
   if (!activeGame || activeGame.resultSeen) {
@@ -129,6 +196,7 @@ function observePrompt(at: number) {
     }
   }
   activeGame!.observedPrompt = true;
+  confirmActivityPrompt(activeGame!, at);
 }
 function crop(rect: Rect, upscale = false): HTMLCanvasElement {
   const frame = frameSurface();
@@ -207,6 +275,7 @@ async function finalizeCandidate(candidate: Candidate) {
 }
 function endCurrent(at: number, observedExit = true) {
   if (!currentCandidate || !closeObservedBoundary(currentCandidate, at, observedExit)) return;
+  if (currentCandidate.activityOccurrence) currentCandidate.activityOccurrence.until = at;
   if (currentCandidate.processed) {
     const write = finalizeCandidate(currentCandidate).catch(reportError);
     pendingWrites.add(write);
@@ -214,6 +283,7 @@ function endCurrent(at: number, observedExit = true) {
   }
 }
 function resetAutoRegions(at: number, publish = true, confirmedResult = false) {
+  breakActivity(activeGame, at);
   // An unknown loss makes the attempt's end uncertain. A detected receipt is
   // an observed game-end transition and retains the final phrase's boundary.
   endCurrent(at, confirmedResult);
@@ -276,10 +346,13 @@ function candidateFromFrame(at: number, signature: Uint8Array, reliableBoundary:
   const c = calibration!;
   const bounds = unionRects([c.japanese, c.roman, ...(c.reading ? [c.reading] : [])]);
   const evidence = crop(bounds);
+  const id = ++sequence, activityOccurrence = { id: `${activeGame!.session.id}:${id}`, from: at };
+  activeGame!.activityOccurrences.push(activityOccurrence);
+  recordActivityOccurrence(activeGame!, activityOccurrence);
   return {
     game: activeGame!, completionBoundary: createCompletionBoundary(),
     precedingBoundary: reliableBoundary && currentCandidate?.game === activeGame ? currentCandidate.completionBoundary : undefined,
-    id: ++sequence, at, japanese: crop(c.japanese, true), reading: c.reading ? crop(c.reading, true) : undefined,
+    id, at, activityOccurrence, japanese: crop(c.japanese, true), reading: c.reading ? crop(c.reading, true) : undefined,
     roman: crop(c.roman, true), screenshot: evidence.toDataURL('image/jpeg', .84), signature,
     processed: false, finalized: false, reliableBoundary, observationReliable: false,
   };
@@ -301,6 +374,7 @@ function sampleFrame(now = Date.now()) {
   const { bytes, ink } = imageSignature(calibration.japanese);
   if (ink < .006 || ink > .85) {
     if (collectResultFrame(now, true)) return;
+    breakActivity(activeGame, now);
     currentCandidate?.completionBoundary.settle(null);
     endCurrent(now, false);
     promptSignatures.reset();
@@ -612,7 +686,7 @@ async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; ta
   // Stored rectangles belong to an old viewport. Automatic detection is the
   // default for every session; a manual override is applied only on request.
   calibration = undefined; manualRegions = false; detectedRegions = null; lastRegionScan = 0;
-  keyBuffer = []; focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
+  keyBuffer = []; seenKeyEvents = new Set(); focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
   games = []; activeGame = null; session = null; lastResultScan = 0;
   promptSignatures.reset(); sequence = 0;
   lastCanvasAt = 0; lastCanvasSequence = lastCanvasResultSequence = -1; lastCanvasResultFound = false;
@@ -645,6 +719,7 @@ async function start(message: { source?: 'canvas' | 'tab'; streamId?: string; ta
     // External frames are sampled exactly once, on arrival with their capture
     // timestamp. An interval would turn one stale image into repeated evidence.
     if (source === 'tab') sampleTimer = setInterval(sampleFrame, SAMPLE_MS);
+    activityTimer = setInterval(checkpointActivity, 5000);
     heartbeat = setInterval(() => {
       if (status.startedAt && Date.now() - status.startedAt > 60 * 60 * 1000) { void stop(); return; }
       if (status.state === 'recording') announce();
@@ -681,8 +756,11 @@ async function finishStop() {
   stopped = true;
   if (sampleTimer) clearInterval(sampleTimer);
   if (heartbeat) clearInterval(heartbeat);
-  sampleTimer = heartbeat = undefined;
+  if (activityTimer) clearInterval(activityTimer);
+  sampleTimer = heartbeat = activityTimer = undefined;
   const endedAt = Date.now();
+  breakActivity(activeGame, endedAt);
+  for (const game of games) recordObservedActivity(game);
   endCurrent(endedAt);
   announce({ state: 'stopping', message: '最後のお題を保存しています' });
   // Stop the media tracks immediately; only already-cropped text awaits OCR.
@@ -715,7 +793,7 @@ async function finishStop() {
   generation++;
   await Promise.all([jpWorker?.terminate(), romanWorker?.terminate()]);
   jpWorker = romanWorker = null; initializing = null;
-  keyBuffer = []; focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
+  keyBuffer = []; seenKeyEvents.clear(); focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
   calibration = undefined; detectedRegions = null; manualRegions = false;
   announce({ state: 'idle', ocrReady: false, regionState: undefined, regionConfidence: undefined, region: undefined, message: captureWarning });
   return { ok: true, status, sessionId: session?.id };
@@ -739,7 +817,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'UCHI_OFF_FRAME': sendResponse(snapshot()); return;
     case 'UCHI_OFF_KEYS':
       if (message.sessionId === status.sessionId && Array.isArray(message.keys) && (status.state === 'recording' || status.state === 'stopping')) {
-        keyBuffer.push(...message.keys);
+        const fresh: KeyStroke[] = [];
+        for (const key of message.keys as KeyStroke[]) {
+          if (!key || typeof key.key !== 'string' || key.key.length !== 1 || !Number.isFinite(key.at)) continue;
+          const id = physicalKeyId(key);
+          if (seenKeyEvents.has(id)) continue;
+          seenKeyEvents.add(id); fresh.push(key);
+        }
+        keyBuffer.push(...fresh);
+        for (const game of games) recordObservedActivity(game, fresh);
         if (keyBuffer.length > MAX_KEY_BUFFER) {
           keyBuffer.splice(0, keyBuffer.length - MAX_KEY_BUFFER);
           for (const candidate of queue) { candidate.reliableBoundary = false; candidate.completionBoundary.settle(null); }
@@ -756,6 +842,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'UCHI_OFF_GAP':
       if (message.sessionId === status.sessionId && ['recording', 'stopping'].includes(status.state) && Number.isFinite(message.at)) {
         focusGaps.push(message.at);
+        breakActivity(activeGame, message.at);
         if (currentCandidate && message.at >= currentCandidate.at && (!currentCandidate.endedAt || message.at < currentCandidate.endedAt)) {
           currentCandidate.completionBoundary.settle(null);
         }

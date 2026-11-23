@@ -5,6 +5,7 @@ import { Window } from 'happy-dom';
 import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb';
 import type { Phrase } from '../src/core/types';
 import { buildAttempt } from '../src/core/analytics';
+import { trainingDateKey } from '../src/core/activity';
 
 const browserWindow=new Window({url:'https://uchikomi.test/index.html',width:1440,height:1000});
 const define=(name:string,value:unknown)=>Object.defineProperty(globalThis,name,{configurable:true,writable:true,value});
@@ -94,6 +95,35 @@ test('UI first run contains no invented history or vocabulary',async()=>{
   assert.equal(data.phrases.length,0);assert.equal(data.sessions.length,0);assert.equal(data.attempts.length,0);
   assert.match(document.body.textContent??'',/30,000/);assert.match(document.body.textContent??'',/開始時の目安/);
   await navigateWords();assert.equal(document.querySelectorAll('[data-testid="phrase-row"]').length,0);
+});
+
+test('daily training shows real per-day volume, zero days, older estimates and source breakdowns',async()=>{
+  const today=trainingDateKey(Date.now()),yesterday=trainingDateKey(Date.now()-86400000);
+  const at=Date.parse(`${today}T10:00:00+09:00`);
+  const base={startedAt:at,endedAt:at+120000,scoreType:'total' as const,course:10000 as const,mode:'accuracy' as const,phraseCount:0,correctKeys:0,mistakes:0,durationMs:0};
+  await db.saveSession({...base,id:'daily-capture',source:'capture',activity:[{date:today,activeMs:45000,keys:30,phrases:2}]});
+  await db.saveSession({...base,id:'daily-practice',source:'practice',activity:[{date:today,activeMs:20000,keys:14,phrases:1}]});
+  await db.saveSession({...base,id:'daily-legacy',source:'practice',startedAt:at-86400000,endedAt:at-86400000+10000,durationMs:10000,correctKeys:9,mistakes:1,phraseCount:1});
+  await db.saveSession({...base,id:'daily-score-only',source:'manual',score:30000,phraseCount:999,correctKeys:999,durationMs:999000});
+  await mount();await click(query('[data-testid="nav-growth"]'));
+  assert.equal(query('[data-testid="daily-keys"]').textContent,'44打鍵');
+  assert.equal(query('[data-testid="daily-time"]').textContent,'1分5秒');
+  assert.equal(query('[data-testid="daily-phrases"]').textContent,'3語');
+  assert.equal(document.querySelector('[data-testid="daily-estimated"]'),null);
+  assert.match(query('.daily-breakdown').textContent??'',/寿司打1記録/);
+  assert.match(query('.daily-breakdown').textContent??'',/UCHIKOMI 復習1セット/);
+  assert.equal(document.querySelectorAll('.daily-bar').length,7);
+  await input(query<HTMLInputElement>('input[aria-label="練習量を表示する日"]'),yesterday);
+  assert.equal(query('[data-testid="daily-keys"]').textContent,'10打鍵');
+  assert.equal(query('[data-testid="daily-time"]').textContent,'10秒');
+  assert.match(query('[data-testid="daily-estimated"]').textContent??'',/概算/);
+  await click(button('30日'));assert.equal(document.querySelectorAll('.daily-bar').length,30);
+  await input(query<HTMLInputElement>('input[aria-label="練習量を表示する日"]'),trainingDateKey(Date.now()-60*86400000));
+  assert.equal(query('[data-testid="daily-keys"]').textContent,'0打鍵');
+  assert.match(query('.daily-empty').textContent??'',/この日の練習記録はありません/);
+  await click(button('今日へ戻る'));
+  assert.equal(query<HTMLInputElement>('input[aria-label="練習量を表示する日"]').value,today);
+  assert.equal(query('[data-testid="daily-keys"]').textContent,'44打鍵');
 });
 
 test('phrase form rejects conflicting reading, and duplicate save-to-practice uses canonical ID',async()=>{

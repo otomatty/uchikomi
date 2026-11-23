@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import { transform } from 'esbuild';
 import * as db from '../src/core/db';
 import { DEFAULT_SETTINGS } from '../src/core/types';
+import { dailyTraining } from '../src/core/activity';
 
 const nativeChannel = globalThis.BroadcastChannel;
 (globalThis as any).BroadcastChannel = undefined;
@@ -204,7 +205,7 @@ test('canvas start needs no tab stream, starts no image timer, and leaves no emp
   await app.start(canvasStart);
   assert.equal(app.mediaCalls(), 0);
   assert.equal(app.evaluate('status.source'), 'canvas');
-  assert.deepEqual([...app.intervals.values()].map(item => item.delay), [15000]);
+  assert.deepEqual([...app.intervals.values()].map(item => item.delay), [5000, 15000]);
   assert.equal((await db.getData()).sessions.length, 0);
   assert.equal((await app.request('UCHI_OFF_FRAME')).ok, false);
   assert.equal((await app.request('UCHI_OFF_START', { ...canvasStart, tabId: 1, sessionId: 'duplicate' })).ok, false);
@@ -402,4 +403,122 @@ test('a canvas frame gap requires two fresh receipt observations before saving',
   for (let i = 0; i < 15; i++) await run.send();
   assert.equal((await db.getData()).sessions[0].score, 29740);
   assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+
+async function activityFixture(base = Date.parse('2026-12-24T14:59:59.000Z')) {
+  let now = base, sequence = 0;
+  const scene = { prompt: false, receipt: false };
+  // Real prompt geometry is enough to retain physical volume even when text
+  // recognition never produces a usable phrase or an accurate speed result.
+  const worker = () => ({ async setParameters() {}, async terminate() {}, async recognize() { return { data: { text: '?', confidence: 10 } }; } });
+  const app = await fixture(async () => [worker(), worker()], undefined, { scene, clock: () => now });
+  await app.start(canvasStart); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.evaluate('status.ocrReady'), true);
+  const keys = async (values: [number, string][]) => {
+    const strokes = values.map(([offset, key]) => ({ key, code: key === ' ' ? 'Space' : `Key${key.toUpperCase()}`, at: base + offset }));
+    now = Math.max(now, ...strokes.map(stroke => stroke.at));
+    await app.request('UCHI_OFF_KEYS', { sessionId: 'startup-test', keys: strokes });
+  };
+  const observed = async (offset: number) => {
+    now = base + offset;
+    assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, ++sequence) })).ok, true);
+    await app.evaluate('processQueue()');
+  };
+  const checkpoint = async () => {
+    for (const timer of app.intervals.values()) if (timer.delay === 5000) timer.callback();
+    await app.evaluate('Promise.all(games.map(game => game.writes))');
+  };
+  const gap = async (type: 'UCHI_OFF_GAP' | 'UCHI_OFF_VIEW_CHANGE', offset: number) => {
+    now = base + offset; await app.request(type, { sessionId: 'startup-test', at: now });
+  };
+  return { app, scene, keys, observed, checkpoint, gap, base };
+}
+
+test('capture checkpoints retain uncertain physical input across JST days without menu keys or duplicate batches', async () => {
+  const run = await activityFixture();
+  await run.keys([[20, ' ']]); await run.observed(80);
+  assert.equal((await db.getData()).sessions.length, 0);
+  run.scene.prompt = true;
+  const typed: [number, string][] = [[350, 'a'], [450, ' '], [750, 'b'], [1050, 'c']];
+  let sent = 0;
+  for (let at = 320; at <= 1280; at += 80) {
+    while (sent < typed.length && typed[sent][0] <= at) { await run.keys([typed[sent]]); sent++; }
+    await run.observed(at);
+  }
+  await run.keys(typed); // Repeated delivery is not another set of physical keys.
+  await run.checkpoint();
+  const measured = [
+    { date: '2026-12-24', activeMs: 650, keys: 3, phrases: 1 },
+    { date: '2026-12-25', activeMs: 50, keys: 1, phrases: 0 },
+  ];
+  let data = await db.getData();
+  assert.deepEqual(data.sessions[0].activity, measured);
+  assert.equal(data.phrases.length, 0); assert.equal(data.attempts.length, 0);
+  assert.equal(data.sessions[0].phraseCount, 0, 'uncertain physical volume does not invent a reliable OCR result');
+  run.scene.prompt = false; run.scene.receipt = true;
+  await run.observed(1520); await run.keys([[1600, ' '], [1700, 'z']]); await run.checkpoint();
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  data = await db.getData(); assert.deepEqual(data.sessions[0].activity, measured);
+  const summary = dailyTraining(data, { today: '2026-12-25', days: 2 });
+  assert.equal(summary.totals.keys, 4); assert.equal(summary.totals.phrases, 1); assert.equal(summary.totals.activeMs, 700);
+  assert.equal(summary.today.keys, 1); assert.equal(summary.totals.estimated, false);
+});
+
+test('each automatically separated game owns its activity and the daily total adds both games once', async () => {
+  const run = await activityFixture(Date.parse('2026-12-25T03:00:00.000Z'));
+  await run.keys([[20, ' ']]); run.scene.prompt = true;
+  for (const at of [80, 160, 240, 320, 400, 480]) {
+    if (at === 160) await run.keys([[100, 'a']]);
+    if (at === 240) await run.keys([[200, 'b']]);
+    await run.observed(at);
+  }
+  run.scene.prompt = false; run.scene.receipt = true; await run.observed(560);
+  await run.keys([[600, ' '], [750, ' ']]);
+  run.scene.prompt = true; run.scene.receipt = false;
+  for (const at of [800, 880, 960, 1040]) {
+    if (at === 880) await run.keys([[820, 'a']]);
+    if (at === 960) await run.keys([[920, 'q']]);
+    await run.observed(at);
+  }
+  run.scene.prompt = false; run.scene.receipt = true; await run.observed(1280);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  const data = await db.getData(); assert.equal(data.sessions.length, 2);
+  assert.equal(data.sessions[0].id, 'startup-test'); assert.notEqual(data.sessions[1].id, data.sessions[0].id);
+  for (const session of data.sessions) assert.deepEqual(session.activity, [{ date: '2026-12-25', activeMs: 100, keys: 2, phrases: 1 }]);
+  assert.equal(data.sessions[0].endedAt, run.base + 560); assert.equal(data.sessions[1].startedAt, run.base + 800);
+  const daily = dailyTraining(data, { today: '2026-12-25', days: 1 });
+  assert.equal(daily.today.captureCount, 2); assert.equal(daily.today.keys, 4); assert.equal(daily.today.phrases, 2); assert.equal(daily.today.activeMs, 200);
+});
+
+test('focus, viewport and missing-frame gaps break capture input time without charging unknown intervals', async () => {
+  const run = await activityFixture(); run.scene.prompt = true;
+  for (const at of [80, 160, 240, 320]) {
+    if (at === 160) await run.keys([[100, 'a']]);
+    if (at === 240) await run.keys([[200, 'b']]);
+    await run.observed(at);
+  }
+  await run.gap('UCHI_OFF_GAP', 330);
+  for (const at of [400, 480, 560, 640, 720, 800]) {
+    if (at === 640) await run.keys([[570, 'c']]);
+    if (at === 720) await run.keys([[670, 'd']]);
+    await run.observed(at);
+  }
+  await run.gap('UCHI_OFF_VIEW_CHANGE', 810);
+  for (const at of [880, 960, 1040, 1120]) {
+    if (at === 960) await run.keys([[900, 'e']]);
+    if (at === 1040) await run.keys([[1000, 'f']]);
+    await run.observed(at);
+  }
+  await run.keys([[1300, 'x']]); // The prompt was not observed during this gap.
+  for (const at of [1520, 1600, 1680, 1760]) {
+    if (at === 1600) await run.keys([[1540, 'g']]);
+    if (at === 1680) await run.keys([[1640, 'h']]);
+    await run.observed(at);
+  }
+  await run.checkpoint();
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+  const rows = (await db.getData()).sessions[0].activity!;
+  assert.equal(rows.reduce((sum, row) => sum + row.keys, 0), 8);
+  assert.equal(rows.reduce((sum, row) => sum + row.activeMs, 0), 400);
 });

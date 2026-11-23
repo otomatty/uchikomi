@@ -23,12 +23,15 @@ export interface Attempt {
  errorTerminated?:boolean;
 }
 export interface ScoreReview { score?:number; scoreType:'total'; confidence:number; observedAt:number; evidence?:string; reason:string; }
+export interface DailyActivity { date:string; activeMs:number; keys:number; phrases:number; }
 export interface Session {
  id: string; startedAt: number; endedAt?: number; source: 'capture'|'practice'|'manual'|'demo';
  score?: number; scoreType: 'total'; course: 10000; mode: 'accuracy';
  phraseCount: number; correctKeys: number; mistakes: number; durationMs: number;
  captureId?:string; scoreSource?:'ocr'|'manual'; scoreConfidence?:number; scoreObservedAt?:number; scoreEvidence?:string; scoreModeSource?:'configured'|'ocr';
  scoreTotal?:number; scoreReview?:ScoreReview;
+ /** Present (including []) for measured activity; absent for legacy records. */
+ activity?:DailyActivity[];
 }
 export interface Rect { x:number; y:number; width:number; height:number; }
 export interface Calibration { japanese:Rect; reading?:Rect; roman:Rect; viewport?:{width:number;height:number}; updatedAt:number; }

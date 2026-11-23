@@ -1,8 +1,9 @@
 import { DEFAULT_SETTINGS } from './types';
-import type { AppData, Attempt, Calibration, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
+import type { AppData, Attempt, Calibration, DailyActivity, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
 import { normalizeRoman } from './romaji';
 import { isErrorTerminatedAttempt } from './analytics';
 import { compatibleAttemptWithPhrase, compatiblePhraseAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
+import { MAX_ACTIVITY_DAYS, MAX_ACTIVITY_KEYS, MAX_ACTIVITY_MS, MAX_ACTIVITY_PHRASES, mergeDailyActivity, validTrainingDate } from './activity';
 const DB_NAME='uchikomi-v1', VERSION=3;
 const STORE_NAMES=['phrases','attempts','sessions','settings','phraseAliases'] as const;
 let database:Promise<IDBDatabase>|undefined;
@@ -175,6 +176,10 @@ export async function saveSession(value:Session):Promise<void> {
   }else if(existing?.scoreReview&&session.score===undefined&&(!session.scoreReview||existing.scoreReview.observedAt>session.scoreReview.observedAt)){
     session.scoreReview=existing.scoreReview;
   }
+  const activity=mergeDailyActivity(existing?.activity,session.activity);
+  if(activity!==undefined){
+    try{session.activity=validateDailyActivity(activity);}catch(error){tx.abort();await done.catch(()=>{});throw error;}
+  }
   store.put(session);await done;notify();
 }
 const scoreFields=['score','scoreType','scoreSource','scoreConfidence','scoreObservedAt','scoreEvidence','scoreModeSource','scoreTotal','scoreReview'] as const;
@@ -266,7 +271,11 @@ export async function importData(value:unknown):Promise<void> {
       const reliable=attempt.reliable&&(before?compatiblePhraseAttempt(before,target,attempt):attempt.phraseId===target.id||compatibleAttemptWithPhrase(target,attempt));
       tx.objectStore('attempts').put({...attempt,phraseId:target.id,reliable});
     }
-    for(const session of imported.sessions)tx.objectStore('sessions').put(session);
+    const previousSessions=new Map(currentSessions.map(session=>[session.id,session]));
+    for(const session of imported.sessions){
+      const activity=mergeDailyActivity(previousSessions.get(session.id)?.activity,session.activity);
+      tx.objectStore('sessions').put(activity===undefined?session:{...session,activity:validateDailyActivity(activity)});
+    }
     tx.objectStore('settings').put(imported.settings,'main');await done;notify();
   }catch(error){try{tx.abort();}catch{}await done.catch(()=>{});throw error;}
 }
@@ -347,6 +356,18 @@ function validateScoreReview(value:unknown):ScoreReview {
 function validateScoreModeSource(value:unknown):'configured'|'ocr' {
   if(value!=='configured'&&value!=='ocr')throw new Error('モードの確認元を確認してください。');return value;
 }
+function validateDailyActivity(value:unknown):DailyActivity[] {
+  const rows=list(value,'日別の練習記録',MAX_ACTIVITY_DAYS).map(value=>{
+    const row=object(value,'日別の練習記録');
+    if(!validTrainingDate(row.date))throw new Error('練習日を確認してください。');
+    const activeMs=number(row.activeMs,'入力時間',0,MAX_ACTIVITY_MS),keys=number(row.keys,'打鍵数',0,MAX_ACTIVITY_KEYS),phrases=number(row.phrases,'出題数',0,MAX_ACTIVITY_PHRASES);
+    if(!Number.isInteger(keys)||!Number.isInteger(phrases))throw new Error('打鍵数・出題数は整数で指定してください。');
+    return {date:row.date,activeMs,keys,phrases};
+  });
+  if(new Set(rows.map(row=>row.date)).size!==rows.length)throw new Error('練習日が重複しています。');
+  if(rows.reduce((sum,row)=>sum+row.activeMs,0)>MAX_ACTIVITY_MS||rows.reduce((sum,row)=>sum+row.keys,0)>MAX_ACTIVITY_KEYS||rows.reduce((sum,row)=>sum+row.phrases,0)>MAX_ACTIVITY_PHRASES)throw new Error('日別の練習記録の合計が上限を超えています。');
+  return rows.sort((a,b)=>a.date.localeCompare(b.date));
+}
 function validateSession(value:unknown):Session {
   const s=object(value,'セッション');if(s.course!==10000||s.mode!=='accuracy')throw new Error('10,000円・正確重視の記録のみ読み込めます。');
   const result:Session={id:identifier(s.id),startedAt:number(s.startedAt,'開始時刻'),source:source(s.source),scoreType:scoreType(s.scoreType),course:10000,mode:'accuracy',phraseCount:number(s.phraseCount,'語句数',0,1000000),correctKeys:number(s.correctKeys,'正しい入力数',0,10000000),mistakes:number(s.mistakes,'ミス数',0,10000000),durationMs:number(s.durationMs,'セッション時間',0,86400000)};
@@ -361,6 +382,7 @@ function validateSession(value:unknown):Session {
   if(s.scoreTotal!==undefined)result.scoreTotal=number(s.scoreTotal,'合計金額',0,10010000);
   if(result.score!==undefined&&result.scoreTotal!==undefined&&result.score!==result.scoreTotal)throw new Error('合計金額が一致しません。');
   if(s.scoreReview!==undefined)result.scoreReview=validateScoreReview(s.scoreReview);
+  if(s.activity!==undefined)result.activity=validateDailyActivity(s.activity);
   return result;
 }
 /** Convert legacy money fields once at the upgrade/import boundary only. */

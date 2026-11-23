@@ -26,6 +26,11 @@ const run = async (name, fn) => {
 try {
   await mkdir(output, { recursive: true });
   await cp(path.join(root, 'dist'), extension, { recursive: true });
+  // Capture counters exist only in this temporary QA copy. The packaged
+  // content script and its browser/media APIs still execute normally.
+  const observerFile = path.join(extension, 'content.js');
+  const diagnostics = await readFile(path.join(root, 'tests/canvas-diagnostics.js'), 'utf8');
+  await writeFile(observerFile, diagnostics + '\n' + await readFile(observerFile, 'utf8'));
   // A blank origin-owned page lets the final regression seed an actual v1 DB
   // before any production module opens it. This exists only in the temp copy.
   await writeFile(path.join(extension,'qa-empty.html'),'<!doctype html><meta charset="utf-8"><title>Database migration fixture</title>');
@@ -265,6 +270,11 @@ try {
     assert.equal(wrong[0].actual,'q');assert.deepEqual(wrong[0].expected,['p']);
     const session=data.sessions.find(s=>s.id===practiced[0].sessionId);
     assert.ok(session?.endedAt);assert.equal(session.phraseCount,5);
+    assert.ok(Array.isArray(session.activity), 'The actual practice must persist measured daily activity');
+    assert.equal(session.activity.reduce((sum, day) => sum + day.keys, 0), 41);
+    assert.equal(session.activity.reduce((sum, day) => sum + day.phrases, 0), 5, 'Repeated words count toward practice volume');
+    assert.ok(session.activity.reduce((sum, day) => sum + day.activeMs, 0) > 0);
+    report.measuredPractice = { sessionId: session.id, activity: session.activity };
     await app.screenshot({ animations: 'disabled',path:path.join(output,'practice-complete.png'),fullPage:true});
   });
   await run('Mistake details show actual keys, correct candidates and per-key history',async()=>{
@@ -563,9 +573,89 @@ try {
       canonicalId: canonical.id, oldIds: duplicateBackup.phrases.map(phrase => phrase.id), keywords: 1, seenCount: 7,
       histories: 2, retainedImages: retainedImages.length, reloads: 1, oldBackupReimports: 1, existingRecordsPreserved: true };
   });
+  await run('Daily training retains measured records and navigates historical days in desktop and 360px layouts', async () => {
+    const fixtures = await app.evaluate(async () => {
+      const dayMs = 86400000, endAt = Date.now() - 36 * dayMs;
+      const dateAt = at => new Date(at + 9 * 3600000).toISOString().slice(0, 10);
+      const sessions = [];
+      for (let i = 0; i < 7; i++) {
+        const date = dateAt(endAt - (6 - i) * dayMs), at = Date.parse(`${date}T10:00:00+09:00`);
+        for (const source of ['capture', 'practice']) {
+          const capture = source === 'capture', factor = i === 6 ? 1 : (i + 2) / 10;
+          const activity = { date, activeMs: Math.round((capture ? 120000 : 45000) * factor),
+            keys: Math.round((capture ? 1200 : 360) * factor), phrases: Math.round((capture ? 24 : 12) * factor) };
+          const session = { id: `qa-daily-${source}-${date}`, startedAt: at, endedAt: at + activity.activeMs,
+            source, scoreType: 'total', course: 10000, mode: 'accuracy', phraseCount: activity.phrases,
+            correctKeys: activity.keys, mistakes: 0, durationMs: activity.activeMs,
+            ...(i === 5 && !capture ? {} : { activity: [activity] }) };
+          await window.UchiQA.saveSession(session); sessions.push(session);
+        }
+      }
+      return { end: dateAt(endAt), previous: dateAt(endAt - dayMs), sessions };
+    });
+    await app.bringToFront();
+    await app.getByTestId('nav-growth').click();
+    const daily = app.getByTestId('daily-training');
+    await daily.locator('input[type=date]').fill(fixtures.end);
+    await app.waitForFunction(() => document.querySelector('[data-testid="daily-keys"]')?.textContent === '1,560打鍵');
+    assert.equal(await daily.getByTestId('daily-time').innerText(), '2分45秒');
+    assert.equal(await daily.getByTestId('daily-phrases').innerText(), '36語');
+    assert.equal(await daily.locator('.daily-bar').count(), 7);
+    assert.match(await daily.locator('.daily-breakdown').innerText(), /寿司打\s*1記録/);
+    assert.match(await daily.locator('.daily-breakdown').innerText(), /UCHIKOMI 復習\s*1セット/);
+    assert.match(await daily.locator('.daily-total').innerText(), /概算を含む/);
+    assert.equal(await daily.getByTestId('daily-estimated').count(), 0, 'Only the historical mixed day is estimated');
+    await daily.locator(`[data-day="${fixtures.end}"]`).focus();
+    await app.keyboard.press('ArrowLeft');
+    assert.equal(await daily.locator('input[type=date]').inputValue(), fixtures.previous);
+    assert.match(await daily.getByTestId('daily-estimated').innerText(), /概算/);
+    await daily.getByRole('button', { name: '30日', exact: true }).click();
+    assert.equal(await daily.locator('.daily-bar').count(), 30);
+    await daily.getByRole('button', { name: '90日', exact: true }).click();
+    assert.equal(await daily.locator('.daily-bar').count(), 90);
+    assert.equal(await daily.locator('input[type=date]').inputValue(), fixtures.previous);
+    await daily.getByRole('button', { name: '次の日', exact: true }).click();
+    await daily.getByRole('button', { name: '7日', exact: true }).click();
+    assert.equal(await daily.locator('input[type=date]').inputValue(), fixtures.end);
+    await app.screenshot({ animations: 'disabled', path: path.join(output, 'daily-training-desktop.png'), fullPage: true });
+    await daily.screenshot({ animations: 'disabled', path: path.join(output, 'daily-training-card.png') });
+
+    const panel = await context.newPage();
+    try {
+      await panel.setViewportSize({ width: 360, height: 900 });
+      await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+      await panel.getByTestId('nav-growth').click();
+      const small = panel.getByTestId('daily-training');
+      await small.locator('input[type=date]').fill(fixtures.end);
+      await panel.waitForFunction(() => document.querySelector('[data-testid="daily-keys"]')?.textContent === '1,560打鍵');
+      await panel.screenshot({ animations: 'disabled', path: path.join(output, 'daily-training-360.png'), fullPage: true });
+      await small.screenshot({ animations: 'disabled', path: path.join(output, 'daily-training-360-card.png') });
+      await small.getByRole('button', { name: '90日', exact: true }).click();
+      assert.equal(await small.locator('.daily-bar').count(), 90);
+      const layout = await panel.evaluate(() => ({ width: innerWidth, documentWidth: document.documentElement.scrollWidth,
+        cardWidth: document.querySelector('.daily-training').clientWidth, contentWidth: document.querySelector('.daily-training').scrollWidth }));
+      assert.ok(layout.documentWidth <= layout.width + 1, `Daily training overflows the side panel: ${JSON.stringify(layout)}`);
+      assert.ok(layout.contentWidth <= layout.cardWidth + 1, `The 90-day chart overflows its card: ${JSON.stringify(layout)}`);
+      await panel.screenshot({ animations: 'disabled', path: path.join(output, 'daily-training-90-days.png'), fullPage: true });
+      await small.getByRole('button', { name: '今日へ戻る', exact: true }).click();
+      const today = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+      assert.equal(await small.locator('input[type=date]').inputValue(), today);
+      report.dailyTraining = { timeZone: 'Asia/Tokyo', historicalDate: fixtures.end, measuredKeys: 1560,
+        measuredActiveMs: 165000, repeatedPhrases: 36, ranges: [7, 30, 90], layout };
+    } finally { await panel.close(); }
+    await app.bringToFront();
+    await app.reload(); await app.getByTestId('app-shell').waitFor();
+    await app.addScriptTag({ url: `chrome-extension://${extensionId}/qa-harness.js` });
+    const saved = await app.evaluate(() => window.UchiQA.getData());
+    for (const expected of fixtures.sessions) assert.deepEqual(saved.sessions.find(value => value.id === expected.id), expected,
+      'Reload must preserve each measured date and the distinct legacy marker');
+    const actualPractice = saved.sessions.find(session => session.id === report.measuredPractice.sessionId);
+    assert.deepEqual(actualPractice.activity, report.measuredPractice.activity, 'Measured practice must survive backup round-trip, DB upgrade and reload');
+  });
   await run('Opening a live WebGL game automatically records, pauses on hide, and respects manual pause', async () => {
     let game, panel;
-    const result = report.automaticCanvas = { preserveDrawingBuffer: false, phases: {} };
+    let observedTabId;
+    const result = report.automaticCanvas = { preserveDrawingBuffer: false, phases: {}, diagnostics: {} };
     const send = type => app.evaluate(type => new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`${type} did not respond within 30 seconds`)), 30000);
       chrome.runtime.sendMessage({ type }).then(reply => { clearTimeout(timer); resolve(reply); }, error => { clearTimeout(timer); reject(error); });
@@ -573,8 +663,34 @@ try {
     const readStatus = async () => {
       const reply = await send('UCHI_STATUS');
       assert.equal(reply?.ok, true, 'The real background status handler failed');
+      if (reply.status?.tabId) observedTabId = reply.status.tabId;
       assert.notEqual(reply.status?.state, 'error', reply.status?.message || 'Automatic capture failed');
       return reply.status;
+    };
+    const diagnose = async label => {
+      const details = result.diagnostics[label] = {};
+      details.status = await send('UCHI_STATUS').catch(error => ({ error: String(error.message || error) }));
+      const tabId = details.status?.status?.tabId ?? observedTabId ?? await app.evaluate(async () => {
+        const tabs = await chrome.tabs.query({ url: 'https://sushida.net/play.html' });
+        return tabs.find(tab => tab.active)?.id ?? tabs[0]?.id;
+      });
+      if (tabId) details.content = await app.evaluate(tabId => chrome.tabs.sendMessage(tabId, { type: 'UCHI_QA_CAPTURE_DIAGNOSTICS' }), tabId)
+        .catch(error => ({ error: String(error.message || error) }));
+      if (game && !game.isClosed()) details.fixture = await game.evaluate(() => ({
+        ready: window.canvasFixture?.ready, frames: window.canvasFixture?.frames, visible: !document.hidden,
+        width: document.querySelector('canvas')?.width, height: document.querySelector('canvas')?.height,
+        trackProcessorAvailable: typeof MediaStreamTrackProcessor === 'function',
+      })).catch(error => ({ error: String(error.message || error) }));
+      // A real offscreen snapshot proves that a message was accepted and its
+      // JPEG decoded, even when no prompt region has been found or published.
+      const snapshot = await send('UCHI_FRAME').catch(error => ({ error: String(error.message || error) }));
+      details.snapshot = { ok: snapshot?.ok, error: snapshot?.error };
+      if (snapshot?.ok && snapshot.frame?.dataUrl?.startsWith('data:image/jpeg;base64,')) {
+        const { dataUrl, ...metadata } = snapshot.frame;
+        details.snapshot = { ok: true, ...metadata, imageCharacters: dataUrl.length };
+        await writeFile(path.join(output, `automatic-${label}-ingested.jpg`), Buffer.from(dataUrl.split(',')[1], 'base64'));
+        details.snapshotRegions = await app.evaluate(image => window.UchiQA.detectPromptFromImage(image), dataUrl);
+      }
     };
     const poll = async (label, read, accept, timeout = 45000) => {
       const deadline = Date.now() + timeout; let last;
@@ -620,6 +736,8 @@ try {
       // evaluate() observes the background extension tab without activating it.
       const first = result.phases.opened = await waitRecording('Automatic canvas recording');
       assert.ok(first.sessionId && first.documentToken);
+      await diagnose('opened');
+      assert.equal(result.diagnostics.opened.snapshot.ok, true, 'Offscreen must have decoded a real canvas frame');
       result.phases.recognized = await poll('The new capture recognizes its first keyword', readStatus,
         state => state.sessionId === first.sessionId && state.phraseCount >= 1 && state.latestPhrase === 'ペアルック', 90000);
       result.phrase = await poll('A real OCR phrase saved to IndexedDB', () => app.evaluate(async startedAt => {
@@ -638,6 +756,13 @@ try {
       assert.equal(firstGame.source, 'capture'); assert.equal(firstGame.scoreType, 'total');
       assert.equal(firstGame.course, 10000); assert.equal(firstGame.mode, 'accuracy');
       result.phases.freshFrames = await poll('Continuing live frames', readStatus, state => state.sessionId === first.sessionId && state.lastFrameAt > first.lastFrameAt);
+      await game.locator('#game').click();
+      await game.keyboard.type('pe ', { delay: 100 });
+      result.measuredActivity = await poll('Physical game keys persist as daily activity', () => app.evaluate(async id => {
+        const data = await window.UchiQA.getData(); return data.sessions.find(session => session.id === id)?.activity ?? null;
+      }, firstGame.id), activity => activity?.reduce((sum, day) => sum + day.keys, 0) === 3, 20000);
+      assert.equal(result.measuredActivity.reduce((sum, day) => sum + day.phrases, 0), 1);
+      assert.ok(result.measuredActivity.reduce((sum, day) => sum + day.activeMs, 0) > 0);
 
       await panel.waitForFunction(() => !!document.querySelector('.capture-dot.on'), null, { polling: 250, timeout: 20000 });
       result.quietIndicator = await panel.evaluate(() => {
@@ -691,6 +816,7 @@ try {
       result.openedWithoutCaptureAction = true;
       result.manualPauseSurvivedVisibilityAndReload = true;
     } catch (error) {
+      await diagnose('failure').catch(diagnosticError => { result.diagnosticError = String(diagnosticError.message || diagnosticError); });
       result.failureStatus = await send('UCHI_STATUS').catch(e => ({ error: String(e.message || e) }));
       if (game && !game.isClosed()) await game.screenshot({ path: path.join(output, 'automatic-webgl-failure.png'), timeout: 5000 }).catch(() => {});
       throw error;
