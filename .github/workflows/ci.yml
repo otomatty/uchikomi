@@ -62,6 +62,8 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - name: Extension UI, OCR worker and automatic region smoke tests
         run: npm run test:browser
+        env:
+          DEBUG: pw:browser
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -16,8 +16,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = path.join(root, 'qa');
 const temp = await mkdtemp(path.join(os.tmpdir(), 'uchikomi-qa-'));
 const extension = path.join(temp, 'extension');
-const report = { startedAt: new Date().toISOString(), fixtureOnly: true, checks: [], errors: [], browserErrors: [] };
-let context;
+const report = { startedAt: new Date().toISOString(), fixtureOnly: true, checks: [], errors: [], browserErrors: [], consoleErrors: [] };
+let context, app, cdp;
 const run = async (name, fn) => {
   try { await fn(); report.checks.push({ name, ok: true }); console.log(`PASS ${name}`); }
   catch (e) { report.checks.push({ name, ok: false, error: String(e.message || e) }); throw e; }
@@ -78,7 +78,10 @@ try {
     ...(process.env.CHROME_BIN ? { executablePath: process.env.CHROME_BIN } : { channel: 'chromium' }),
     headless: process.env.HEADLESS !== '0',
     ignoreDefaultArgs: ['--disable-extensions'],
-    args: ['--no-sandbox', `--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
+    // Chrome's supported extension-testing API needs an explicit opt-in. Playwright
+    // supplies --remote-debugging-pipe itself. This is an isolated, disposable profile.
+    // https://github.com/GoogleChrome/chrome-launcher/blob/main/test/load-extension-test.ts
+    args: ['--no-sandbox', '--enable-unsafe-extension-debugging'],
     viewport: { width: 1440, height: 1000 },
     acceptDownloads: true,
   });
@@ -88,13 +91,43 @@ try {
     if (route.request().url() === 'https://sushida.net/play.html') return route.fulfill({ contentType: 'text/html; charset=utf-8', body: fixture });
     return route.abort('blockedbyclient');
   });
-  const serviceWorker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout: 15000 });
-  const extensionId = new URL(serviceWorker.url()).host;
-  const app = await context.newPage();
-  app.on('pageerror', error => report.browserErrors.push(error.message));
+  context.on('weberror', event => report.browserErrors.push(event.error().message));
+  context.on('console', message => {
+    if (message.type() === 'error') report.consoleErrors.push({ text: message.text().slice(0, 1000), location: message.location() });
+  });
+  const browser = context.browser();
+  assert.ok(browser, 'A Chromium browser is required for extension installation');
+  report.browserVersion = browser.version();
+  cdp = await browser.newBrowserCDPSession();
+  let extensionId;
+  await run('Explicit unpacked-extension installation and enabled status', async () => {
+    // A direct install returns the ID or the actual manifest/install error. We do
+    // not infer installation success from the arrival of a serviceworker event.
+    const installed = await cdp.send('Extensions.loadUnpacked', { path: extension });
+    extensionId = installed.id;
+    assert.match(extensionId, /^[a-p]{32}$/, 'Chrome did not return a valid extension ID');
+    const inventory = await cdp.send('Extensions.getExtensions');
+    report.extensions = inventory.extensions;
+    const loaded = inventory.extensions.find(item => item.id === extensionId);
+    assert.ok(loaded, 'Installed extension is missing from Chrome extension inventory');
+    assert.equal(loaded.enabled, true, 'Chrome installed the extension in a disabled state');
+    assert.equal(loaded.version, manifest.version, 'Installed extension version differs from the build');
+  });
+  app = await context.newPage();
   await app.goto(`chrome-extension://${extensionId}/index.html`);
+  await run('Extension service worker responds through its real runtime message handler', async () => {
+    const reply = await app.evaluate(() => Promise.race([
+      chrome.runtime.sendMessage({ type: 'UCHI_STATUS' }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('UCHI_STATUS did not respond within 10 seconds')), 10000)),
+    ]));
+    assert.equal(reply?.ok, true, 'Background UCHI_STATUS response was not successful');
+    assert.equal(reply.status?.state, 'idle', 'A fresh extension must start with an idle capture');
+    report.backgroundStatus = reply.status;
+    report.serviceWorkerUrls = context.serviceWorkers().map(worker => worker.url());
+  });
   await app.waitForFunction(() => document.querySelector('#root')?.childElementCount > 0);
   await app.addScriptTag({ url: `chrome-extension://${extensionId}/qa-harness.js` });
+  await app.bringToFront();
 
   await run('Initial user data is empty (no synthetic records)', async () => {
     const data = await app.evaluate(() => window.UchiQA.getData());
@@ -174,6 +207,10 @@ try {
     assert.deepEqual(states, [true, true]);
   });
   await run('A selected saved keyword completes a five-word practice through the actual UI', async () => {
+    // Installation opens a welcome tab, and the image fixture opens another tab.
+    // Explicitly restore focus; the product intentionally pauses when focus is lost.
+    await app.bringToFront();
+    await app.waitForFunction(() => !document.hidden && document.hasFocus());
     await app.getByTestId('nav-phrases').click();
     await app.getByRole('button', { name: 'テスト用のペアルックを復習', exact: true }).click();
     await app.getByTestId('practice-start').click();
@@ -205,7 +242,6 @@ try {
   });
   await run('360px side panel renders without horizontal overflow', async () => {
     const panel = await context.newPage();
-    panel.on('pageerror', error => report.browserErrors.push(error.message));
     await panel.setViewportSize({ width: 360, height: 900 });
     await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
     await panel.waitForFunction(() => document.querySelector('#root')?.childElementCount > 0);
@@ -217,9 +253,20 @@ try {
 } catch (e) {
   report.errors.push(String(e.stack || e));
   console.error(e.message || e);
+  if (cdp) {
+    try { report.extensionsAtFailure = (await cdp.send('Extensions.getExtensions')).extensions; }
+    catch (diagnosticError) { report.extensionDiagnosticError = String(diagnosticError.message || diagnosticError); }
+    try { report.targetsAtFailure = (await cdp.send('Target.getTargets')).targetInfos; }
+    catch (diagnosticError) { report.targetDiagnosticError = String(diagnosticError.message || diagnosticError); }
+  }
+  if (context) report.openPagesAtFailure = context.pages().map(page => page.url());
+  if (app && !app.isClosed()) {
+    await app.screenshot({ path: path.join(output, 'failure.png'), fullPage: true, timeout: 5000 }).catch(() => {});
+  }
   process.exitCode = 1;
 } finally {
-  if (context) await context.close();
+  if (cdp) await cdp.detach().catch(() => {});
+  if (context) await context.close().catch(error => report.errors.push(`Browser cleanup: ${error.message || error}`));
   report.completedAt = new Date().toISOString();
   await mkdir(output, { recursive: true });
   await writeFile(path.join(output, 'browser-report.json'), JSON.stringify(report, null, 2));
