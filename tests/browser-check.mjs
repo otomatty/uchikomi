@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { build } from 'esbuild';
+import { configureChromiumDownloads, startChromiumPipe } from './chromium-pipe.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = path.join(root, 'qa');
@@ -21,9 +22,14 @@ const temp = await mkdtemp(path.join(os.tmpdir(), 'uchikomi-qa-'));
 const extension = path.join(temp, 'extension');
 const headless = process.env.HEADLESS === '1';
 const report = { startedAt: new Date().toISOString(), fixtureOnly: true,
-  browserMode: { headless, displayProvided: !!process.env.DISPLAY },
+  browserMode: { headless, displayProvided: !!process.env.DISPLAY, noDefaults: true, transport: 'pipe' },
   checks: [], errors: [], browserErrors: [], consoleErrors: [] };
-let context, app, cdp;
+let context, app, cdp, chromeProcess, connectedBrowser;
+const newQaPage = async () => {
+  const page = await context.newPage();
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  return page;
+};
 const run = async (name, fn) => {
   try { await fn(); report.checks.push({ name, ok: true }); console.log(`PASS ${name}`); }
   catch (e) { report.checks.push({ name, ok: false, error: String(e.message || e) }); throw e; }
@@ -108,21 +114,24 @@ try {
     },
     bundle: true, platform: 'browser', format: 'iife', globalName: 'UchiQA', target: 'es2022', outfile: path.join(extension, 'qa-harness.js'),
   });
-  context = await chromium.launchPersistentContext(path.join(temp, 'profile'), {
-    // Use full Chromium, including when HEADLESS=1 is explicitly requested.
-    // CI runs headed under Xvfb so inactive tabs become genuinely hidden.
-    ...(process.env.CHROME_BIN ? { executablePath: process.env.CHROME_BIN } : { channel: 'chromium' }),
-    headless,
-    ignoreDefaultArgs: ['--disable-extensions'],
-    // Chrome's supported extension-testing API needs an explicit opt-in. Playwright
-    // supplies --remote-debugging-pipe itself. This is an isolated, disposable profile.
-    // https://github.com/GoogleChrome/chrome-launcher/blob/main/test/load-extension-test.ts
-    // Software rendering also exercises an actual WebGL drawing buffer on
-    // GPU-less CI runners; these flags are confined to this disposable browser.
-    args: ['--no-sandbox', '--enable-unsafe-extension-debugging', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
-    viewport: { width: 1440, height: 1000 },
-    acceptDownloads: true,
+  const profileDir = path.join(temp, 'profile'), artifactsDir = path.join(temp, 'downloads');
+  await mkdir(profileDir, { recursive: true });
+  await mkdir(artifactsDir, { recursive: true });
+  // launchPersistentContext enables focus emulation on every page, which keeps
+  // inactive tabs visible even in headed mode. The public pipe transport and
+  // noDefaults option retain Chrome's actual visibility and focus lifecycle.
+  // The same local pipe supports Chrome's explicit extension-testing API.
+  chromeProcess = await startChromiumPipe({
+    executablePath: process.env.CHROME_BIN || chromium.executablePath(), profileDir, headless,
   });
+  // Enable events on the same root pipe Playwright will observe. A separate
+  // attached CDP session would receive download events only for that session.
+  await configureChromiumDownloads(chromeProcess.transport, artifactsDir);
+  connectedBrowser = await chromium.connectOverCDP(chromeProcess.transport, {
+    noDefaults: true, isLocal: true, artifactsDir, timeout: 30000,
+  });
+  context = connectedBrowser.contexts()[0];
+  assert.ok(context, 'The disposable Chrome profile must expose its default context');
   // All website requests are blocked; only the independent local fixture is served.
   const fixture = await readFile(path.join(root, 'tests/capture-fixture.html'), 'utf8');
   let activeFixture = fixture;
@@ -158,7 +167,7 @@ try {
     assert.equal(loaded.enabled, true, 'Chrome installed the extension in a disabled state');
     assert.equal(loaded.version, manifest.version, 'Installed extension version differs from the build');
   });
-  app = await context.newPage();
+  app = await newQaPage();
   await app.goto(`chrome-extension://${extensionId}/index.html`);
   await run('Extension service worker responds through its real runtime message handler', async () => {
     const reply = await app.evaluate(() => Promise.race([
@@ -198,7 +207,7 @@ try {
   });
 
   await run('Automatic prompt bounds from a full browser screenshot, including page margins', async () => {
-    const game = await context.newPage();
+    const game = await newQaPage();
     await game.goto('https://sushida.net/play.html');
     await game.bringToFront();
     await game.evaluate(async () => {
@@ -432,7 +441,7 @@ try {
     }
   });
   await run('360px side panel renders without horizontal overflow', async () => {
-    const panel = await context.newPage();
+    const panel = await newQaPage();
     await panel.setViewportSize({ width: 360, height: 900 });
     await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
     await panel.waitForFunction(() => document.querySelector('#root')?.childElementCount > 0);
@@ -449,7 +458,7 @@ try {
     const original=await app.evaluate(()=>window.UchiQA.getData());
     // Release every origin-owned connection, including Chrome's welcome tab.
     for(const page of context.pages())if(page.url().startsWith(`chrome-extension://${extensionId}/`))await page.close();
-    app=await context.newPage();await app.goto(`chrome-extension://${extensionId}/qa-empty.html`);
+    app=await newQaPage();await app.goto(`chrome-extension://${extensionId}/qa-empty.html`);
     await app.bringToFront();
     const legacy=await app.evaluate(async original=>{
       const data=structuredClone(original),at=Date.now();
@@ -650,7 +659,7 @@ try {
     await app.screenshot({ animations: 'disabled', path: path.join(output, 'daily-training-desktop.png'), fullPage: true });
     await daily.screenshot({ animations: 'disabled', path: path.join(output, 'daily-training-card.png') });
 
-    const panel = await context.newPage();
+    const panel = await newQaPage();
     try {
       await panel.setViewportSize({ width: 360, height: 900 });
       await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
@@ -763,13 +772,13 @@ try {
     try {
       await app.bringToFront();
       await app.getByTestId('nav-dashboard').click();
-      panel = await context.newPage();
+      panel = await newQaPage();
       await panel.setViewportSize({ width: 360, height: 900 });
       await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
       await panel.getByTestId('capture-card').waitFor();
       await app.evaluate(() => window.UchiQA.updateSettings({ autoRecord: true, replayShortcut: 'Escape' }));
       activeFixture = canvasFixture;
-      game = await context.newPage();
+      game = await newQaPage();
       await game.goto('https://sushida.net/play.html');
       await game.bringToFront();
       await game.waitForFunction(() => window.canvasFixture?.ready && window.canvasFixture.frames > 2 && !document.hidden);
@@ -1011,8 +1020,14 @@ try {
   }
   process.exitCode = 1;
 } finally {
-  if (cdp) await cdp.detach().catch(() => {});
-  if (context) await context.close().catch(error => report.errors.push(`Browser cleanup: ${error.message || error}`));
+  if (cdp) await cdp.send('Browser.close', {}, { timeout: 5000 }).catch(() => {});
+  if (connectedBrowser) await connectedBrowser.close().catch(() => {});
+  if (chromeProcess) {
+    await chromeProcess.stop().catch(error => {
+      report.errors.push(`Browser cleanup: ${error.message || error}`); process.exitCode = 1;
+    });
+    report.chromeProcess = chromeProcess.diagnostics();
+  }
   report.completedAt = new Date().toISOString();
   await mkdir(output, { recursive: true });
   await writeFile(path.join(output, 'browser-report.json'), JSON.stringify(report, null, 2));
