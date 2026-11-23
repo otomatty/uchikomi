@@ -1,9 +1,10 @@
 import { signatureDistance } from './helpers';
 import type { CompletionBoundary } from './key-boundary';
-import { StableScoreReader, type ParsedScore, type ScoreType } from './score-parser';
+import { StableScoreReader, type ParsedScore } from './score-parser';
 
 interface PromptTransition {
   interruptedAt?: number;
+  pendingAt?: number;
   candidate?: { at: number; contiguous: boolean };
 }
 
@@ -23,7 +24,7 @@ export class PromptSignatureTracker {
     }
     if (!this.pending) {
       this.pending = { bytes, at };
-      return { interruptedAt };
+      return { interruptedAt, pendingAt: at };
     }
     const candidate = { at: this.pending.at, contiguous: this.last !== null };
     this.last = bytes; this.pending = null;
@@ -52,16 +53,16 @@ export function closeObservedBoundary(candidate: ObservedBoundary, at: number, o
 export class ResultFrameSequence {
   private reader = new StableScoreReader();
   private revision = 0;
-  constructor(private scoreType: ScoreType) {}
   scanned(found: boolean, at: number): number {
     if (!found) {
       this.revision++;
-      this.reader.observe({ kind: 'none', scoreType: this.scoreType, confidence: 0 }, at);
+      this.reader.observe({ kind: 'none', scoreType: 'total', confidence: 0 }, at);
     }
     return this.revision;
   }
+  isCurrent(revision: number): boolean { return revision === this.revision; }
   observe(parsed: ParsedScore, at: number, revision: number): ParsedScore | null {
-    if (revision !== this.revision) return null;
+    if (!this.isCurrent(revision)) return null;
     return this.reader.observe(parsed, at);
   }
 }

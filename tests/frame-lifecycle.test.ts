@@ -68,28 +68,31 @@ test('a confirmed receipt retains the last word, while an unknown disappearance 
   }
 });
 
-const score: ParsedScore = { kind: 'score', scoreType: 'profit', score: 19740, total: 29740, profit: 19740, confidence: 95, fingerprint: 'profit:10000:accuracy:29740:19740' };
+const score: ParsedScore = { kind: 'score', scoreType: 'total', score: 29740, total: 29740, confidence: 95, fingerprint: 'total:10000:accuracy:29740' };
 
 test('an actually scanned blank breaks result agreement, including OCR queued before that blank', () => {
   for (const ocrBeforeBlank of [true, false]) {
-    const frames = new ResultFrameSequence('profit');
+    const frames = new ResultFrameSequence();
     const first = frames.scanned(true, now + 1000);
+    assert.equal(frames.isCurrent(first), true);
     if (ocrBeforeBlank) assert.equal(frames.observe(score, now + 1000, first), null);
     frames.scanned(false, now + 1600);
+    assert.equal(frames.isCurrent(first), false, 'obsolete queued work is visible before running its OCR');
     if (!ocrBeforeBlank) assert.equal(frames.observe(score, now + 1000, first), null);
     const second = frames.scanned(true, now + 2200);
+    assert.equal(frames.isCurrent(second), true);
     assert.equal(frames.observe(score, now + 2200, second), null);
     const third = frames.scanned(true, now + 3400);
-    assert.equal(frames.observe(score, now + 3400, third)?.score, 19740);
+    assert.equal(frames.observe(score, now + 3400, third)?.score, 29740);
   }
 });
 
 test('interval skips supply no new observation and do not reset two real result frames', () => {
-  const frames = new ResultFrameSequence('profit');
+  const frames = new ResultFrameSequence();
   const first = frames.scanned(true, now + 1000);
   assert.equal(frames.observe(score, now + 1000, first), null);
   // The sampling loop makes no scanned() call while its scan interval is closed.
   const second = frames.scanned(true, now + 2200);
   assert.equal(second, first);
-  assert.equal(frames.observe(score, now + 2200, second)?.score, 19740);
+  assert.equal(frames.observe(score, now + 2200, second)?.score, 29740);
 });

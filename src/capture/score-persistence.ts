@@ -8,6 +8,7 @@ interface CaptureScoreResult {
 
 /** Keep database readbacks separate from the session owned by capture writes. */
 export async function saveCaptureScore(session: Session, patch: AutomaticScore): Promise<CaptureScoreResult | null> {
+  if (patch.scoreType !== 'total') throw new Error('スコアは食べた金額の合計で指定してください。');
   const saved = await saveAutomaticScore(session.id, patch);
   let displayed = session;
   if (saved) {
@@ -25,7 +26,7 @@ export async function saveCaptureScore(session: Session, patch: AutomaticScore):
   return {
     saved,
     latestScore: {
-      sessionId: session.id, score: displayed.score, scoreType: displayed.scoreType,
+      sessionId: session.id, score: displayed.score, scoreType: 'total',
       confidence: displayed.scoreConfidence,
     },
   };
