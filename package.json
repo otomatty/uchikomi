@@ -1,0 +1,38 @@
+{
+  "name": "uchikomi",
+  "version": "1.2.2",
+  "private": true,
+  "type": "module",
+  "description": "寿司打の出題を記録し、苦手な組み合わせを復習する個人用Chrome拡張",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "preview": "vite preview --host 0.0.0.0",
+    "test:ocr": "node tests/ocr-check.mjs",
+    "test:browser": "node tests/browser-check.mjs",
+    "test:auto-ocr": "node --import tsx tests/auto-ocr-check.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.577.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "@tesseract.js-data/jpn": "^1.0.0",
+    "@types/chrome": "^0.1.37",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "esbuild": "^0.27.0",
+    "fake-indexeddb": "^6.2.8",
+    "happy-dom": "^21.0.4",
+    "playwright": "^1.65.1",
+    "pngjs": "^7.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2"
+  }
+}

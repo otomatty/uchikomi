@@ -1,0 +1,16 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+const root=process.cwd();
+const target=path.resolve(root,'../deliverables');
+const staging=path.join(target,'UCHIKOMI');
+await fs.rm(staging,{recursive:true,force:true});
+await fs.mkdir(staging,{recursive:true});
+await fs.cp('dist',path.join(staging,'extension'),{recursive:true});
+await fs.copyFile('preview.html',path.join(staging,'UI-preview.html'));
+for(const name of ['START.html','README.md','VALIDATION.md','THIRD_PARTY_NOTICES.txt'])await fs.copyFile(name,path.join(staging,name));
+const source=path.join(staging,'source');await fs.mkdir(source,{recursive:true});
+for(const name of ['src','public','scripts','tests'])await fs.cp(name,path.join(source,name),{recursive:true});
+for(const name of ['package.json','package-lock.json','tsconfig.json','vite.config.ts','index.html','sidepanel.html','offscreen.html','.gitignore','README.md','VALIDATION.md','THIRD_PARTY_NOTICES.txt','START.html'])await fs.copyFile(name,path.join(source,name));
+await fs.copyFile('THIRD_PARTY_NOTICES.txt',path.join(staging,'extension','THIRD_PARTY_NOTICES.txt'));
+await fs.copyFile('preview.html',path.join(target,'UCHIKOMI-preview.html'));
+console.log('Staged files in '+target);

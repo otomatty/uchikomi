@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UCHIKOMI capture fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #e9eceb; color: #24312e; font: 15px system-ui, sans-serif; }
+    header { height: 60px; display: flex; gap: 18px; align-items: center; padding: 0 28px; background: #fff; }
+    header strong { letter-spacing: .1em; }
+    header span { font-size: 12px; color: #61736e; }
+    main { padding: 28px; }
+    canvas { display: block; width: 900px; height: 560px; max-width: 100%; outline-offset: 5px; }
+    nav { display: flex; align-items: center; gap: 12px; margin-top: 18px; }
+    button { border: 1px solid #c6cecb; padding: 10px 16px; border-radius: 8px; background: #fff; color: #24312e; font: inherit; cursor: pointer; }
+    output { margin-left: 12px; font: 13px ui-monospace, monospace; }
+    p { color: #61736e; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header><strong>CAPTURE FIXTURE</strong><span>自動テスト専用の独自画面。寿司打本体・公式の出題データではありません。</span></header>
+  <main>
+    <canvas id="game" width="900" height="560" tabindex="0" aria-label="テスト用タイピング画面"></canvas>
+    <nav><button id="next">次のテスト語句</button><button id="reset">リセット</button><button id="blank">空画面</button><output id="state" aria-live="polite"></output></nav>
+    <p>キャンバスをクリックしてローマ字入力。画面の完了色・誤入力・語句切替を検証します。</p>
+  </main>
+  <script>
+    (() => {
+      const phrases = [
+        { text: 'ペアルック', reading: 'ぺあるっく', roman: 'pearukku' },
+        { text: '写真を撮る', reading: 'しゃしんをとる', roman: 'syasinwotoru' },
+        { text: '週末の予定', reading: 'しゅうまつのよてい', roman: 'syuumatunoyotei' },
+        { text: 'テスト用の単語', reading: 'てすとようのたんご', roman: 'tesutoyounotango' },
+      ];
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+      let index = 0, position = 0, mistakes = 0, blank = false, completeAt = null;
+      const paint = () => {
+        // A distinct coloured backdrop is part of this white-border prompt fixture.
+        // An almost-white backdrop joins the border into one viewport-wide white rail.
+        ctx.fillStyle = '#597763'; ctx.fillRect(0, 0, 900, 560);
+        ctx.fillStyle = '#87987d'; ctx.fillRect(0, 410, 900, 150);
+        ctx.fillStyle = '#fff'; ctx.font = '16px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText('TEST FIXTURE', 32, 40);
+        ctx.textAlign = 'right'; ctx.fillText('10,000 / 正確重視（テスト表示）', 868, 40);
+        if (!blank) {
+          const p = phrases[index];
+          ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.roundRect(150, 190, 600, 172, 16); ctx.fill();
+          ctx.fillStyle = '#231f15'; ctx.beginPath(); ctx.roundRect(157, 197, 586, 158, 9); ctx.fill();
+          ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+          ctx.font = '22px "Noto Sans CJK JP", "Noto Sans JP", sans-serif'; ctx.fillText(p.reading, 450, 231);
+          ctx.font = '34px "Noto Sans CJK JP", "Noto Sans JP", sans-serif'; ctx.fillText(p.text, 450, 275);
+          ctx.font = 'bold 32px monospace'; ctx.textAlign = 'left';
+          const width = ctx.measureText(p.roman).width, start = (900 - width) / 2;
+          ctx.fillStyle = '#fff'; ctx.fillText(p.roman, start, 328);
+          ctx.fillStyle = '#ef4130'; ctx.fillText(p.roman.slice(0, position), start, 328);
+          ctx.fillStyle = '#64766b'; ctx.textAlign = 'center'; ctx.font = '18px sans-serif';
+          ctx.fillText(position === p.roman.length ? '入力完了' : '画面をクリックして入力', 450, 490);
+        }
+        document.getElementById('state').textContent = `fixture=${index} position=${position} errors=${mistakes} blank=${blank}`;
+      };
+      const select = (i) => { index = ((i % phrases.length) + phrases.length) % phrases.length; position = 0; mistakes = 0; blank = false; completeAt = null; paint(); };
+      canvas.addEventListener('keydown', e => {
+        if (e.ctrlKey || e.altKey || e.metaKey || e.repeat || e.key.length !== 1 || blank) return;
+        const p = phrases[index]; if (position >= p.roman.length) return;
+        if (e.key.toLowerCase() === p.roman[position]) position++; else mistakes++;
+        if (position === p.roman.length) completeAt = Date.now();
+        e.preventDefault(); paint();
+      });
+      document.getElementById('next').onclick = () => { select(index + 1); canvas.focus(); };
+      document.getElementById('reset').onclick = () => { select(index); canvas.focus(); };
+      document.getElementById('blank').onclick = () => { blank = !blank; paint(); canvas.focus(); };
+      window.fixture = {
+        phrases, select, canvas, repaint: paint,
+        get state() { return { index, position, mistakes, blank, completeAt }; },
+        get calibration() {
+          const r = canvas.getBoundingClientRect(), sx = r.width / 900, sy = r.height / 560;
+          const rect = (x, y, width, height) => ({ x: (r.x + x * sx) / innerWidth, y: (r.y + y * sy) / innerHeight, width: width * sx / innerWidth, height: height * sy / innerHeight });
+          return { japanese: rect(166, 241, 568, 48), reading: rect(166, 204, 568, 36), roman: rect(166, 291, 568, 57), viewport: { width: innerWidth, height: innerHeight }, updatedAt: Date.now() };
+        }
+      };
+      paint();
+    })();
+  </script>
+</body>
+</html>

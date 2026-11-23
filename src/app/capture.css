@@ -1,0 +1,32 @@
+.capture-auto-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 17px 0;
+  color: #5b6d4b;
+  font-size: 11px;
+}
+.capture-region {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 10px;
+  margin: 17px 0 3px;
+  border: 1px solid #dfe3d4;
+  border-radius: 9px;
+  background: #f6f7f0;
+  text-align: left;
+}
+.capture-region.is-locked { background: #eff3e6; border-color: #dbe3cc; }
+.capture-region > div { flex: 1; min-width: 0; }
+.capture-region strong { display: block; font-size: 12px; font-weight: 600; color: #455638; }
+.capture-region div > span { display: block; margin-top: 2px; font-size: 10px; color: #657255; }
+.capture-region .icon-button { flex: 0 0 30px; width: 30px; height: 30px; color: #5c6a4e; }
+.region-symbol { display: grid; place-items: center; width: 26px; height: 26px; flex: 0 0 26px; color: #60794b; }
+.region-symbol.is-searching { animation: region-search 2s ease-in-out infinite; }
+.capture-advanced { margin: 13px 0 0; text-align: center; color: #68735e; font-size: 11px; }
+.capture-advanced summary { cursor: pointer; padding: 4px 0; }
+.capture-advanced .text-button { margin: 9px 0 3px; }
+@keyframes region-search { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .region-symbol.is-searching { animation: none; } }
