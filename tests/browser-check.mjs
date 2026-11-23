@@ -8,16 +8,11 @@ import { mkdtemp, mkdir, cp, readFile, writeFile, rm, access } from 'node:fs/pro
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright';
+import { build } from 'esbuild';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const require = createRequire(import.meta.url);
-let chromium;
-try { ({ chromium } = require('playwright')); }
-catch { ({ chromium } = require('/opt/codex/runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright')); }
-const { build } = require('esbuild');
 const output = path.join(root, 'qa');
 const temp = await mkdtemp(path.join(os.tmpdir(), 'uchikomi-qa-'));
 const extension = path.join(temp, 'extension');
@@ -78,7 +73,9 @@ try {
     bundle: true, platform: 'browser', format: 'iife', globalName: 'UchiQA', target: 'es2022', outfile: path.join(extension, 'qa-harness.js'),
   });
   context = await chromium.launchPersistentContext(path.join(temp, 'profile'), {
-    ...(process.env.CHROME_BIN ? { executablePath: process.env.CHROME_BIN } : existsSync('/usr/bin/chromium') ? { executablePath: '/usr/bin/chromium' } : {}),
+    // The bundled Chromium channel supports extensions in new headless mode.
+    // The default headless shell does not load an extension service worker.
+    ...(process.env.CHROME_BIN ? { executablePath: process.env.CHROME_BIN } : { channel: 'chromium' }),
     headless: process.env.HEADLESS !== '0',
     ignoreDefaultArgs: ['--disable-extensions'],
     args: ['--no-sandbox', `--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
