@@ -2,6 +2,7 @@
  * Prepended only to the disposable QA background/offscreen bundles. Observe
  * real API boundaries without changing production messages, frame contents,
  * decoding choices or acknowledgement timing. No image/key data is retained.
+ * OCR text below belongs only to the independent QA receipt and word fixture.
  */
 (() => {
   if (globalThis.__uchikomiQaRouting) return;
@@ -10,6 +11,8 @@
   const state = globalThis.__uchikomiQaRouting = {
     context, startedAt: clock(), received: {}, sent: {}, imageDecodes: { calls: 0, pending: 0, fulfilled: 0, rejected: 0 },
     bitmaps: { calls: 0, pending: 0, fulfilled: 0, rejected: 0 }, events: [], offscreenEvents: [],
+    frames: { lastAt: null, gaps: [], maxGap: 0 }, scoreStates: [],
+    ocr: { workers: 0, calls: 0, completed: 0, rejected: 0, pending: {}, results: [] },
   };
   const send = chrome.runtime.sendMessage;
   const traced = new Set(['UCHI_CANVAS_READY', 'UCHI_CANVAS_FRAME', 'UCHI_CANVAS_END',
@@ -36,6 +39,13 @@
   };
   chrome.runtime.sendMessage = function (...args) {
     const message = args[0], type = message?.type;
+    if (context === 'offscreen' && type === 'UCHI_OFF_STATE' && message.status) {
+      const value = message.status;
+      state.scoreStates.push({ at: clock(), activeSessionId: value.activeSessionId,
+        scoreState: value.scoreState, scoreReviewSessionId: value.scoreReviewSessionId,
+        latestScore: value.latestScore, message: value.message });
+      if (state.scoreStates.length > 160) state.scoreStates.shift();
+    }
     let observed;
     if (typeof type === 'string' && (type.startsWith('UCHI_OFF_') || type.startsWith('UCHI_CANVAS_'))) {
       observed = state.sent[type] ??= { calls: 0, pending: 0, fulfilled: 0, rejected: 0 };
@@ -78,9 +88,47 @@
     const observed = state.received[type] ??= { calls: 0 };
     observed.calls++; observed.last = { at: clock(), ...messageMeta(message),
       senderUrl: sender.url, hasTab: !!sender.tab, frameId: sender.frameId };
+    if (context === 'offscreen' && type === 'UCHI_OFF_CANVAS_FRAME' && Number.isFinite(message.frame?.at)) {
+      const at = message.frame.at, previous = state.frames.lastAt;
+      if (previous !== null && at > previous) {
+        const gap = at - previous; state.frames.maxGap = Math.max(state.frames.maxGap, gap);
+        if (gap > 300) {
+          state.frames.gaps.push({ at, gap, sequence: message.frame.sequence });
+          if (state.frames.gaps.length > 160) state.frames.gaps.shift();
+        }
+      }
+      state.frames.lastAt = at;
+    }
     if (traced.has(type)) record('receive', messageMeta(message));
   });
   if (context !== 'offscreen') return;
+  const NativeWorker = globalThis.Worker;
+  if (typeof NativeWorker === 'function') globalThis.Worker = new Proxy(NativeWorker, {
+    construct(Target, args) {
+      const worker = Reflect.construct(Target, args), id = ++state.ocr.workers;
+      const post = worker.postMessage;
+      worker.postMessage = function (...messages) {
+        const message = messages[0];
+        if (message?.action === 'recognize') {
+          state.ocr.calls++;
+          state.ocr.pending[`${id}:${message.jobId}`] = { worker: id, jobId: message.jobId, startedAt: clock() };
+        }
+        return Reflect.apply(post, this, messages);
+      };
+      worker.addEventListener('message', event => {
+        const message = event.data;
+        if (message?.action !== 'recognize' || !['resolve', 'reject'].includes(message.status)) return;
+        const key = `${id}:${message.jobId}`, pending = state.ocr.pending[key];
+        delete state.ocr.pending[key];
+        if (message.status === 'resolve') state.ocr.completed++; else state.ocr.rejected++;
+        state.ocr.results.push({ ...pending, worker: id, jobId: message.jobId, at: clock(), status: message.status,
+          text: String(message.data?.text ?? '').slice(0, 512), confidence: message.data?.confidence,
+          ...(message.status === 'reject' ? { error: errorText(message.data) } : {}) });
+        if (state.ocr.results.length > 256) state.ocr.results.shift();
+      });
+      return worker;
+    },
+  });
   const imageDecode = globalThis.HTMLImageElement?.prototype.decode;
   if (typeof imageDecode === 'function') HTMLImageElement.prototype.decode = function (...args) {
     const observed = state.imageDecodes, startedAt = clock();

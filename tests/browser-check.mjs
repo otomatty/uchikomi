@@ -706,6 +706,17 @@ try {
       assert.notEqual(reply.status?.state, 'error', reply.status?.message || 'Automatic capture failed');
       return reply.status;
     };
+    const gameRecords = () => app.evaluate(async since => {
+      const data = await window.UchiQA.getData();
+      return data.sessions.filter(value => value.source === 'capture' && value.startedAt >= since).map(value => ({
+        id: value.id, captureId: value.captureId, startedAt: value.startedAt, endedAt: value.endedAt,
+        phraseCount: value.phraseCount, score: value.score, scoreTotal: value.scoreTotal, scoreSource: value.scoreSource,
+        scoreConfidence: value.scoreConfidence, scoreObservedAt: value.scoreObservedAt, activity: value.activity,
+        scoreReview: value.scoreReview ? { score: value.scoreReview.score, reason: value.scoreReview.reason,
+          confidence: value.scoreReview.confidence, observedAt: value.scoreReview.observedAt,
+          hasEvidence: !!value.scoreReview.evidence } : undefined,
+      }));
+    }, result.phases.opened?.startedAt ?? Date.now());
     const diagnose = async label => {
       const details = result.diagnostics[label] = {};
       const [routing, status] = await Promise.all([
@@ -994,11 +1005,13 @@ try {
     } catch (error) {
       await diagnose('failure').catch(diagnosticError => { result.diagnosticError = String(diagnosticError.message || diagnosticError); });
       result.failureStatus = await send('UCHI_STATUS').catch(e => ({ error: String(e.message || e) }));
+      result.recordsAtFailure = await gameRecords().catch(e => ({ error: String(e.message || e) }));
       if (game && !game.isClosed()) await game.screenshot({ path: path.join(output, 'automatic-webgl-failure.png'), timeout: 5000 }).catch(() => {});
       throw error;
     } finally {
       // Cleanup uses the public pause handler, never a test hook in the product.
       await send('UCHI_STOP').catch(error => report.errors.push(`Automatic capture cleanup: ${error.message || error}`));
+      result.recordsAfterStop = await gameRecords().catch(e => ({ error: String(e.message || e) }));
       if (game && !game.isClosed()) await game.close();
       if (panel && !panel.isClosed()) await panel.close();
       activeFixture = fixture;

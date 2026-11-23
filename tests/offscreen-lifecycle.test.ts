@@ -57,7 +57,8 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     },
     async createImageBitmap(blob: Blob) {
       bitmapInputs.push(blob);
-      const bitmap = { width: 1280, height: 800, closeCalls: 0, close() { this.closeCalls++; } };
+      const bitmap = { width: 1280, height: 800, closeCalls: 0, fixtureFrame: options.scene?.prompt ? 'prompt' : options.scene?.receipt ? 'receipt' : 'blank',
+        close() { this.closeCalls++; } };
       images.push(bitmap);
       await options.decode?.();
       return bitmap;
@@ -73,10 +74,14 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     document: {
       body: { append() {} },
       createElement(tag: string) {
-        return tag === 'video' ? video : {
+        if (tag === 'video') return video;
+        const canvas: any = {
           width: 0, height: 0, toDataURL: () => 'data:image/jpeg;base64,AA==',
           getContext: () => ({
-            drawImage() {}, fillRect() {}, putImageData() {},
+            drawImage(image: any, ...coordinates: number[]) {
+              canvas.fixtureFrame = image.fixtureFrame;
+              canvas.fixtureCropY = coordinates.length === 8 ? coordinates[1] : image.fixtureCropY;
+            }, fillRect() {}, putImageData() {},
             getImageData(_x: number, _y: number, width: number, height: number) {
               const data = new Uint8ClampedArray(width * height * 4).fill(255);
               // Two distinct, stable text-like signatures let the real prompt
@@ -92,6 +97,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
             },
           }),
         };
+        return canvas;
       },
     },
     navigator: { mediaDevices: { async getUserMedia() { mediaCalls++; return stream; } } },
@@ -495,6 +501,42 @@ test('a canvas frame gap requires two fresh receipt observations before saving',
   for (let i = 0; i < 15; i++) await run.send();
   assert.equal((await db.getData()).sessions[0].score, 29740);
   assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('identical totals in consecutive games save independently after even a brief observed replay prompt', async () => {
+  let now = 1700000000000, sequence = 0, receiptLine = 0;
+  const scene = { prompt: true, receipt: false, variant: 0 };
+  const jp = { async setParameters() {}, async terminate() {}, async recognize(image: any) {
+    const text = image.fixtureFrame === 'prompt' ? image.fixtureCropY === 248 ? 'ぺあるっく' : 'ペアルック'
+      : image.fixtureFrame === 'receipt' && image.fixtureCropY === 160 ? receiptLines[receiptLine++ % 4] : '?';
+    return { data: { text, confidence: 96 } };
+  } };
+  const roman = { async setParameters() {}, async terminate() {}, async recognize(image: any) {
+    return { data: { text: image.fixtureFrame === 'prompt' ? 'pearukku' : '?', confidence: 96 } };
+  } };
+  const app = await fixture(async () => [jp, roman], undefined, { scene, clock: () => now });
+  await app.start(canvasStart); await new Promise(resolve => setImmediate(resolve));
+  const send = async (delay = 80) => {
+    now += delay;
+    assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, ++sequence) })).ok, true);
+    await app.evaluate('processQueue()');
+  };
+  const ids: string[] = [];
+  for (const promptFrames of [4, 1, 2]) {
+    scene.prompt = true; scene.receipt = false;
+    await send(240); ids.push(app.evaluate('activeGame.session.id'));
+    for (let i = 1; i < promptFrames; i++) await send();
+    scene.prompt = false; scene.receipt = true;
+    for (let i = 0; i < 30; i++) await send();
+    const saved = (await db.getData()).sessions.find(session => session.id === ids.at(-1));
+    assert.equal(saved?.score, 29740, `result after ${promptFrames} prompt frame(s)`);
+    assert.equal(saved?.scoreReview, undefined);
+    assert.equal(app.evaluate('status.latestScore.sessionId'), ids.at(-1));
+    assert.equal(app.evaluate('status.scoreState'), 'saved');
+  }
+  assert.equal(new Set(ids).size, 3);
+  assert.equal((await db.getData()).sessions.filter(session => session.score === 29740).length, 3);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
 });
 
 const replay = (app: Awaited<ReturnType<typeof fixture>>, sessionId = 'startup-test') => app.request('UCHI_OFF_REPLAY', { sessionId });
