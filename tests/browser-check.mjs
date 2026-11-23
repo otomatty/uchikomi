@@ -26,6 +26,9 @@ const run = async (name, fn) => {
 try {
   await mkdir(output, { recursive: true });
   await cp(path.join(root, 'dist'), extension, { recursive: true });
+  // A blank origin-owned page lets the final regression seed an actual v1 DB
+  // before any production module opens it. This exists only in the temp copy.
+  await writeFile(path.join(extension,'qa-empty.html'),'<!doctype html><meta charset="utf-8"><title>Database migration fixture</title>');
   const manifest = JSON.parse(await readFile(path.join(extension, 'manifest.json'), 'utf8'));
   await run('MV3 manifest / locally packaged OCR assets', async () => {
     assert.equal(manifest.manifest_version, 3);
@@ -184,7 +187,7 @@ try {
   const now = Date.now();
   const imported = {
     version: 1, exportedAt: now,
-    settings: { targetScore: 30000, baselineScore: 18000, targetDate: '2026-12-25', scoreType: 'profit', sessionLength: 10, includeUnverified: false },
+    settings: { targetScore: 30000, baselineScore: 18000, targetDate: '2026-12-25', scoreType: 'total', sessionLength: 10, includeUnverified: false },
     phrases: [
       { id: 'qa-phrase-1', text: 'テスト用のペアルック', reading: 'ぺあるっく', roman: 'pearukku', source: 'manual', confidence: 100, verified: true, capturedAt: now, lastSeenAt: now, seenCount: 1 },
       { id: 'qa-phrase-2', text: 'テスト用の写真', reading: 'しゃしん', roman: 'syasinn', source: 'manual', confidence: 100, verified: true, capturedAt: now, lastSeenAt: now, seenCount: 1 },
@@ -268,7 +271,7 @@ try {
   await run('Repeated slow intervals filter to actual saved words in the browser UI',async()=>{
     await app.evaluate(async()=>{
       const data=await window.UchiQA.getData(),startedAt=Date.now();
-      const session={id:'qa-measurements',startedAt,endedAt:startedAt+30000,source:'practice',scoreType:'profit',course:10000,mode:'accuracy',phraseCount:12,correctKeys:90,mistakes:0,durationMs:30000};
+      const session={id:'qa-measurements',startedAt,endedAt:startedAt+30000,source:'practice',scoreType:'total',course:10000,mode:'accuracy',phraseCount:12,correctKeys:90,mistakes:0,durationMs:30000};
       await window.UchiQA.saveSession(session);
       for(const phrase of data.phrases)for(let i=0;i<6;i++){
         const start=startedAt+i*2000;let at=start;
@@ -289,20 +292,22 @@ try {
   await run('An automatic score is saved once and appears in growth without manual entry',async()=>{
     const saved=await app.evaluate(async()=>{
       const startedAt=Date.now();
-      const session={id:'qa-auto-score',captureId:'qa-capture',startedAt,endedAt:startedAt+120000,source:'capture',scoreType:'profit',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:120000};
+      const session={id:'qa-auto-score',captureId:'qa-capture',startedAt,endedAt:startedAt+120000,source:'capture',scoreType:'total',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:120000};
       await window.UchiQA.saveSession(session);
-      const score={score:19740,scoreType:'profit',scoreConfidence:94,scoreObservedAt:startedAt+120000,scoreTotal:29740,scoreProfit:19740,scoreModeSource:'configured'};
+      const score={score:29740,scoreType:'total',scoreConfidence:94,scoreObservedAt:startedAt+120000,scoreTotal:29740,scoreModeSource:'configured'};
       const first=await window.UchiQA.saveAutomaticScore(session.id,score);
       const duplicate=await window.UchiQA.saveAutomaticScore(session.id,score);
       const data=await window.UchiQA.getData();
       return{first,duplicate,sessions:data.sessions.filter(s=>s.id===session.id)};
     });
     assert.equal(saved.first,true);assert.equal(saved.duplicate,false);assert.equal(saved.sessions.length,1);
-    assert.equal(saved.sessions[0].scoreSource,'ocr');assert.equal(saved.sessions[0].score,19740);
+    assert.equal(saved.sessions[0].scoreSource,'ocr');assert.equal(saved.sessions[0].score,29740);assert.equal(saved.sessions[0].scoreType,'total');
     await app.getByTestId('nav-growth').click();
-    await app.getByRole('button',{name:'19,740円の記録を編集',exact:true}).waitFor();
-    assert.match(await app.locator('.session-score').innerText(),/自動/);
-    assert.match(await app.locator('.growth-stats').innerText(),/19,740/);
+    await app.getByRole('button',{name:'29,740円の記録を編集',exact:true}).waitFor();
+    assert.match(await app.locator('.session-score').innerText(),/合計.*自動/);
+    assert.match(await app.locator('.growth-stats').innerText(),/29,740/);
+    assert.match(await app.locator('.chart-card').innerText(),/食べた金額の合計/);
+    assert.doesNotMatch(await app.locator('body').innerText(),/お得|利益|profit/i);
     await app.screenshot({ animations: 'disabled',path:path.join(output,'automatic-score.png'),fullPage:true});
   });
   await run('A backup larger than 30 MiB round-trips through settings into an empty database',async()=>{
@@ -339,9 +344,9 @@ try {
         const scored=data.sessions.find(s=>s.id==='qa-auto-score');
         if(!scored)throw new Error('Missing automatic score fixture');
         scored.scoreEvidence=screenshot;
-        data.sessions.push({id:'qa-backup-review',startedAt:at,source:'capture',scoreType:'profit',course:10000,mode:'accuracy',
+        data.sessions.push({id:'qa-backup-review',startedAt:at,source:'capture',scoreType:'total',course:10000,mode:'accuracy',
           phraseCount:0,correctKeys:0,mistakes:0,durationMs:0,
-          scoreReview:{score:18000,scoreType:'profit',confidence:60,observedAt:at,reason:'画像を確認',evidence:screenshot}});
+          scoreReview:{score:28000,scoreType:'total',confidence:60,observedAt:at,reason:'画像を確認',evidence:screenshot}});
         await window.UchiQA.importData({...data,version:1});
         return {addedImages:count,imageCharacters:screenshot.length};
       });
@@ -350,6 +355,8 @@ try {
       assert.equal(expected.attempts,original.attempts.length);assert.equal(expected.sessions,original.sessions.length+1);
       assert.ok(expected.scoreEvidence>0&&expected.reviewEvidence>0);
       await app.getByTestId('nav-settings').click();
+      assert.equal(await app.locator('[role="dialog"] option[value="profit"],[role="dialog"] option[value="total"]').count(),0);
+      assert.doesNotMatch(await app.getByRole('dialog').innerText(),/お得|利益|スコアの基準/);
       const downloadEvent=app.waitForEvent('download');
       await app.getByTestId('export-data').click();
       download=await downloadEvent;
@@ -385,6 +392,85 @@ try {
     assert.ok(await panel.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'word analysis overflow');
     await panel.screenshot({ animations: 'disabled', path: path.join(output, 'sidepanel-analysis-360.png'), fullPage: true });
     await panel.close();
+  });
+  await run('An actual version-1 database upgrades totals once while retaining records and evidence',async()=>{
+    const original=await app.evaluate(()=>window.UchiQA.getData());
+    // Release every origin-owned connection, including Chrome's welcome tab.
+    for(const page of context.pages())if(page.url().startsWith(`chrome-extension://${extensionId}/`))await page.close();
+    app=await context.newPage();await app.goto(`chrome-extension://${extensionId}/qa-empty.html`);
+    const legacy=await app.evaluate(async original=>{
+      const data=structuredClone(original),at=Date.now();
+      const canvas=document.createElement('canvas');canvas.width=canvas.height=8;
+      const ctx=canvas.getContext('2d');ctx.fillStyle='#df6948';ctx.fillRect(0,0,8,8);
+      const evidence=canvas.toDataURL('image/png'),image=new Image();image.src=evidence;await image.decode();
+      data.settings.scoreType='profit';data.phrases[0].screenshot=evidence;
+      const scored=data.sessions.find(s=>s.id==='qa-auto-score');
+      if(!scored)throw new Error('Missing pre-migration automatic score');
+      Object.assign(scored,{score:19740,scoreType:'profit',scoreTotal:29740,scoreProfit:19740,scoreEvidence:evidence});
+      const base={source:'capture',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:1000};
+      data.sessions.push({...base,id:'qa-old-total',startedAt:scored.startedAt-2000,endedAt:scored.startedAt-1000,score:24000,scoreTotal:24000,scoreType:'total'});
+      data.sessions.push({...base,id:'qa-old-review',startedAt:at,endedAt:at+1000,scoreType:'profit',
+        scoreReview:{score:5000,scoreType:'profit',confidence:65,observedAt:at,reason:'画像を確認',evidence}});
+      const request=(req,label)=>new Promise((resolve,reject)=>{
+        const timer=setTimeout(()=>reject(new Error(`${label} did not settle`)),5000);
+        req.onsuccess=()=>{clearTimeout(timer);resolve(req.result);};
+        req.onerror=()=>{clearTimeout(timer);reject(req.error);};
+        req.onblocked=()=>{clearTimeout(timer);reject(new Error(`${label} was blocked by an open connection`));};
+      });
+      await request(indexedDB.deleteDatabase('uchikomi-v1'),'Delete current database');
+      const opening=indexedDB.open('uchikomi-v1',1);
+      opening.onupgradeneeded=()=>{
+        const db=opening.result;db.createObjectStore('phrases',{keyPath:'id'});
+        const attempts=db.createObjectStore('attempts',{keyPath:'id'});attempts.createIndex('phraseId','phraseId');attempts.createIndex('sessionId','sessionId');
+        db.createObjectStore('sessions',{keyPath:'id'});db.createObjectStore('settings');
+      };
+      const db=await request(opening,'Create legacy database');
+      try{
+        if(db.version!==1)throw new Error('Legacy fixture must start at database version 1');
+        const tx=db.transaction(['phrases','attempts','sessions','settings'],'readwrite');
+        const completed=new Promise((resolve,reject)=>{
+          const timer=setTimeout(()=>{tx.abort();reject(new Error('Legacy data write did not settle'));},5000);
+          tx.oncomplete=()=>{clearTimeout(timer);resolve();};
+          tx.onabort=tx.onerror=()=>{clearTimeout(timer);reject(tx.error??new Error('Legacy data write failed'));};
+        });
+        for(const name of ['phrases','attempts','sessions'])for(const row of data[name])tx.objectStore(name).put(row);
+        tx.objectStore('settings').put(data.settings,'main');await completed;
+      }finally{db.close();}
+      return data;
+    },original);
+    // Expected values come from the pre-migration total snapshot, with explicit
+    // known conversions for the two legacy fixtures, rather than the migrator.
+    const expected=structuredClone(original);
+    expected.phrases.find(p=>p.id===legacy.phrases[0].id).screenshot=legacy.phrases[0].screenshot;
+    expected.sessions.find(s=>s.id==='qa-auto-score').scoreEvidence=legacy.sessions.find(s=>s.id==='qa-auto-score').scoreEvidence;
+    expected.sessions.push(legacy.sessions.find(s=>s.id==='qa-old-total'));
+    const review=legacy.sessions.find(s=>s.id==='qa-old-review');
+    expected.sessions.push({...review,scoreType:'total',scoreReview:{...review.scoreReview,score:15000,scoreType:'total'}});
+    const canonical=data=>({...data,phrases:[...data.phrases].sort((a,b)=>a.id.localeCompare(b.id)),
+      attempts:[...data.attempts].sort((a,b)=>a.id.localeCompare(b.id)),sessions:[...data.sessions].sort((a,b)=>a.id.localeCompare(b.id))});
+    for(let pass=0;pass<3;pass++){
+      if(pass===0)await app.goto(`chrome-extension://${extensionId}/index.html`);else await app.reload();
+      await app.getByTestId('app-shell').waitFor();
+      await app.addScriptTag({url:`chrome-extension://${extensionId}/qa-harness.js`});
+      const actual=await app.evaluate(()=>window.UchiQA.getData());
+      assert.deepEqual(canonical(actual),canonical(expected),`Database migration/reload ${pass} changed a record`);
+      assert.equal(actual.settings.targetScore,30000);assert.equal(actual.settings.baselineScore,18000);assert.equal(actual.settings.scoreType,'total');
+      assert.ok(actual.sessions.every(s=>s.scoreType==='total'&&!('scoreProfit' in s)));
+    }
+    const version=await app.evaluate(()=>new Promise((resolve,reject)=>{
+      const req=indexedDB.open('uchikomi-v1'),timer=setTimeout(()=>reject(new Error('Database version read timed out')),5000);
+      req.onsuccess=()=>{clearTimeout(timer);const version=req.result.version;req.result.close();resolve(version);};
+      req.onerror=()=>{clearTimeout(timer);reject(req.error);};
+    }));
+    assert.equal(version,2);assert.match(await app.locator('.goal-bottom').innerText(),/29,740/);
+    await app.getByTestId('nav-growth').click();
+    assert.match(await app.locator('.score-chart svg').getAttribute('aria-label'),/29740円/);
+    assert.match(await app.locator('.chart-card').innerText(),/食べた金額の合計/);
+    assert.equal(await app.getByRole('button',{name:'29,740円の記録を編集',exact:true}).count(),1);
+    assert.equal(await app.getByRole('button',{name:'24,000円の記録を編集',exact:true}).count(),1);
+    assert.doesNotMatch(await app.locator('body').innerText(),/お得|利益|profit/i);
+    await app.screenshot({animations:'disabled',path:path.join(output,'database-migrated.png'),fullPage:true});
+    report.databaseMigration={from:1,to:version,reloads:2,phrases:expected.phrases.length,attempts:expected.attempts.length,sessions:expected.sessions.length,total:29740,reviewTotal:15000};
   });
   await run('No uncaught application exceptions', async () => assert.deepEqual(report.browserErrors, []));
 } catch (e) {

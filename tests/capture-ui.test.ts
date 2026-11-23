@@ -92,15 +92,18 @@ test('automatic lock is visible and retry returns to searching without losing ca
 test('an automatically recorded score is visible and stopping does not force manual score entry', async () => {
   const now=Date.now();
   await act(async()=>{
-    await db.saveSession({id:'first-session',source:'capture',startedAt:now-120000,endedAt:now,score:22000,scoreType:'profit',scoreSource:'ocr',scoreConfidence:96,scoreObservedAt:now,scoreTotal:32000,scoreProfit:22000,course:10000,mode:'accuracy',phraseCount:3,correctKeys:30,mistakes:1,durationMs:120000});
-    publish({state:'recording',activeSessionId:'first-session',scoreState:'saved',latestScore:{sessionId:'first-session',score:22000,scoreType:'profit',confidence:96}});
+    await db.saveSession({id:'first-session',source:'capture',startedAt:now-120000,endedAt:now,score:29740,scoreType:'total',scoreSource:'ocr',scoreConfidence:96,scoreObservedAt:now,scoreTotal:29740,course:10000,mode:'accuracy',phraseCount:3,correctKeys:30,mistakes:1,durationMs:120000});
+    publish({state:'recording',activeSessionId:'first-session',scoreState:'saved',latestScore:{sessionId:'first-session',score:29740,scoreType:'total',confidence:96}});
     await delay(20);
   });
   await settle(()=>Boolean(document.querySelector('[data-testid="auto-score"]')));
-  assert.match(document.querySelector('[data-testid="auto-score"]')?.textContent??'',/22,000/);
+  assert.match(document.querySelector('[data-testid="auto-score"]')?.textContent??'',/29,740/);
+  assert.match(document.querySelector('[data-testid="auto-score"]')?.textContent??'',/合計/);
+  assert.match(document.querySelector('.panel-goal')?.textContent??'',/29,740/);
+  assert.doesNotMatch(document.body.textContent??'',/お得|利益|profit/i);
   const stop=[...document.querySelectorAll<HTMLButtonElement>('button')].find(button=>button.textContent?.includes('記録を終了'));
   assert.ok(stop);await act(async()=>{stop.click();await delay(30);});
   await settle(()=>messages.includes('UCHI_STOP'));
   assert.equal(document.querySelector('[role="dialog"]'),null);
-  assert.equal((await db.getData()).sessions[0].score,22000);
+  assert.equal((await db.getData()).sessions[0].score,29740);assert.equal((await db.getData()).sessions[0].scoreType,'total');
 });

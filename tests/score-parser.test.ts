@@ -5,149 +5,143 @@ import { parseResultScore, StableScoreReader, type ScoreText, type ParsedScore }
 const labelled=(patch:Partial<ScoreText>={}):ScoreText=>({
   headerText:'高級10,000円コース【正確重視】',
   bodyText:'29,740円分のお寿司をゲット！10,000円払って…19,740円分お得でした！',
-  headerConfidence:94,bodyConfidence:94,scoreType:'profit',...patch,
+  headerConfidence:94,bodyConfidence:94,...patch,
 });
 const numeric=(patch:Partial<ScoreText>={}):ScoreText=>({
-  headerText:'',bodyText:'数字を含む本文の認識が不完全',headerConfidence:0,bodyConfidence:25,scoreType:'profit',
+  headerText:'',bodyText:'数字を含む本文の認識が不完全',headerConfidence:0,bodyConfidence:25,
   labelText:'19,740内分お得でした！',labelConfidence:94,structureConfidence:.96,
   numeric:{total:{text:'29,740',confidence:95},paid:{text:'10,000',confidence:96},profit:{text:'19,740',confidence:96}},
   ...patch,
 });
 function notSaved(input:ScoreText,message?:string){assert.notEqual(parseResultScore(input).kind,'score',message);}
 
-test('labelled results distinguish profit from total and normalize typography without guessing digits',()=>{
-  const profit=parseResultScore(labelled());assert.equal(profit.kind,'score');assert.equal(profit.score,19740);
-  assert.equal(profit.total,29740);assert.equal(profit.profit,19740);assert.equal(profit.modeSource,'ocr');
-  const total=parseResultScore(labelled({scoreType:'total'}));assert.equal(total.kind,'score');assert.equal(total.score,29740);
-  assert.notEqual(profit.fingerprint,total.fingerprint,'different score bases cannot stabilize each other');
+test('the directly observed food total is the only score, including stale mode input',()=>{
+  for(const input of [labelled(),{...labelled(),scoreType:'profit'} as ScoreText]){
+    const result=parseResultScore(input);assert.equal(result.kind,'score');assert.equal(result.score,29740);
+    assert.equal(result.total,29740);assert.equal(result.scoreType,'total');assert.equal(result.modeSource,'ocr');
+    assert.equal(Object.hasOwn(result,'profit'),false);
+  }
   const wide=parseResultScore(labelled({bodyText:'２９，７４０ 円 分 の お 寿司 を ゲット！\n１０，０００ 円 払って\n１９，７４０ 円 分 お得 でした！'}));
-  assert.equal(wide.kind,'score');assert.equal(wide.score,19740);
+  assert.equal(wide.kind,'score');assert.equal(wide.score,29740);
 });
 
-test('observed numeric crops corroborate amounts when Japanese digit OCR is incomplete',()=>{
-  const result=parseResultScore(numeric());assert.equal(result.kind,'score');assert.equal(result.score,19740);
-  assert.equal(result.modeSource,'configured','an unreadable mode is not presented as OCR verified');
-  const observedMode=parseResultScore(numeric({headerText:'高級10,000円コース【正確重視】',headerConfidence:94}));
-  assert.equal(observedMode.modeSource,'ocr');
-  const observedLabel=parseResultScore(numeric({labelText:'内分ね得でした！',labelConfidence:88}));
-  assert.equal(observedLabel.kind,'score');assert.equal(observedLabel.score,19740);
-  notSaved(labelled({bodyText:'10,000円払って19,740内分ね得でした！'}),'OCR label variations alone do not supply trustworthy numeric evidence');
+test('independent numeric crops return the total when Japanese digit OCR is incomplete',()=>{
+  const result=parseResultScore(numeric());assert.equal(result.kind,'score');assert.equal(result.score,29740);assert.equal(result.modeSource,'configured');
+  assert.equal(parseResultScore(numeric({headerText:'高級10,000円コース【正確重視】',headerConfidence:94})).modeSource,'ocr');
+  assert.equal(parseResultScore(numeric({labelText:'内分ね得でした！',labelConfidence:88})).score,29740);
   const dots=parseResultScore(numeric({numeric:{total:{text:'29.740',confidence:95},paid:{text:'10.000',confidence:96},profit:{text:'19.740',confidence:96}}}));
-  assert.equal(dots.kind,'score');assert.equal(dots.score,19740);
+  assert.equal(dots.kind,'score');assert.equal(dots.score,29740);
 });
 
-test('loss and break-even retain their signs in both amount-reading paths',()=>{
-  const loss=parseResultScore(labelled({bodyText:'9,200円分のお寿司をゲット！10,000円払って800円分損でした！'}));
-  assert.equal(loss.kind,'score');assert.equal(loss.score,-800);assert.equal(loss.total,9200);
-  const observedLoss=parseResultScore(numeric({labelText:'800円分損でした！',numeric:{total:{text:'9,200',confidence:95},paid:{text:'10,000',confidence:96},profit:{text:'800',confidence:96}}}));
-  assert.equal(observedLoss.kind,'score');assert.equal(observedLoss.score,-800);
-  const zero=parseResultScore(labelled({bodyText:'10,000円分のお寿司をゲット！10,000円払って0円分お得でした！'}));
-  assert.equal(zero.kind,'score');assert.equal(zero.score,0);
+test('clear total and payment remain usable when the optional difference cannot be read',()=>{
+  const observed=numeric({totalLabelText:'円分のお寿司をゲット！',totalLabelConfidence:94,labelText:'',labelConfidence:0,
+    numeric:{total:{text:'29,740',confidence:95},paid:{text:'10,000',confidence:96}}});
+  assert.equal(parseResultScore(observed).score,29740);
+  assert.equal(parseResultScore({...observed,totalLabelText:'円分のお禾弘をゲット！',totalLabelConfidence:84}).score,29740,'the actual reference total label remains sufficient without the auxiliary row');
+  assert.equal(parseResultScore({...observed,numeric:{...observed.numeric,profit:{text:'???',confidence:99}}}).score,29740);
+  assert.equal(parseResultScore({...observed,numeric:{...observed.numeric,profit:{text:'19,760',confidence:40}}}).score,29740);
+  const bodyOnly=labelled({bodyConfidence:25,amountLines:{
+    total:{text:'29,740円分のお寿司をゲット！',confidence:94},paid:{text:'10,000円払って…',confidence:93},
+    profit:{text:'19,760円分お得でした！',confidence:25},
+  }});
+  assert.equal(parseResultScore(bodyOnly).score,29740,'weak auxiliary OCR must not lower clear primary lines');
+  assert.equal(parseResultScore(labelled({bodyText:'29,740円分のお寿司をゲット！10,000円払って…'})).score,29740);
 });
 
-test('a missing total can be derived only from an observed amount and the corroborated payment',()=>{
-  const result=parseResultScore(numeric({numeric:{paid:{text:'10,000',confidence:96},profit:{text:'19,740',confidence:96}}}));
-  assert.equal(result.kind,'score');assert.equal(result.total,29740);
-  notSaved(numeric({numeric:{profit:{text:'19,740',confidence:96}}}),'missing payment');
-  notSaved(numeric({numeric:{paid:{text:'5,000',confidence:96},profit:{text:'19,740',confidence:96}}}),'wrong payment');
+test('totals below the course cost, break-even totals and zero remain nonnegative food amounts',()=>{
+  const belowCost=parseResultScore(labelled({bodyText:'9,200円分のお寿司をゲット！10,000円払って800円分損でした！'}));
+  assert.equal(belowCost.kind,'score');assert.equal(belowCost.score,9200);
+  const observed=parseResultScore(numeric({labelText:'800円分損でした！',numeric:{total:{text:'9,200',confidence:95},paid:{text:'10,000',confidence:96},profit:{text:'800',confidence:96}}}));
+  assert.equal(observed.score,9200);assert.equal(Object.hasOwn(observed,'profit'),false);
+  assert.equal(parseResultScore(labelled({bodyText:'10,000円分のお寿司をゲット！10,000円払って0円分お得でした！'})).score,10000);
+  assert.equal(parseResultScore(labelled({bodyText:'0円分のお寿司をゲット！10,000円払って10,000円分損でした！'})).score,0);
+});
+
+test('a missing total is never reconstructed from the difference and course cost',()=>{
+  notSaved(numeric({numeric:{paid:{text:'10,000',confidence:96},profit:{text:'19,740',confidence:96}}}));
+  notSaved(labelled({bodyText:'10,000円払って19,740円分お得でした！'}));
+  notSaved(numeric({numeric:{total:{text:'29,740',confidence:96}}}),'missing payment');
   notSaved(labelled({bodyText:'29,740円分のお寿司をゲット！19,740円分お得でした！'}),'missing labelled payment');
 });
 
 test('ranking text and unlabeled numbers never become result scores',()=>{
-  for(const bodyText of ['スコア30,000円ランキング1位','30,000円','1位 29,740 10,000 19,740','正しく打ったキー1541平均7.9ミスタイプ6']){
-    assert.equal(parseResultScore(labelled({bodyText})).kind,'none');
-  }
-  notSaved(numeric({labelText:'ランキングスコア19,740円'}));
-  notSaved(numeric({labelText:'19,740円'}));
+  for(const bodyText of ['スコア30,000円ランキング1位','30,000円','1位 29,740 10,000 19,740','正しく打ったキー1541平均7.9ミスタイプ6'])assert.equal(parseResultScore(labelled({bodyText})).kind,'none');
+  notSaved(numeric({labelText:'ランキングスコア19,740円'}));notSaved(numeric({labelText:'19,740円'}));
 });
 
-test('numeric OCR does not turn ambiguous characters, malformed separators or signs into money',()=>{
-  for(const text of ['19,7O0','I9,740','19,74','19.74','19..740','19,740.000','+19740','-19740','1e4','','1,000,020']){
-    const input=numeric();input.numeric!.profit={text,confidence:99};
-    notSaved(input,`corrupted numeric crop: ${text}`);
+test('ambiguous characters, malformed separators and signs cannot supply a primary total',()=>{
+  for(const text of ['29,7O0','I9,740','29,74','29.74','29..740','29,740.000','+29740','-29740','1e4','','1,000,020']){
+    const input=numeric();input.numeric!.total={text,confidence:99};notSaved(input,text);
   }
-  for(const token of ['19,7O0','19,74','19.74','19..740','+19740','-19740'])notSaved(labelled({bodyText:`29,740円分のお寿司をゲット！10,000円払って${token}円分お得でした！`}),`corrupted labelled number: ${token}`);
+  for(const token of ['29,7O0','29,74','29.74','29..740','+29740','-29740'])notSaved(labelled({bodyText:`${token}円分のお寿司をゲット！10,000円払って19,740円分お得でした！`}),token);
 });
 
-test('contradictory totals, payment, signs, or independent OCR readings require review',()=>{
+test('confident contradictory amounts require review, but unreadable auxiliary text does not',()=>{
   const wrongTotal=numeric();wrongTotal.numeric!.total={text:'29,760',confidence:99};notSaved(wrongTotal);
-  notSaved(numeric({bodyText:'29,760円分のお寿司をゲット！10,000円払って19,760円分お得でした！'}));
+  const contradictory='29,760円分のお寿司をゲット！10,000円払って19,760円分お得でした！';
+  notSaved(numeric({bodyText:contradictory,bodyConfidence:94}));
+  assert.equal(parseResultScore(numeric({bodyText:contradictory,bodyConfidence:25})).score,29740);
   notSaved(numeric({labelText:'19,740円分お得でした！800円分損でした！'}));
+  notSaved(numeric({labelText:'円分損でした！',numeric:{total:{text:'29,740',confidence:95},paid:{text:'10,000',confidence:96}}}),'a confident contradictory direction remains evidence even if the auxiliary digits are unreadable');
   notSaved(labelled({bodyText:'29,740円分のお寿司をゲット！30,000円分のお寿司をゲット！10,000円払って19,740円分お得でした！'}));
   notSaved(labelled({bodyText:'29,740円分のお寿司をゲット！5,000円払って19,740円分お得でした！'}));
-  notSaved(labelled({bodyText:'29,741円分のお寿司をゲット！10,000円払って19,741円分お得でした！'}),'not reachable with 20-yen price increments');
-  notSaved(numeric({labelText:'10,020円分損でした！',numeric:{paid:{text:'10,000',confidence:96},profit:{text:'10,020',confidence:96}}}),'loss cannot imply a negative food total');
+  notSaved(labelled({bodyText:'29,741円分のお寿司をゲット！10,000円払って…'}),'unreachable 20-yen increment');
+  assert.equal(parseResultScore(labelled({bodyText:'29,740円分のお寿司をゲット！10,000円払って19,7O0円分お得でした！'})).score,29740);
 });
 
 test('an explicitly different course or mode blocks automatic saving',()=>{
   for(const headerText of ['お勧め5,000円コース【正確重視】','高級10,000円コース【普通】','高級10,000円コース【ふつう】','高級10,000円コース【速度必須】','高級10,000円コース【一発勝負】']){
-    notSaved(numeric({headerText,headerConfidence:99}),headerText);
-    notSaved(labelled({headerText,headerConfidence:99}),headerText);
+    notSaved(numeric({headerText,headerConfidence:99}),headerText);notSaved(labelled({headerText,headerConfidence:99}),headerText);
   }
 });
 
-test('structure, label and individual numeric confidence gates are independent',()=>{
-  notSaved(numeric({structureConfidence:.89}));
-  notSaved(numeric({structureConfidence:NaN}));
-  notSaved(numeric({labelConfidence:81}));
-  notSaved(numeric({labelConfidence:NaN}));
-  for(const kind of ['total','paid','profit'] as const){const input=numeric();input.numeric![kind]!.confidence=84;notSaved(input,kind);}
+test('structure, semantic-label and primary numeric confidence gates remain independent',()=>{
+  for(const structureConfidence of [.89,NaN])notSaved(numeric({structureConfidence}));
+  for(const labelConfidence of [81,NaN])notSaved(numeric({labelConfidence}));
+  for(const kind of ['total','paid'] as const){const input=numeric();input.numeric![kind]!.confidence=84;notSaved(input,kind);}
+  const auxiliary=numeric();auxiliary.numeric!.profit!.confidence=84;assert.equal(parseResultScore(auxiliary).kind,'score');
   notSaved(labelled({bodyConfidence:NaN}));
-  const boundary=numeric({labelConfidence:82,structureConfidence:.9});
-  for(const item of Object.values(boundary.numeric!))item!.confidence=85;
+  const boundary=numeric({labelConfidence:82,structureConfidence:.9});for(const item of Object.values(boundary.numeric!))item!.confidence=85;
   assert.equal(parseResultScore(boundary).kind,'score');
 });
 
-test('a confident result label cannot promote low-confidence amounts taken from the body text',()=>{
+test('a confident isolated label cannot promote weak body-text amounts',()=>{
   const input=labelled({labelText:'19,740円分お得でした！',labelConfidence:94,bodyConfidence:40});
   const result=parseResultScore(input);assert.equal(result.kind,'review');assert.equal(result.confidence,40);
   for(const bodyConfidence of [81,NaN])notSaved({...input,bodyConfidence});
-  const threshold=parseResultScore({...input,bodyConfidence:82});assert.equal(threshold.kind,'score');assert.equal(threshold.confidence,82);
-  assert.equal(parseResultScore(numeric({bodyConfidence:25})).kind,'score','separately verified numeric crops do not depend on body digits');
+  assert.equal(parseResultScore({...input,bodyConfidence:82}).kind,'score');assert.equal(parseResultScore(numeric({bodyConfidence:25})).kind,'score');
 });
 
-test('body-text fallback rejects usable contradictory numeric crops but still permits independent body-only results',()=>{
+test('body-text fallback rejects usable contradictory numeric crops without requiring them',()=>{
   const input=labelled({labelText:'19,740円分お得でした！',labelConfidence:94,structureConfidence:.89});
-  for(const numeric of [
-    {total:{text:'29,760',confidence:95}},
-    {paid:{text:'5,000',confidence:95}},
-    {profit:{text:'19,760',confidence:95}},
-  ])assert.equal(parseResultScore({...input,numeric}).kind,'review');
-  assert.equal(parseResultScore(input).kind,'score');
-  assert.equal(parseResultScore({...input,numeric:numeric().numeric}).kind,'score');
-  assert.equal(parseResultScore({...input,numeric:{total:{text:'29,760',confidence:84}}}).kind,'score','weak optional digits cannot overrule the verified body');
-  const loss=parseResultScore(labelled({bodyText:'9,200円分のお寿司をゲット！10,000円払って800円分損でした！',structureConfidence:.89,numeric:{profit:{text:'800',confidence:95}}}));
-  assert.equal(loss.kind,'score');assert.equal(loss.profit,-800,'the numeric crop contains the loss magnitude, not a minus sign');
+  for(const observed of [{total:{text:'29,760',confidence:95}},{paid:{text:'5,000',confidence:95}},{profit:{text:'19,760',confidence:95}}])assert.equal(parseResultScore({...input,numeric:observed}).kind,'review');
+  assert.equal(parseResultScore(input).kind,'score');assert.equal(parseResultScore({...input,numeric:numeric().numeric}).kind,'score');
+  assert.equal(parseResultScore({...input,numeric:{total:{text:'29,760',confidence:84}}}).kind,'score');
 });
 
-test('two genuinely separate agreeing result observations are required',()=>{
+test('two separate agreeing observations save 29,740, never the displayed difference',()=>{
   const reader=new StableScoreReader(),score=parseResultScore(labelled());
-  assert.equal(reader.observe(score,1000),null);
-  assert.equal(reader.observe(score,1000),null,'same callback time is not independent evidence');
-  assert.equal(reader.observe(score,1300),null,'too close to the initial observation');
+  assert.equal(reader.observe(score,1000),null);assert.equal(reader.observe(score,1000),null);assert.equal(reader.observe(score,1300),null);
   const result=reader.observe({...score,confidence:88},1500);
-  assert.equal(result?.kind,'score');assert.equal(result?.score,19740);assert.equal(result?.confidence,88);
+  assert.equal(result?.kind,'score');assert.equal(result?.score,29740);assert.equal(result?.scoreType,'total');assert.equal(result?.confidence,88);assert.equal(Object.hasOwn(result!,'profit'),false);
 });
 
-test('a score change, score-base change, blank interval or long gap resets stability',()=>{
+test('score changes, blank intervals and long gaps reset stability; optional absent differences do not',()=>{
   const first=parseResultScore(labelled()),second=parseResultScore(labelled({bodyText:'30,000円分のお寿司をゲット！10,000円払って20,000円分お得でした！'}));
-  const reader=new StableScoreReader();
-  assert.equal(reader.observe(first,1000),null);
-  assert.equal(reader.observe(second,1600),null);
-  assert.equal(reader.observe(second,2200)?.score,20000);
-  const total=parseResultScore(labelled({scoreType:'total'}));
-  assert.equal(reader.observe(total,2800),null);
-  assert.equal(reader.observe({kind:'none',scoreType:'total',confidence:0},3400),null);
-  assert.equal(reader.observe(total,4000),null);
-  assert.equal(reader.observe(total,17000),null,'old observations cannot corroborate a later round');
-  assert.equal(reader.observe(total,17600)?.score,29740);
+  const reader=new StableScoreReader();assert.equal(reader.observe(first,1000),null);assert.equal(reader.observe(second,1600),null);assert.equal(reader.observe(second,2200)?.score,30000);
+  assert.equal(reader.observe({kind:'none',scoreType:'total',confidence:0},3400),null);assert.equal(reader.observe(first,4000),null);assert.equal(reader.observe(first,17000),null);
+  const withoutDifference=parseResultScore(labelled({bodyText:'29,740円分のお寿司をゲット！10,000円払って…'}));assert.equal(reader.observe(withoutDifference,17600)?.score,29740);
 });
 
-test('a low-confidence observation cannot promote the next high-confidence frame by itself',()=>{
+test('legacy score observations and low-confidence frames cannot establish a saved total',()=>{
   const reader=new StableScoreReader(),high=parseResultScore(labelled()),low:ParsedScore={...high,kind:'review',confidence:40,reason:'uncertain'};
-  assert.equal(reader.observe(low,1000),null);
-  assert.equal(reader.observe(high,1600)?.kind,'review');
-  assert.equal(reader.observe(high,2200)?.kind,'score');
-  assert.equal(reader.observe(high,NaN),null);
-  assert.equal(reader.observe(high,2800),null,'invalid observation clears prior state');
+  assert.equal(reader.observe(low,1000),null);assert.equal(reader.observe(high,1600)?.kind,'review');assert.equal(reader.observe(high,2200)?.kind,'score');
+  assert.equal(reader.observe({...high,scoreType:'profit',score:19740} as unknown as ParsedScore,2800),null);
+  assert.equal(reader.observe(high,3400),null,'legacy observations clear prior agreement');assert.equal(reader.observe(high,NaN),null);
+});
+
+test('review reasons describe amount validation without offering another score basis',()=>{
+  for(const input of [numeric({labelText:'19,740円分お得でした！800円分損でした！'}),numeric({numeric:{total:{text:'29,760',confidence:95},paid:{text:'10,000',confidence:95},profit:{text:'19,740',confidence:95}}})]){
+    const result=parseResultScore(input);assert.equal(result.kind,'review');assert.equal(result.scoreType,'total');assert.doesNotMatch(result.reason??'',/お得|損/);
+  }
 });

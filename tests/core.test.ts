@@ -107,10 +107,12 @@ test('targeted practice completes a trusted terminal-miss prefix without changin
   assert.deepEqual(choosePractice([salt],[failedI],1,'hi').map(word=>word.roman),['shio']);
   assert.equal(salt.roman,'sio');
 });
-test('empty summary has no fabricated performance and score types stay separate',()=>{
+test('empty summary has no fabricated performance and aggregates only canonical total scores',()=>{
   assert.equal(summarize(empty).best,null);assert.equal(summarize(empty).accuracy,null);assert.equal(summarize(empty).practiceCount,0);
-  const data:AppData={...empty,sessions:[{id:'s1',startedAt:now,source:'manual',score:18000,scoreType:'profit',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:0}, {id:'s2',startedAt:now+1,source:'manual',score:39000,scoreType:'total',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:0}]};
-  assert.equal(summarize(data).best,18000);assert.equal(summarize(data).median,18000);assert.equal(summarize(data).delta,0);
+  const data:AppData={...empty,sessions:[{id:'s1',startedAt:now,source:'manual',score:18000,scoreType:'total',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:0}, {id:'s2',startedAt:now+1,source:'manual',score:39000,scoreType:'total',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:0}]};
+  assert.equal(summarize(data).best,39000);assert.equal(summarize(data).median,28500);assert.equal(summarize(data).delta,10500);
+  const unmigrated={...data.sessions[0],id:'old',score:999999,scoreType:'profit'} as unknown as AppData['sessions'][number];
+  assert.equal(summarize({...data,sessions:[...data.sessions,unmigrated]}).best,39000);
 });
 test('practice accuracy and speed exclude capture measurements',()=>{
   const practice={...synthetic([]),correctKeys:8,mistakes:2,durationMs:2000};

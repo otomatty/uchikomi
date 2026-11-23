@@ -1,5 +1,5 @@
 # Shared APIs
-All times are epoch milliseconds; intervals are ms. Scores are numeric recorded values with scoreType, never combine profit and total. No demo data persisted by default.
+All times are epoch milliseconds; intervals are ms. `Session.score` is the total yen eaten. `Session.scoreType`, `Settings.scoreType`, and `ScoreReview.scoreType` retain the compatibility field with the sole value `'total'`; there is no selectable score unit. No demo data is persisted by default.
 
 core/db.ts exports:
 - getData():Promise<AppData>
@@ -8,10 +8,10 @@ core/db.ts exports:
 - deletePhrase(id:string):Promise<void> (cascade attempts)
 - saveAttempt(attempt:Attempt):Promise<void>
 - saveSession(session:Session):Promise<void>
-- saveAutomaticScore(sessionId:string, patch:AutomaticScore):Promise<boolean> — atomically stores an OCR result and clears scoreReview; returns false for a duplicate, older/weaker OCR result, or any existing manual/legacy score. Patch requires score, scoreType, scoreConfidence (0..100), scoreObservedAt; optional scoreEvidence data URL, scoreTotal, scoreProfit. Total minus profit must equal the 10,000 yen course price.
+- saveAutomaticScore(sessionId:string, patch:AutomaticScore):Promise<boolean> — atomically stores an OCR result and clears scoreReview; returns false for a duplicate, older/weaker OCR result, or any existing manual/legacy score. Patch requires score, scoreType:'total', scoreConfidence (0..100), scoreObservedAt; optional scoreEvidence data URL, scoreTotal, scoreModeSource. If provided, scoreTotal must equal score. Ordinary save APIs reject legacy score units rather than interpreting them as totals.
 - updateSettings(patch:Partial<Settings>):Promise<Settings>
-- importData(value:unknown):Promise<void> validates before mutation; merges IDs
-- exportData():Promise<AppData & {version:1;exportedAt:number}>
+- importData(value:unknown):Promise<void> converts legacy monetary fields and validates before mutation; merges IDs atomically
+- exportData():Promise<AppData & {version:1;exportedAt:number}> validates format/count limits and standalone references before returning a complete, restorable snapshot; does not omit images or records
 - clearData():Promise<void>
 - subscribe(onChange:()=>void):()=>void (BroadcastChannel + same-page callbacks)
 
@@ -60,10 +60,18 @@ The caller must independently verify that this capture starts at the phrase boun
 
 ## Automatic and reviewed scores
 
-Optional Session fields: `captureId`, `scoreSource:'ocr'|'manual'`, `scoreConfidence`, `scoreObservedAt`, `scoreEvidence`, `scoreTotal`, `scoreProfit`, and `scoreReview:{score?,scoreType,confidence,observedAt,evidence?,reason}`. A review candidate does not populate `score`, so graphs and best scores ignore it. Each game can have its own Session linked to the recording by `captureId`.
+Optional Session fields: `captureId`, `scoreSource:'ocr'|'manual'`, `scoreConfidence`, `scoreObservedAt`, `scoreEvidence`, `scoreTotal`, and `scoreReview:{score?,scoreType:'total',confidence,observedAt,evidence?,reason}`. `scoreTotal` is a compatibility alias for `score`, not another score metric; when both are present they must agree. New saved records and exports contain no `scoreProfit`. A review candidate does not populate `score`, so graphs and best scores ignore it. Each game can have its own Session linked to the recording by `captureId`.
 
 `scoreModeSource?:'configured'|'ocr'` records how accuracy mode was established: the user's explicitly configured course/mode, or a recognized result heading. `saveAutomaticScore` accepts the same optional field. This provenance is preserved in backups and asynchronous session writes; it does not claim that an unreadable heading was recognized. Editing only the numeric score does not change the recorded origin of its mode.
 
-`saveSession` preserves an existing manual score (including legacy scores without a source) against asynchronous capture writes. It also preserves a saved OCR result when an older capture object has no score. Explicit user corrections must set `scoreSource:'manual'`; this clears OCR confidence/evidence/review and recomputes total/profit. `saveAutomaticScore` performs its score/source checks inside the same IndexedDB transaction as the write.
+`saveSession` preserves an existing manual score (including legacy scores without a source) against asynchronous capture writes. It also preserves a saved OCR result when an older capture object has no score. Explicit user corrections must set `scoreSource:'manual'`; this clears OCR confidence/evidence/review and replaces the `scoreTotal` alias with the edited score. `saveAutomaticScore` performs its score/source checks inside the same IndexedDB transaction as the write. Summary statistics only include confirmed total scores from the configured 10,000 yen accuracy course.
 
 CaptureStatus adds `activeSessionId`, `latestScore:{sessionId,score,scoreType,confidence?}`, `scoreState:'watching'|'reading'|'saved'|'review'`, and `scoreReviewSessionId`. Its original `sessionId` remains the recording's content-key routing ID.
+
+## Total-score migration and backup compatibility
+
+The database name remains `uchikomi-v1`; its IndexedDB schema version is now **2**. Opening a version 1 database converts sessions and stored settings in the single versionchange transaction. Object stores and indexes are created only if absent. Phrase records, screenshots, attempts, physical-key details, IDs, links, counters, and timestamps are retained. Connections close on `versionchange`; a blocked open reports the need to close the other UCHIKOMI page. If migration validation fails, the upgrade aborts and the version 1 data remains intact. Reopening a version 2 database does not run the conversion again.
+
+Backup format remains `version:1`. Legacy import and the database upgrade use the same conversion: a legacy `scoreType:'profit'` amount becomes `score + course` (the supported course is 10,000 yen); an existing total amount stays unchanged. Pending review candidates follow their own recorded score type. Legacy `scoreProfit` is removed after its corresponding total is checked. Canonical exports contain total-only fields, and reimporting them does not add the course price again. Settings change only their score type: the numeric target, baseline, target date, and all other supported settings are preserved. The defaults remain a 30,000 yen target and an 18,000 yen baseline.
+
+When legacy monetary fields imply different totals, migration does not choose one. It removes the confirmed score and its total alias, and stores a pending review with no prefilled score. Its reason retains every conflicting total plus the converted candidate and reason from any earlier review. Existing review confidence, timestamps, and evidence are retained; the session's separate evidence also remains available. These records stay out of graphs until the user confirms the total. New ordinary writes accept only canonical total values; legacy conversion is confined to upgrade and import.

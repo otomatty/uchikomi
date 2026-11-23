@@ -1,6 +1,6 @@
 import { signatureDistance } from './helpers';
 import type { CompletionBoundary } from './key-boundary';
-import { StableScoreReader, type ParsedScore, type ScoreType } from './score-parser';
+import { StableScoreReader, type ParsedScore } from './score-parser';
 
 interface PromptTransition {
   interruptedAt?: number;
@@ -52,11 +52,10 @@ export function closeObservedBoundary(candidate: ObservedBoundary, at: number, o
 export class ResultFrameSequence {
   private reader = new StableScoreReader();
   private revision = 0;
-  constructor(private scoreType: ScoreType) {}
   scanned(found: boolean, at: number): number {
     if (!found) {
       this.revision++;
-      this.reader.observe({ kind: 'none', scoreType: this.scoreType, confidence: 0 }, at);
+      this.reader.observe({ kind: 'none', scoreType: 'total', confidence: 0 }, at);
     }
     return this.revision;
   }

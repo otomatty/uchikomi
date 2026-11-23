@@ -63,6 +63,17 @@ function phrase(id:string,text='テスト用のペアルック',reading='ぺあ�
 }
 async function navigateWords(){await click(query('[data-testid="nav-phrases"]'));}
 async function closeModal(){await click(query('[role="dialog"] button[aria-label="閉じる"]'));}
+function assertTotalOnly(scope:Document|Element=document){
+  assert.doesNotMatch((scope===document?document.body.textContent:scope.textContent)??'',/お得|利益|profit|スコアの基準/i);
+  assert.equal(scope.querySelector('[aria-label="スコアの種類"]'),null);
+  assert.equal(scope.querySelector('option[value="profit"],option[value="total"]'),null);
+}
+async function uploadBackup(value:unknown){
+  const file=new browserWindow.File([JSON.stringify(value)],'legacy-backup.json',{type:'application/json'});
+  const transfer=new browserWindow.DataTransfer();transfer.items.add(file);
+  await act(async()=>{const el=query<HTMLInputElement>('[data-testid="import-file"]');el.files=transfer.files as unknown as FileList;el.dispatchEvent(new browserWindow.Event('change',{bubbles:true}));await delay(20);});
+  await settled(()=>!document.querySelector('[role="dialog"]'));
+}
 async function openAdd(){await click(button('追加する'));await settled(()=>!!document.querySelector('[role="dialog"]'));}
 async function fillPhrase(text:string,reading:string,roman:string){
   await input(query<HTMLInputElement>('input[placeholder="実際に出題されたキーワード"]'),text);
@@ -141,29 +152,83 @@ test('opening settings pauses practice and a partial run remains a valid restora
   await db.clearData();await db.importData(exported);assert.equal((await db.getData()).attempts.length,1);
 });
 
-test('negative profit can be recorded and charted; changing score basis keeps histories separate',async()=>{
-  await mount();await click(button('スコアを記録'));await input(query<HTMLInputElement>('input[aria-label="スコア"]'),'-5000');await click(button('スコアを保存'));
-  await settled(()=>!document.querySelector('[role="dialog"]'));assert.equal((await db.getData()).sessions[0].score,-5000);
+test('settings and manual scores use only nonnegative totals, which reach the cards and graph unchanged',async()=>{
+  await mount();await click(query('[data-testid="nav-settings"]'));assertTotalOnly(query('[role="dialog"]'));
+  const defaults=await db.getData();assert.equal(defaults.settings.targetScore,30000);assert.equal(defaults.settings.baselineScore,18000);assert.equal(defaults.settings.scoreType,'total');
+  await click(button('保存する'));await settled(()=>!document.querySelector('[role="dialog"]'));
+  await click(button('スコアを記録'));
+  const amount=query<HTMLInputElement>('input[aria-label="スコア"]');assert.equal(amount.min,'0');
+  assert.match(query('[role="dialog"]').textContent??'',/食べた金額の合計/);assertTotalOnly(query('[role="dialog"]'));
+  await input(amount,'-1');
+  // Exercise the submit guard as well as the browser's min attribute.
+  await act(async()=>{query('form.score-form').dispatchEvent(new browserWindow.Event('submit',{bubbles:true,cancelable:true}));await delay(0);});
+  assert.ok(document.querySelector('[role="dialog"] [role="alert"]'));assert.equal((await db.getData()).sessions.length,0);
+  await input(amount,'0');await click(button('スコアを保存'));await settled(()=>!document.querySelector('[role="dialog"]'));
+  await click(button('スコアを記録'));await input(query<HTMLInputElement>('input[aria-label="スコア"]'),'29740');await click(button('スコアを保存'));
+  await settled(()=>!document.querySelector('[role="dialog"]'));
+  const saved=(await db.getData()).sessions;
+  assert.deepEqual(saved.map(s=>s.score).sort((a,b)=>a!-b!),[0,29740]);assert.ok(saved.every(s=>s.scoreType==='total'&&!('scoreProfit' in s)));
+  assert.match(query('.goal-bottom').textContent??'',/29,740/);assertTotalOnly();
   await click(query('[data-testid="nav-growth"]'));await settled(()=>!!document.querySelector('.score-chart'));
+  assert.match(query('.score-chart svg').getAttribute('aria-label')??'',/29740円/);
+  assert.match(query('.chart-card').textContent??'',/食べた金額の合計/);assert.equal(document.querySelectorAll('.session-score').length,2);
+  assert.ok([...document.querySelectorAll('.session-score')].every(el=>el.textContent?.includes('合計')));
   const values=[...document.querySelectorAll('.score-chart circle')].map(c=>Number(c.getAttribute('cy')));
-  assert.ok(values.length>0&&values.every(y=>y>=0&&y<=270),'Negative values should fit inside SVG');
-  await click(query('[data-testid="nav-settings"]'));
-  const select=[...document.querySelectorAll<HTMLSelectElement>('[role="dialog"] select')].find(s=>[...s.options].some(o=>o.value==='total'))!;
-  await input(select,'total');await click(button('保存する'));await settled(()=>!document.querySelector('[role="dialog"]'));
-  assert.ok(document.querySelector('.chart-empty'));assert.equal((await db.getData()).sessions[0].scoreType,'profit');
+  assert.ok(values.length>0&&values.every(y=>Number.isFinite(y)&&y>=0&&y<=270));assertTotalOnly();
 });
 
-test('score review initializes its amount and score basis from the same record',async()=>{
-  const backup=await db.exportData(),now=Date.now();
-  backup.sessions=[{id:'ui-mixed-review',startedAt:now,endedAt:now+1000,source:'capture',score:20000,scoreType:'total',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:1000,
-    scoreReview:{score:15000,scoreType:'profit',confidence:60,observedAt:now,reason:'読み取りの確認'}}];
+test('legacy profit backups restore through settings as totals and do not convert again after reload or export',async()=>{
+  const current=await db.exportData(),now=Date.now(),evidence='data:image/png;base64,AA==';
+  const base={source:'capture',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:1000};
+  const backup={...current,version:1,settings:{...current.settings,scoreType:'profit'},sessions:[
+    {...base,id:'ui-legacy-gain',startedAt:now,endedAt:now+1000,score:19740,scoreType:'profit',scoreTotal:29740,scoreProfit:19740,scoreSource:'ocr',scoreConfidence:94,scoreEvidence:evidence},
+    {...base,id:'ui-legacy-loss',startedAt:now-2000,endedAt:now-1000,score:-5000,scoreType:'profit'},
+    {...base,id:'ui-existing-total',startedAt:now-4000,endedAt:now-3000,score:23000,scoreType:'total'},
+  ]};
+  await mount();await click(query('[data-testid="nav-settings"]'));await uploadBackup(backup);
+  const restored=await db.getData(),byId=new Map(restored.sessions.map(s=>[s.id,s]));
+  assert.equal(byId.get('ui-legacy-gain')?.score,29740);assert.equal(byId.get('ui-legacy-loss')?.score,5000);assert.equal(byId.get('ui-existing-total')?.score,23000);
+  assert.equal(byId.get('ui-legacy-gain')?.scoreEvidence,evidence);assert.ok(restored.sessions.every(s=>s.scoreType==='total'&&!('scoreProfit' in s)));
+  assert.equal(restored.settings.targetScore,30000);assert.equal(restored.settings.baselineScore,18000);assert.equal(restored.settings.scoreType,'total');
+  assert.match(query('.goal-bottom').textContent??'',/29,740/);assertTotalOnly();
+  await click(query('[data-testid="nav-growth"]'));await settled(()=>!!document.querySelector('.score-chart'));
+  assert.match(query('.score-chart svg').getAttribute('aria-label')??'',/29740円/);assert.equal(document.querySelectorAll('.session-score').length,3);assertTotalOnly();
+  await click(query('button[aria-label="29,740円の記録を編集"]'));
+  assert.equal(query<HTMLInputElement>('input[aria-label="スコア"]').value,'29740');assertTotalOnly(query('[role="dialog"]'));await closeModal();
+  await unmount();root=createRoot(container);await mount();
+  assert.deepEqual((await db.getData()).sessions,restored.sessions);assertTotalOnly();
+  const exported=await db.exportData();assert.ok(exported.sessions.every(s=>s.scoreType==='total'&&!('scoreProfit' in s)));
+  await act(async()=>{await db.clearData();await db.importData(exported);await delay(20);});
+  assert.deepEqual((await db.getData()).sessions,restored.sessions);
+});
+
+test('legacy review amounts are normalized to total before manual confirmation',async()=>{
+  const current=await db.exportData(),now=Date.now();
+  const backup={...current,version:1,sessions:[{id:'ui-mixed-review',startedAt:now,endedAt:now+1000,source:'capture',score:20000,scoreType:'total',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:1000,
+    scoreReview:{score:15000,scoreType:'profit',confidence:60,observedAt:now,reason:'読み取りの確認'}}]};
   await db.importData(backup);await mount();await click(query('[data-testid="nav-growth"]'));
   await click(query('button[aria-label="20,000円の記録を編集"]'));
-  assert.equal(query<HTMLInputElement>('input[aria-label="スコア"]').value,'15000');
-  assert.equal(query('.segmented .active').textContent,'お得になった金額');
+  assert.equal(query<HTMLInputElement>('input[aria-label="スコア"]').value,'25000');assertTotalOnly(query('[role="dialog"]'));
   await click(button('スコアを保存'));await settled(()=>!document.querySelector('[role="dialog"]'));
   const saved=(await db.getData()).sessions[0];
-  assert.equal(saved.score,15000);assert.equal(saved.scoreType,'profit');assert.equal(saved.scoreProfit,15000);assert.equal(saved.scoreTotal,25000);
+  assert.equal(saved.score,25000);assert.equal(saved.scoreType,'total');assert.equal(saved.scoreTotal,25000);assert.equal('scoreProfit' in saved,false);assert.equal(saved.scoreReview,undefined);
+});
+
+test('conflicting legacy amounts stay out of the graph until a total is confirmed',async()=>{
+  const current=await db.exportData(),now=Date.now(),evidence='data:image/png;base64,AA==';
+  await db.importData({...current,version:1,sessions:[{id:'ui-conflicting-total',startedAt:now,endedAt:now+1000,source:'capture',
+    score:19740,scoreType:'profit',scoreTotal:30000,scoreProfit:19740,scoreSource:'ocr',scoreEvidence:evidence,
+    course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:1000}]});
+  await mount();await click(query('[data-testid="nav-growth"]'));
+  assert.ok(document.querySelector('.chart-empty'));assert.equal(document.querySelector('.score-chart svg'),null);
+  await click(button('スコアを確認'));
+  assert.equal(query<HTMLInputElement>('input[aria-label="スコア"]').value,'');
+  const dialog=query('[role="dialog"]');assert.match(dialog.textContent??'',/29,?740/);assert.match(dialog.textContent??'',/30,?000/);
+  assert.equal(query('.phrase-proof img').getAttribute('src'),evidence);assertTotalOnly(dialog);
+  await input(query<HTMLInputElement>('input[aria-label="スコア"]'),'29800');await click(button('スコアを保存'));
+  await settled(()=>!document.querySelector('[role="dialog"]'));
+  const saved=(await db.getData()).sessions[0];assert.equal(saved.score,29800);assert.equal(saved.scoreTotal,29800);assert.equal(saved.scoreType,'total');assert.equal(saved.scoreReview,undefined);
+  assert.match(query('.score-chart svg').getAttribute('aria-label')??'',/29800円/);assertTotalOnly();
 });
 
 test('failed practice saves keep results and retry controls until the full attempt is persisted',async()=>{
@@ -221,7 +286,7 @@ test('correct but slow letter combinations show the personal baseline and lead t
   const pair=phrase('ui-slow-pair'),photo=phrase('ui-fast-photo','テスト用の写真','しゃしん','syasinn');
   await db.savePhrase(pair);await db.savePhrase(photo);await db.updateSettings({sessionLength:5});
   const start=Date.now()-120000,sessionId='ui-speed-observations';
-  await db.saveSession({id:sessionId,startedAt:start,endedAt:start+60000,source:'practice',scoreType:'profit',course:10000,mode:'accuracy',phraseCount:12,correctKeys:90,mistakes:0,durationMs:60000});
+  await db.saveSession({id:sessionId,startedAt:start,endedAt:start+60000,source:'practice',scoreType:'total',course:10000,mode:'accuracy',phraseCount:12,correctKeys:90,mistakes:0,durationMs:60000});
   for(let round=0;round<6;round++){
     for(const [p,offset] of [[pair,0],[photo,2000]] as const){
       const startedAt=start+round*5000+offset;let at=startedAt;

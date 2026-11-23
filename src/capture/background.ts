@@ -11,16 +11,25 @@ let stateLoaded = false;
 let creating: Promise<void> | null = null;
 let transitioning = false;
 
+function totalOnlyStatus(value: CaptureStatus): CaptureStatus {
+  // Session storage is only a live notification cache. Never relabel an old
+  // difference-based notification as a total; canonical records migrate in DB.
+  if (value.latestScore && value.latestScore.scoreType !== 'total') {
+    const { latestScore: _legacy, ...rest } = value;
+    return rest;
+  }
+  return value;
+}
 async function loadStatus() {
   if (!stateLoaded) {
     const stored = await chrome.storage.session.get('captureStatus');
-    if (stored.captureStatus && typeof stored.captureStatus === 'object') status = stored.captureStatus as CaptureStatus;
+    if (stored.captureStatus && typeof stored.captureStatus === 'object') status = totalOnlyStatus(stored.captureStatus as CaptureStatus);
     stateLoaded = true;
   }
   return status;
 }
 async function publish(next: CaptureStatus) {
-  status = next;
+  status = totalOnlyStatus(next);
   stateLoaded = true;
   await chrome.storage.session.set({ captureStatus: status });
   void chrome.action.setBadgeText({ text: status.state === 'recording' ? '●' : '' });
@@ -46,7 +55,7 @@ async function currentStatus(forceCheck = false) {
   if ((status.state === 'recording' || status.state === 'starting') && (!transitioning || forceCheck)) {
     if (await hasOffscreen()) {
       const result = await offscreen<{ status?: CaptureStatus }>('UCHI_OFF_STATUS').catch(() => null);
-      if (result?.status) status = result.status;
+      if (result?.status) status = totalOnlyStatus(result.status);
     } else {
       await publish({ ...EMPTY_CAPTURE, state: 'error', message: '記録が中断されました。もう一度開始してください。' });
     }
@@ -97,7 +106,7 @@ async function startCapture() {
     if (!response?.ok || !response.status) throw new Error(response?.error ?? '画面の記録を開始できませんでした。');
     await chrome.storage.session.set({ gameTabId: tab.id });
     await publish(response.status);
-    return { ok: true, status: response.status };
+    return { ok: true, status };
   } catch (error) {
     if (tab?.id) await chrome.tabs.sendMessage(tab.id, { type: 'UCHI_CAPTURE_DISABLE' }).catch(() => {});
     if (await hasOffscreen()) {

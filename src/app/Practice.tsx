@@ -8,16 +8,16 @@ import { Brand, fmt, Highlight, Spinner, uid, useApp } from './shared';
 
 type RunState='ready'|'starting'|'running'|'paused'|'between'|'finished';
 export default function Practice({queue,pattern,onExit,onAgain,onUnsavedChange}:{queue:Phrase[];pattern?:string;onExit:()=>void;onAgain:()=>void;onUnsavedChange?:(unsaved:boolean)=>void}){
-  const {notify,data}=useApp();const [state,setState]=useState<RunState>('ready');const [index,setIndex]=useState(0),[progress,setProgress]=useState(0);
+  const {notify}=useApp();const [state,setState]=useState<RunState>('ready');const [index,setIndex]=useState(0),[progress,setProgress]=useState(0);
   const [display,setDisplay]=useState(queue[0]?.roman||'');const [flash,setFlash]=useState(false),[ime,setIme]=useState(false);
   const [results,setResults]=useState<Attempt[]>([]),[saving,setSaving]=useState(false),[seconds,setSeconds]=useState(0),[persistenceError,setPersistenceError]=useState('');
-  const session=useRef({id:uid(),at:Date.now(),scoreType:data.settings.scoreType});const matcher=useRef(createMatcher(queue[0]?.reading||'',queue[0]?.roman||''));
+  const session=useRef({id:uid(),at:Date.now()});const matcher=useRef(createMatcher(queue[0]?.reading||'',queue[0]?.roman||''));
   const strokes=useRef<KeyStroke[]>([]),phraseAt=useRef(0),pauseAt=useRef(0),paused=useRef(0),totalPaused=useRef(0),timer=useRef<ReturnType<typeof setTimeout>|null>(null);
   const stateRef=useRef<RunState>('ready');const surface=useRef<HTMLDivElement>(null);const mounted=useRef(true),exiting=useRef(false);
   const savedIds=useRef(new Set<string>()),writes=useRef<Promise<void>>(Promise.resolve()),finishTask=useRef<Promise<boolean>|null>(null);
   const phrase=queue[index];const resultRef=useRef<Attempt[]>([]);
   const changeState=(next:RunState)=>{stateRef.current=next;if(mounted.current)setState(next);};
-  const sessionValue=(list:Attempt[],endedAt?:number):Session=>({id:session.current.id,startedAt:session.current.at,...(endedAt?{endedAt}:{}),source:'practice',scoreType:session.current.scoreType,course:10000,mode:'accuracy',phraseCount:list.length,correctKeys:list.reduce((n,a)=>n+a.correctKeys,0),mistakes:list.reduce((n,a)=>n+a.mistakes,0),durationMs:list.reduce((n,a)=>n+a.durationMs,0)});
+  const sessionValue=(list:Attempt[],endedAt?:number):Session=>({id:session.current.id,startedAt:session.current.at,...(endedAt?{endedAt}:{}),source:'practice',scoreType:'total',course:10000,mode:'accuracy',phraseCount:list.length,correctKeys:list.reduce((n,a)=>n+a.correctKeys,0),mistakes:list.reduce((n,a)=>n+a.mistakes,0),durationMs:list.reduce((n,a)=>n+a.durationMs,0)});
   const persist=(list:Attempt[],endedAt?:number)=>{
     // Serialize writes so leaving during the inter-word transition cannot overwrite a later result.
     const task=writes.current.catch(()=>{}).then(async()=>{for(const attempt of list){if(!savedIds.current.has(attempt.id)){await saveAttempt(attempt);savedIds.current.add(attempt.id);}}await saveSession(sessionValue(list,endedAt));});
@@ -26,7 +26,7 @@ export default function Practice({queue,pattern,onExit,onAgain,onUnsavedChange}:
   const prepare=(i:number)=>{matcher.current=createMatcher(queue[i].reading,queue[i].roman);setDisplay(matcher.current.display);setProgress(0);strokes.current=[];phraseAt.current=Date.now();paused.current=0;setIme(false);};
   const start=async()=>{
     if(stateRef.current!=='ready')return;changeState('starting');setPersistenceError('');
-    session.current={id:uid(),at:Date.now(),scoreType:data.settings.scoreType};savedIds.current.clear();finishTask.current=null;exiting.current=false;totalPaused.current=0;setSeconds(0);
+    session.current={id:uid(),at:Date.now()};savedIds.current.clear();finishTask.current=null;exiting.current=false;totalPaused.current=0;setSeconds(0);
     try{await saveSession(sessionValue([]));if(!mounted.current||exiting.current)return;prepare(0);changeState('running');surface.current?.focus();}
     catch{changeState('ready');setPersistenceError('練習記録を保存できません。空き容量を確認して再試行してください。');notify('練習を開始できませんでした。','error');}
   };

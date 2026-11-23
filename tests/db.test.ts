@@ -19,7 +19,7 @@ after(()=>{for(const c of TestBroadcastChannel.channels)c.close();globalThis.Bro
 beforeEach(async()=>{await clearData();});
 const now=1760000000000;
 function phrase(id='p1',text='ペアルック',reading='ぺあるっく',roman='pearukku'):Phrase{return {id,text,reading,roman,source:'capture',confidence:92,verified:true,capturedAt:now,lastSeenAt:now,seenCount:1};}
-function session(id='s1'):Session{return {id,startedAt:now,endedAt:now+2000,source:'practice',scoreType:'profit',course:10000,mode:'accuracy',phraseCount:1,correctKeys:8,mistakes:1,durationMs:2000};}
+function session(id='s1'):Session{return {id,startedAt:now,endedAt:now+2000,source:'practice',scoreType:'total',course:10000,mode:'accuracy',phraseCount:1,correctKeys:8,mistakes:1,durationMs:2000};}
 function attempt(id='a1',phraseId='p1',sessionId='s1'):Attempt{return {id,phraseId,sessionId,source:'practice',startedAt:now,endedAt:now+2000,durationMs:2000,correctKeys:8,mistakes:1,accuracy:8/9*100,kps:4,samples:[{pattern:'kk',intervalMs:200,error:true,at:now+1600}],complete:true,reliable:true,typed:'pearukku'};}
 async function seed(){await savePhrase(phrase());await saveSession(session());await saveAttempt(attempt());}
 
@@ -69,7 +69,7 @@ test('exports validate standalone restore compatibility and preserve all records
   await assert.rejects(exportData(),/参照する語句・セッション/);
   assert.deepEqual(await getData(),withoutSession);
   await saveSession({...session(),source:'capture'});
-  await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+2000,scoreEvidence:evidence});
+  await saveAutomaticScore('s1',{score:18000,scoreType:'total',scoreConfidence:95,scoreObservedAt:now+2000,scoreEvidence:evidence});
   const original=await getData(),backup=await exportData();
   assert.equal(backup.version,1);assert.equal(backup.phrases[0].screenshot,screenshot);assert.equal(backup.sessions[0].scoreEvidence,evidence);
   await clearData();await importData(JSON.parse(JSON.stringify(backup)));
@@ -133,35 +133,35 @@ test('detailed actual and expected keystrokes survive backup and malformed detai
   await assert.rejects(importData(malformed));assert.deepEqual(await getData(),before);
 });
 
-test('automatic scores retain total/profit and survive asynchronous session-count writes',async()=>{
-  const captured:Session={...session(),source:'capture',captureId:'recording-1',scoreReview:{score:18000,scoreType:'profit',confidence:64,observedAt:now+1500,reason:'数値を確認'}};
+test('automatic totals survive asynchronous session-count writes without storing a profit amount',async()=>{
+  const captured:Session={...session(),source:'capture',captureId:'recording-1',scoreReview:{score:18000,scoreType:'total',confidence:64,observedAt:now+1500,reason:'数値を確認'}};
   await saveSession(captured);assert.equal(summarize(await getData()).best,null);
-  assert.equal(await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:94,scoreObservedAt:now+2000,scoreEvidence:'data:image/png;base64,AA==',scoreModeSource:'configured'}),true);
+  assert.equal(await saveAutomaticScore('s1',{score:18000,scoreType:'total',scoreConfidence:94,scoreObservedAt:now+2000,scoreEvidence:'data:image/png;base64,AA==',scoreModeSource:'configured'}),true);
   await saveSession({...captured,phraseCount:7});
-  const saved=(await getData()).sessions[0];assert.equal(saved.score,18000);assert.equal(saved.scoreSource,'ocr');assert.equal(saved.scoreTotal,28000);assert.equal(saved.scoreProfit,18000);assert.equal(saved.phraseCount,7);assert.equal(saved.scoreReview,undefined);
+  const saved=(await getData()).sessions[0];assert.equal(saved.score,18000);assert.equal(saved.scoreSource,'ocr');assert.equal(saved.scoreTotal,18000);assert.equal('scoreProfit' in saved,false);assert.equal(saved.phraseCount,7);assert.equal(saved.scoreReview,undefined);
   assert.equal(saved.scoreModeSource,'configured');
-  assert.equal(await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:99,scoreObservedAt:now+3000}),false);
+  assert.equal(await saveAutomaticScore('s1',{score:18000,scoreType:'total',scoreConfidence:99,scoreObservedAt:now+3000}),false);
   const backup=await exportData();await clearData();await importData(JSON.parse(JSON.stringify(backup)));assert.deepEqual((await getData()).sessions,backup.sessions);
 });
 
 test('manual and legacy score corrections cannot be overwritten by OCR or stale capture objects',async()=>{
   const captured:Session={...session(),source:'capture'};await saveSession(captured);
-  await saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+2000});
+  await saveAutomaticScore('s1',{score:18000,scoreType:'total',scoreConfidence:95,scoreObservedAt:now+2000});
   const automatic=(await getData()).sessions[0];await saveSession({...automatic,score:19000,scoreSource:'manual'});
-  assert.equal(await saveAutomaticScore('s1',{score:20000,scoreType:'profit',scoreConfidence:99,scoreObservedAt:now+4000}),false);
-  await saveSession({...automatic,phraseCount:10,score:22000,scoreObservedAt:Date.now()+1000});
-  let saved=(await getData()).sessions[0];assert.equal(saved.score,19000);assert.equal(saved.scoreSource,'manual');assert.equal(saved.scoreConfidence,undefined);assert.equal(saved.scoreEvidence,undefined);assert.equal(saved.scoreTotal,29000);assert.equal(saved.phraseCount,10);
+  assert.equal(await saveAutomaticScore('s1',{score:20000,scoreType:'total',scoreConfidence:99,scoreObservedAt:now+4000}),false);
+  await saveSession({...automatic,phraseCount:10,score:22000,scoreTotal:22000,scoreObservedAt:Date.now()+1000});
+  let saved=(await getData()).sessions[0];assert.equal(saved.score,19000);assert.equal(saved.scoreSource,'manual');assert.equal(saved.scoreConfidence,undefined);assert.equal(saved.scoreEvidence,undefined);assert.equal(saved.scoreTotal,19000);assert.equal(saved.phraseCount,10);
   await saveSession({...captured,id:'legacy',score:17000});
-  assert.equal(await saveAutomaticScore('legacy',{score:21000,scoreType:'profit',scoreConfidence:99,scoreObservedAt:now+4000}),false);
+  assert.equal(await saveAutomaticScore('legacy',{score:21000,scoreType:'total',scoreConfidence:99,scoreObservedAt:now+4000}),false);
   saved=(await getData()).sessions.find(s=>s.id==='legacy')!;assert.equal(saved.score,17000);
 });
 
 test('pending score review persists without affecting graphs and invalid score evidence is rejected',async()=>{
   const captured:Session={...session(),source:'capture'};await saveSession(captured);
-  await saveSession({...captured,scoreReview:{score:18000,scoreType:'profit',confidence:60,observedAt:now+1000,reason:'数値が一致しません',evidence:'data:image/png;base64,AA=='}});
+  await saveSession({...captured,scoreReview:{score:18000,scoreType:'total',confidence:60,observedAt:now+1000,reason:'数値が一致しません',evidence:'data:image/png;base64,AA=='}});
   await saveSession({...captured,phraseCount:5});const before=await getData();
   assert.equal(before.sessions[0].scoreReview?.score,18000);assert.equal(before.sessions[0].score,undefined);assert.equal(summarize(before).best,null);
-  await assert.rejects(saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+3000,scoreTotal:30000,scoreProfit:18000}));
+  await assert.rejects(saveAutomaticScore('s1',{score:18000,scoreType:'total',scoreConfidence:95,scoreObservedAt:now+3000,scoreTotal:30000}));
   await assert.rejects(importData({...before,version:1,sessions:[{...before.sessions[0],scoreReview:{...before.sessions[0].scoreReview,evidence:'https://example.com/image.png'}}]}));
   await assert.rejects(importData({...before,version:1,sessions:[{...before.sessions[0],scoreModeSource:'inferred'}]}));
   assert.deepEqual(await getData(),before);
@@ -170,7 +170,7 @@ test('pending score review persists without affecting graphs and invalid score e
 test('concurrent manual and automatic score saves always preserve the manual correction',async()=>{
   const captured:Session={...session(),source:'capture'};await saveSession(captured);
   await Promise.all([
-    saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+2000}),
+    saveAutomaticScore('s1',{score:18000,scoreType:'total',scoreConfidence:95,scoreObservedAt:now+2000}),
     saveSession({...captured,score:19500,scoreSource:'manual'}),
   ]);
   const saved=(await getData()).sessions[0];assert.equal(saved.score,19500);assert.equal(saved.scoreSource,'manual');
@@ -200,5 +200,55 @@ test('terminal-miss captures roundtrip and forged termination flags are rejected
   }
   const corrected=buildAttempt({phrase:p,strokes:[...'peaqrukku'].map((key,i)=>({key,at:now+(i+1)*100})),startedAt:now,endedAt:now+1000,sessionId:'s1',source:'practice',complete:true,reliable:true});
   await assert.rejects(saveAttempt({...corrected,source:'capture',complete:false,errorTerminated:true}));
+  assert.deepEqual(await getData(),before);
+});
+
+test('legacy backups convert profit observations once, retain totals, and export only total money fields',async()=>{
+  const evidence='data:image/png;base64,AQ==';
+  const oldSettings={...DEFAULT_SETTINGS,scoreType:'profit',sessionLength:15};
+  const old={version:1,phrases:[{...phrase(),screenshot:evidence}],attempts:[attempt('legacy-attempt','p1','profit')],settings:oldSettings,sessions:[
+    {...session('profit'),source:'capture',score:18000,scoreType:'profit',scoreTotal:28000,scoreProfit:18000,scoreSource:'ocr',scoreConfidence:95,scoreObservedAt:now+2000,scoreEvidence:evidence},
+    {...session('total'),source:'manual',score:28000,scoreType:'total',scoreTotal:28000,scoreProfit:18000},
+    {...session('review'),source:'capture',scoreType:'profit',scoreReview:{score:-800,scoreType:'profit',confidence:64,observedAt:now+1500,reason:'数字を確認',evidence}},
+  ]};
+  await importData(old);const converted=await getData();
+  assert.equal(converted.sessions.find(s=>s.id==='profit')?.score,28000);
+  assert.equal(converted.sessions.find(s=>s.id==='total')?.score,28000);
+  const review=converted.sessions.find(s=>s.id==='review')!;
+  assert.equal(review.score,undefined);assert.equal(review.scoreReview?.score,9200);assert.equal(review.scoreReview?.evidence,evidence);
+  assert.deepEqual(converted.phrases,old.phrases);assert.deepEqual(converted.attempts,old.attempts);
+  assert.deepEqual(converted.settings,{...oldSettings,scoreType:'total'});
+  assert.equal(converted.settings.targetScore,30000);assert.equal(converted.settings.baselineScore,18000);
+  const backup=await exportData();assert.equal(backup.version,1);
+  assert.equal(JSON.stringify(backup).includes('"scoreProfit"'),false);
+  assert.ok(backup.sessions.every(s=>s.scoreType==='total'&&(!s.scoreReview||s.scoreReview.scoreType==='total')));
+  await clearData();await importData(JSON.parse(JSON.stringify(backup)));
+  assert.deepEqual(await getData(),converted);
+});
+
+test('contradictory legacy totals stay in review with all candidates and existing evidence preserved',async()=>{
+  const evidence='data:image/png;base64,AA==',previousEvidence='data:image/png;base64,AQ==';
+  await importData({version:1,phrases:[],attempts:[],settings:DEFAULT_SETTINGS,sessions:[{
+    ...session('conflict'),source:'capture',scoreType:'profit',score:18000,scoreTotal:29000,scoreProfit:18000,
+    scoreSource:'ocr',scoreConfidence:95,scoreObservedAt:now+2000,scoreEvidence:evidence,
+    scoreReview:{score:17500,scoreType:'profit',confidence:60,observedAt:now+1500,reason:'前の数字を確認',evidence:previousEvidence},
+  }]});
+  const data=await getData(),result=data.sessions[0];
+  assert.equal(result.score,undefined);assert.equal(result.scoreTotal,undefined);assert.equal(result.scoreReview?.score,undefined);
+  assert.equal(result.scoreType,'total');assert.equal(result.scoreReview?.scoreType,'total');assert.equal('scoreProfit' in result,false);
+  assert.match(result.scoreReview!.reason,/合計金額の候補が一致しません/);
+  for(const value of ['28000','29000','27500','前の数字を確認'])assert.ok(result.scoreReview!.reason.includes(value));
+  assert.equal(result.scoreEvidence,evidence);assert.equal(result.scoreReview?.evidence,previousEvidence);
+  assert.equal(result.scoreReview?.observedAt,now+1500);assert.equal(result.scoreObservedAt,now+2000);
+  assert.equal(summarize(data).best,null);
+  const backup=await exportData();await clearData();await importData(backup);assert.deepEqual(await getData(),data);
+});
+
+test('ordinary score and settings writes reject legacy profit units instead of interpreting them as totals',async()=>{
+  await saveSession({...session(),source:'capture'});const before=await getData();
+  await assert.rejects(saveSession({...session(),score:18000,scoreType:'profit'} as unknown as Session));
+  await assert.rejects(saveAutomaticScore('s1',{score:18000,scoreType:'profit',scoreConfidence:95,scoreObservedAt:now+2000} as any));
+  await assert.rejects(updateSettings({scoreType:'profit'} as any));
+  await assert.rejects(saveAutomaticScore('s1',{score:18000,scoreType:'total',scoreConfidence:95,scoreObservedAt:now+2000,scoreTotal:28000}));
   assert.deepEqual(await getData(),before);
 });

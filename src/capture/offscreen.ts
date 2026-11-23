@@ -82,10 +82,10 @@ function announce(patch: Partial<CaptureStatus> = {}) {
 }
 function makeGame(at: number, id: string = crypto.randomUUID()): CaptureGame {
   const data: Session = {
-    id, captureId: status.sessionId, startedAt: at, source: 'capture', scoreType: settings!.scoreType,
+    id, captureId: status.sessionId, startedAt: at, source: 'capture', scoreType: 'total',
     course: 10000, mode: 'accuracy', phraseCount: 0, correctKeys: 0, mistakes: 0, durationMs: 0,
   };
-  const game: CaptureGame = { session: data, writes: saveSession(data), observedPrompt: false, resultSeen: false, scoreSaved: false, reader: new ResultFrameSequence(data.scoreType) };
+  const game: CaptureGame = { session: data, writes: saveSession(data), observedPrompt: false, resultSeen: false, scoreSaved: false, reader: new ResultFrameSequence() };
   // Every queued OCR job keeps its own game, so a quick retry cannot attach an
   // old phrase or result to the next game in the same continuous recording.
   games.push(game); activeGame = game; session = data;
@@ -391,7 +391,7 @@ function resultCanvas(input: HTMLCanvasElement, dark = false): HTMLCanvasElement
 async function reviewScore(game: CaptureGame, parsed: ParsedScore, at: number, evidence: string, reason?: string) {
   if (game.scoreSaved) return;
   game.session.scoreReview = {
-    ...(parsed.score !== undefined ? { score: parsed.score } : {}), scoreType: game.session.scoreType,
+    ...(parsed.score !== undefined ? { score: parsed.score } : {}), scoreType: 'total',
     confidence: parsed.confidence, observedAt: at, evidence, reason: reason ?? parsed.reason ?? '結果をもう一度確認してください',
   };
   await persistGame(game);
@@ -401,8 +401,8 @@ async function acceptScore(game: CaptureGame, parsed: ParsedScore, at: number, e
   if (game.scoreSaved || parsed.score === undefined) return;
   await game.writes;
   const patch = {
-    score: parsed.score, scoreType: game.session.scoreType, scoreConfidence: parsed.confidence,
-    scoreObservedAt: at, scoreEvidence: evidence, scoreTotal: parsed.total, scoreProfit: parsed.profit,
+    score: parsed.score, scoreType: 'total' as const, scoreConfidence: parsed.confidence,
+    scoreObservedAt: at, scoreEvidence: evidence, scoreTotal: parsed.total,
     scoreModeSource: parsed.modeSource,
   };
   const result = await saveCaptureScore(game.session, patch);
@@ -417,8 +417,10 @@ async function acceptScore(game: CaptureGame, parsed: ParsedScore, at: number, e
 async function recognizeResult(candidate: ResultCandidate) {
   if (!jpWorker || !romanWorker || candidate.game.scoreSaved) return;
   const numeric: { total?: NumericScoreText; paid?: NumericScoreText; profit?: NumericScoreText } = {};
+  const amountLines: { total?: NumericScoreText; paid?: NumericScoreText; profit?: NumericScoreText } = {};
   const lines: string[] = [];
   let labelText = '', labelConfidence = 0, bodyConfidence = 100;
+  let totalLabelText = '', totalLabelConfidence = 0;
   const header = (await jpWorker.recognize(resultCanvas(candidate.header, true))).data;
   await romanWorker.setParameters({ tessedit_char_whitelist: '0123456789,.' });
   try {
@@ -431,16 +433,18 @@ async function recognizeResult(candidate: ResultCandidate) {
       ]);
       lines.push(textResult.data.text);
       bodyConfidence = Math.min(bodyConfidence, textResult.data.confidence);
+      amountLines[kind] = { text: textResult.data.text, confidence: textResult.data.confidence };
       if (numberResult) numeric[kind] = { text: numberResult.data.text, confidence: numberResult.data.confidence };
-      if (kind === 'profit') {
-        labelText = textResult.data.text; labelConfidence = textResult.data.confidence;
+      if (kind === 'total' || kind === 'profit') {
+        let label = textResult.data;
         if (numberRect) {
           const left = numberRect.x + numberRect.width;
           if (left < .8) {
-            const label = (await jpWorker.recognize(resultCanvas(sliceCanvas(canvas, { x: left, y: 0, width: 1-left, height: 1 })))).data;
-            labelText = label.text; labelConfidence = label.confidence;
+            label = (await jpWorker.recognize(resultCanvas(sliceCanvas(canvas, { x: left, y: 0, width: 1-left, height: 1 })))).data;
           }
         }
+        if (kind === 'total') { totalLabelText = label.text; totalLabelConfidence = label.confidence; }
+        else { labelText = label.text; labelConfidence = label.confidence; }
       }
     }
   } finally {
@@ -448,7 +452,7 @@ async function recognizeResult(candidate: ResultCandidate) {
   }
   let parsed = parseResultScore({
     headerText: header.text, headerConfidence: header.confidence, bodyText: lines.join('\n'), bodyConfidence,
-    labelText, labelConfidence, numeric, structureConfidence: candidate.confidence, scoreType: candidate.game.session.scoreType,
+    labelText, labelConfidence, totalLabelText, totalLabelConfidence, amountLines, numeric, structureConfidence: candidate.confidence,
   });
   if (parsed.kind === 'none') parsed = { ...parsed, kind: 'review', reason: '結果の文字を確認してください', fingerprint: `unreadable:${candidate.game.session.id}` };
   candidate.game.lastResult = { parsed, at: candidate.at, evidence: candidate.screenshot };

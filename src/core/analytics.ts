@@ -206,7 +206,7 @@ function dateKey(at:number):string {
 }
 export function summarize(data:AppData):{best:number|null;median:number|null;delta:number|null;accuracy:number|null;kps:number|null;practiceCount:number;streak:number;todayCount:number} {
   const demoOnly=data.sessions.length>0&&data.sessions.every(s=>s.source==='demo');
-  const scored=data.sessions.filter(s=>s.course===10000&&s.mode==='accuracy'&&s.source!=='practice'&&s.scoreType===data.settings.scoreType&&Number.isFinite(s.score)&&(demoOnly||s.source!=='demo')).sort((a,b)=>a.startedAt-b.startedAt);
+  const scored=data.sessions.filter(s=>s.course===10000&&s.mode==='accuracy'&&s.source!=='practice'&&s.scoreType==='total'&&Number.isFinite(s.score)&&(demoOnly||s.source!=='demo')).sort((a,b)=>a.startedAt-b.startedAt);
   const latestMedian=scored.length?median(scored.slice(-5).map(s=>s.score!)):null;
   const usable=data.attempts.filter(a=>a.reliable&&a.complete&&(a.source==='practice'||(demoOnly&&a.source==='demo')));
   const recent=usable.slice().sort((a,b)=>a.endedAt-b.endedAt).slice(-50),keys=recent.reduce((n,a)=>n+a.correctKeys,0),errors=recent.reduce((n,a)=>n+a.mistakes,0),duration=recent.reduce((n,a)=>n+a.durationMs,0);

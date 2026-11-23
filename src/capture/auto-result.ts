@@ -9,7 +9,7 @@ const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(ma
 /**
  * Locate the result receipt by its dark course header, white paper and coloured
  * outlined amount. Text labels are verified by OCR afterwards; this detector
- * never interprets a leaderboard's generic "score" as profit.
+ * never interprets a leaderboard's generic "score" as a result total.
  */
 export function detectResultRegions(frame: PixelFrame): ResultRegions | null {
   const { width, height, data } = frame;
