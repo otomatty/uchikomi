@@ -925,16 +925,19 @@ try {
         return { key, screen: after.state, round: after.round, noSyntheticEscape: true };
       };
       const savedResult = async (label, gameId) => {
+        const shownAt = Date.now();
         const shown = await game.evaluate(() => window.canvasFixture.showResult());
         const saved = await poll(`${label}: result total saved through live OCR`, readStatus, state =>
           state.activeSessionId === gameId && state.scoreState === 'saved' &&
           state.latestScore?.sessionId === gameId && state.latestScore.score === 29740, 90000);
+        const confirmationLatencyMs = Date.now() - shownAt;
         const persisted = await app.evaluate(async id => (await window.UchiQA.getData()).sessions.find(value => value.id === id), gameId);
         assert.equal(persisted?.score, 29740); assert.equal(persisted.scoreTotal, 29740);
         assert.equal(persisted.scoreType, 'total'); assert.equal(persisted.scoreSource, 'ocr');
         await poll(`${label}: fresh result frames after score persistence`, readStatus,
           state => state.activeSessionId === gameId && state.lastFrameAt > saved.lastFrameAt);
-        return { round: shown.round, sessionId: gameId, score: persisted.score, scoreSource: persisted.scoreSource };
+        return { round: shown.round, sessionId: gameId, score: persisted.score, scoreSource: persisted.scoreSource,
+          confirmationLatencyMs };
       };
       const replayWith = async (label, key, expectedTrusted, previous) => {
         const before = await fixtureState(); assert.equal(before.state, 'result');
@@ -1003,6 +1006,8 @@ try {
       replay.customMappingUpdatedWithoutReload = true;
       replay.f2SettingSurvivedReload = true;
       await diagnose('completed');
+      assert.equal(result.diagnostics.completed.routing.offscreen?.canvasBlobs?.calls, 0,
+        'Hidden offscreen OCR must receive encoded images without an asynchronous canvas.toBlob handoff');
     } catch (error) {
       await diagnose('failure').catch(diagnosticError => { result.diagnosticError = String(diagnosticError.message || diagnosticError); });
       result.failureStatus = await send('UCHI_STATUS').catch(e => ({ error: String(e.message || e) }));

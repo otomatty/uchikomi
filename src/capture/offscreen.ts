@@ -236,6 +236,12 @@ function ocrCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
   context.putImageData(image, 0, 0);
   return output;
 }
+function ocrInput(canvas: HTMLCanvasElement): string {
+  // Tesseract converts HTMLCanvasElement through asynchronous toBlob(), whose
+  // idle encoding can stall in a hidden document. Encode only this small text
+  // crop as lossless PNG; its data-URL input goes straight to byte decoding.
+  return canvas.toDataURL('image/png');
+}
 function imageSignature(rect: Rect): { bytes: Uint8Array; ink: number } {
   const frame = frameSurface();
   const area = pixelRect(rect, frame.width, frame.height);
@@ -424,12 +430,12 @@ function sampleFrame(now = Date.now()) {
 async function recognize(candidate: Candidate) {
   if (!jpWorker || !romanWorker) return;
   const [jpResult, romanResult] = await Promise.all([
-    jpWorker.recognize(ocrCanvas(candidate.japanese)),
-    romanWorker.recognize(ocrCanvas(candidate.roman)),
+    jpWorker.recognize(ocrInput(ocrCanvas(candidate.japanese))),
+    romanWorker.recognize(ocrInput(ocrCanvas(candidate.roman))),
   ]);
   let readingResult: { text: string; confidence: number } | null = null;
   if (candidate.reading) {
-    const result = await jpWorker.recognize(ocrCanvas(candidate.reading));
+    const result = await jpWorker.recognize(ocrInput(ocrCanvas(candidate.reading)));
     readingResult = result.data;
   }
   const text = normalizeJapanese(jpResult.data.text);
@@ -553,15 +559,15 @@ async function recognizeResult(candidate: ResultCandidate) {
   const lines: string[] = [];
   let labelText = '', labelConfidence = 0, bodyConfidence = 100;
   let totalLabelText = '', totalLabelConfidence = 0;
-  const header = (await jpWorker.recognize(resultCanvas(candidate.header, true))).data;
+  const header = (await jpWorker.recognize(ocrInput(resultCanvas(candidate.header, true)))).data;
   await romanWorker.setParameters({ tessedit_char_whitelist: '0123456789,.' });
   try {
     for (const kind of ['total', 'paid', 'profit'] as const) {
       const canvas = candidate[kind], context = canvas.getContext('2d', { willReadFrequently: true })!;
       const numberRect = findAmountRect(context.getImageData(0, 0, canvas.width, canvas.height), kind);
       const [textResult, numberResult] = await Promise.all([
-        jpWorker.recognize(resultCanvas(canvas)),
-        numberRect ? romanWorker.recognize(resultCanvas(sliceCanvas(canvas, numberRect))) : Promise.resolve(null),
+        jpWorker.recognize(ocrInput(resultCanvas(canvas))),
+        numberRect ? romanWorker.recognize(ocrInput(resultCanvas(sliceCanvas(canvas, numberRect)))) : Promise.resolve(null),
       ]);
       lines.push(textResult.data.text);
       bodyConfidence = Math.min(bodyConfidence, textResult.data.confidence);
@@ -572,7 +578,7 @@ async function recognizeResult(candidate: ResultCandidate) {
         if (numberRect) {
           const left = numberRect.x + numberRect.width;
           if (left < .8) {
-            label = (await jpWorker.recognize(resultCanvas(sliceCanvas(canvas, { x: left, y: 0, width: 1-left, height: 1 })))).data;
+            label = (await jpWorker.recognize(ocrInput(resultCanvas(sliceCanvas(canvas, { x: left, y: 0, width: 1-left, height: 1 }))))).data;
           }
         }
         if (kind === 'total') { totalLabelText = label.text; totalLabelConfidence = label.confidence; }

@@ -35,6 +35,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
   const load = createRequire(filename);
   let listener: ((message: any, sender: any, reply: (result: any) => void) => unknown) | undefined;
   const states: any[] = [], images: any[] = [], bitmapInputs: Blob[] = [];
+  const pngInputs = new Map<string, any>(), ocrInputs: { input: string; width: number; height: number }[] = [];
   const intervals = new Map<unknown, { callback: () => void; delay: number }>();
   const replayTimeouts = new Map<unknown, () => void>();
   const decodeTimeouts = new Map<unknown, () => void>();
@@ -76,7 +77,13 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
       createElement(tag: string) {
         if (tag === 'video') return video;
         const canvas: any = {
-          width: 0, height: 0, toDataURL: () => 'data:image/jpeg;base64,AA==',
+          width: 0, height: 0,
+          toDataURL(type: string) {
+            if (type !== 'image/png') return 'data:image/jpeg;base64,AA==';
+            const input = 'data:image/png;base64,' + Buffer.from(`crop:${pngInputs.size}`).toString('base64');
+            pngInputs.set(input, { width: canvas.width, height: canvas.height, fixtureFrame: canvas.fixtureFrame, fixtureCropY: canvas.fixtureCropY });
+            return input;
+          },
           getContext: () => ({
             drawImage(image: any, ...coordinates: number[]) {
               canvas.fixtureFrame = image.fixtureFrame;
@@ -107,7 +114,18 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
       onMessage: { addListener(value: typeof listener) { listener = value; } },
     } },
     require(name: string) {
-      if (name === './ocr-worker') return { startOcrWorkers: startWorkers };
+      if (name === './ocr-worker') return { startOcrWorkers: async (...args: any[]) => (await startWorkers(...args)).map(worker => {
+        if (!worker.recognize) return worker;
+        return { ...worker, recognize(input: string, ...rest: any[]) {
+          // Model the worker boundary while keeping each OCR stub concerned
+          // with its original crop. Canvas inputs would take hidden toBlob().
+          assert.equal(typeof input, 'string', 'OCR must receive pre-encoded PNG instead of a canvas');
+          const crop = pngInputs.get(input);
+          assert.ok(crop, 'OCR must receive the prepared PNG text crop');
+          ocrInputs.push({ input, width: crop.width, height: crop.height });
+          return worker.recognize(crop, ...rest);
+        } };
+      }) };
       if (name === '../core/db') return options.saveSession ? { ...db, saveSession: options.saveSession } : db;
       if (name === 'tesseract.js') return { PSM: { SINGLE_LINE: '7' } };
       if ((receipt !== undefined || options.scene) && name === './auto-region') return { detectPromptRegions: () => {
@@ -138,7 +156,7 @@ async function fixture(startWorkers: (...args: any[]) => Promise<any[]>, receipt
     assert.ok(keepAlive === true || replied, `${type} must reply or keep its channel open`);
   });
   return {
-    request, states, intervals, images, bitmapInputs, replayTimeouts, decodeTimeouts, evaluate: (code: string) => vm.runInContext(code, runtime),
+    request, states, intervals, images, bitmapInputs, ocrInputs, replayTimeouts, decodeTimeouts, evaluate: (code: string) => vm.runInContext(code, runtime),
     stoppedTracks: () => stoppedTracks, mediaCalls: () => mediaCalls,
     presentTabFrame(notify = true) {
       video.readyState = 2; video.videoWidth = 1280; video.videoHeight = 800; presentedFrames++;
@@ -492,6 +510,19 @@ test('separate continuous canvas result frames automatically save the total once
   await run.send();
   assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
   assert.equal((await db.getData()).sessions.length, 1);
+});
+
+test('pre-encoded PNG text crops reach OCR and preserve automatic score agreement without hidden canvas conversion', async () => {
+  const run = await resultFixture();
+  for (let i = 0; i < 15; i++) await run.send();
+  assert.equal(run.app.ocrInputs.length, 8, 'two independent receipts each recognize four text lines in this fixture');
+  for (const image of run.app.ocrInputs) {
+    assert.match(image.input, /^data:image\/png;base64,/);
+    assert.ok(image.width > 0 && image.height > 0 && image.width * image.height < 1280 * 800,
+      'only the prepared text crop is encoded, not the full captured game');
+  }
+  assert.equal((await db.getData()).sessions[0].score, 29740);
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
 });
 
 test('a canvas frame gap requires two fresh receipt observations before saving', async () => {

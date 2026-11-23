@@ -12,6 +12,7 @@
     context, startedAt: clock(), received: {}, sent: {}, imageDecodes: { calls: 0, pending: 0, fulfilled: 0, rejected: 0 },
     bitmaps: { calls: 0, pending: 0, fulfilled: 0, rejected: 0 }, events: [], offscreenEvents: [],
     frames: { lastAt: null, gaps: [], maxGap: 0 }, scoreStates: [],
+    canvasBlobs: { calls: 0 },
     ocr: { workers: 0, calls: 0, completed: 0, rejected: 0, pending: {}, results: [] },
   };
   const send = chrome.runtime.sendMessage;
@@ -102,6 +103,11 @@
     if (traced.has(type)) record('receive', messageMeta(message));
   });
   if (context !== 'offscreen') return;
+  const canvasBlob = globalThis.HTMLCanvasElement?.prototype.toBlob;
+  if (typeof canvasBlob === 'function') HTMLCanvasElement.prototype.toBlob = function (...args) {
+    state.canvasBlobs.calls++;
+    return Reflect.apply(canvasBlob, this, args);
+  };
   const NativeWorker = globalThis.Worker;
   if (typeof NativeWorker === 'function') globalThis.Worker = new Proxy(NativeWorker, {
     construct(Target, args) {
