@@ -1,7 +1,10 @@
 /**
  * Reproducible QA for the unpacked extension. Never uses an existing Chrome profile.
  * npm run build && node tests/browser-check.mjs
- * HEADLESS=0 CHROME_BIN=/path/to/chrome node tests/browser-check.mjs
+ * Linux CI: xvfb-run -a npm run test:browser
+ * The complete suite uses headed Chrome for genuine tab visibility changes.
+ * HEADLESS=1 is an explicit diagnostic option; all assertions still apply.
+ * CHROME_BIN=/path/to/chrome node tests/browser-check.mjs
  * Screenshots/report are internal QA artifacts, not product assets.
  */
 import { mkdtemp, mkdir, cp, readFile, writeFile, rm, access, stat } from 'node:fs/promises';
@@ -16,7 +19,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = path.join(root, 'qa');
 const temp = await mkdtemp(path.join(os.tmpdir(), 'uchikomi-qa-'));
 const extension = path.join(temp, 'extension');
-const report = { startedAt: new Date().toISOString(), fixtureOnly: true, checks: [], errors: [], browserErrors: [], consoleErrors: [] };
+const headless = process.env.HEADLESS === '1';
+const report = { startedAt: new Date().toISOString(), fixtureOnly: true,
+  browserMode: { headless, displayProvided: !!process.env.DISPLAY },
+  checks: [], errors: [], browserErrors: [], consoleErrors: [] };
 let context, app, cdp;
 const run = async (name, fn) => {
   try { await fn(); report.checks.push({ name, ok: true }); console.log(`PASS ${name}`); }
@@ -63,10 +69,19 @@ try {
         import { detectPromptRegions } from ${JSON.stringify(path.join(root, 'src/capture/auto-region.ts'))};
         import { detectResultRegions } from ${JSON.stringify(path.join(root, 'src/capture/auto-result.ts'))};
         async function imageFrame(dataUrl) {
-          const image=new Image(); image.src=dataUrl; await image.decode();
-          const canvas=document.createElement('canvas'); canvas.width=image.naturalWidth; canvas.height=image.naturalHeight;
-          const ctx=canvas.getContext('2d'); ctx.drawImage(image,0,0);
-          return ctx.getImageData(0,0,canvas.width,canvas.height);
+          // This helper is called while the extension tab is truly hidden.
+          // Decode bytes directly; HTMLImageElement.decode can await rendering
+          // work that a hidden document does not perform.
+          const comma=dataUrl.indexOf(','), header=dataUrl.slice(0,comma), type=header.slice(5,-7);
+          if(comma<0||!header.startsWith('data:')||!header.endsWith(';base64')||
+            !['image/png','image/jpeg','image/webp'].includes(type))throw new Error('Invalid QA image');
+          const bytes=Uint8Array.from(atob(dataUrl.slice(comma+1)),character=>character.charCodeAt(0));
+          const image=await createImageBitmap(new Blob([bytes],{type}));
+          try {
+            const canvas=document.createElement('canvas'); canvas.width=image.width; canvas.height=image.height;
+            const ctx=canvas.getContext('2d'); ctx.drawImage(image,0,0);
+            return ctx.getImageData(0,0,canvas.width,canvas.height);
+          } finally {image.close();}
         }
         export async function detectPromptFromImage(dataUrl) { return detectPromptRegions(await imageFrame(dataUrl)); }
         export async function detectResultFromImage(dataUrl) { return detectResultRegions(await imageFrame(dataUrl)); }
@@ -94,10 +109,10 @@ try {
     bundle: true, platform: 'browser', format: 'iife', globalName: 'UchiQA', target: 'es2022', outfile: path.join(extension, 'qa-harness.js'),
   });
   context = await chromium.launchPersistentContext(path.join(temp, 'profile'), {
-    // The bundled Chromium channel supports extensions in new headless mode.
-    // The default headless shell does not load an extension service worker.
+    // Use full Chromium, including when HEADLESS=1 is explicitly requested.
+    // CI runs headed under Xvfb so inactive tabs become genuinely hidden.
     ...(process.env.CHROME_BIN ? { executablePath: process.env.CHROME_BIN } : { channel: 'chromium' }),
-    headless: process.env.HEADLESS !== '0',
+    headless,
     ignoreDefaultArgs: ['--disable-extensions'],
     // Chrome's supported extension-testing API needs an explicit opt-in. Playwright
     // supplies --remote-debugging-pipe itself. This is an isolated, disposable profile.
@@ -347,6 +362,7 @@ try {
     await app.screenshot({ animations: 'disabled',path:path.join(output,'automatic-score.png'),fullPage:true});
   });
   await run('A backup larger than 30 MiB round-trips through settings into an empty database',async()=>{
+    await app.bringToFront();
     const original=await app.evaluate(()=>window.UchiQA.exportData());
     // Compare every field without sending large images to Node or an assertion diff.
     const snapshot=async()=>{
@@ -434,6 +450,7 @@ try {
     // Release every origin-owned connection, including Chrome's welcome tab.
     for(const page of context.pages())if(page.url().startsWith(`chrome-extension://${extensionId}/`))await page.close();
     app=await context.newPage();await app.goto(`chrome-extension://${extensionId}/qa-empty.html`);
+    await app.bringToFront();
     const legacy=await app.evaluate(async original=>{
       const data=structuredClone(original),at=Date.now();
       const canvas=document.createElement('canvas');canvas.width=canvas.height=8;

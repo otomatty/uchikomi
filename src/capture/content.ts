@@ -26,6 +26,7 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
   let lastReplayAt = 0;
   let buffer: { key: string; code: string; at: number }[] = [];
   let pendingKeys: Promise<unknown> = Promise.resolve();
+  let pendingEnd: Promise<void> = Promise.resolve();
   let timer: number | undefined;
   let probeTimer: number | undefined;
   const safeSend = async (message: unknown) => {
@@ -87,8 +88,10 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
     if (reason === 'error') retryBlocked = true;
     disable();
     if (endingSession && endingMode === 'canvas') {
-      await pendingKeys;
-      await safeSend({ type: 'UCHI_CANVAS_END', sessionId: endingSession, documentToken, reason, ...(error ? { error } : {}) });
+      pendingEnd = Promise.all([pendingEnd, pendingKeys]).then(async () => {
+        await safeSend({ type: 'UCHI_CANVAS_END', sessionId: endingSession, documentToken, reason, ...(error ? { error } : {}) });
+      });
+      await pendingEnd;
     }
   }
 
@@ -97,6 +100,10 @@ import { isReplayShortcut, matchesReplayShortcut, type ReplayShortcut } from '..
     if (pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
     probing = true;
     try {
+      // A fast return to the tab must not reuse the session whose final keys
+      // and END are still in flight: that late END would stop the new producer.
+      await pendingEnd;
+      if (pageHidden || document.visibilityState !== 'visible' || retryBlocked) return;
       const canvas = visibleGameCanvas(document);
       if (captureMode === 'tab' && sessionId && captureCanvas !== canvas) {
         // Manual tabCapture keeps the same media owner when the page replaces
