@@ -1002,6 +1002,7 @@ try {
       replay.nativeEscapeUnchanged = true;
       replay.customMappingUpdatedWithoutReload = true;
       replay.f2SettingSurvivedReload = true;
+      await diagnose('completed');
     } catch (error) {
       await diagnose('failure').catch(diagnosticError => { result.diagnosticError = String(diagnosticError.message || diagnosticError); });
       result.failureStatus = await send('UCHI_STATUS').catch(e => ({ error: String(e.message || e) }));

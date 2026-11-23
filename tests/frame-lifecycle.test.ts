@@ -74,10 +74,13 @@ test('an actually scanned blank breaks result agreement, including OCR queued be
   for (const ocrBeforeBlank of [true, false]) {
     const frames = new ResultFrameSequence();
     const first = frames.scanned(true, now + 1000);
+    assert.equal(frames.isCurrent(first), true);
     if (ocrBeforeBlank) assert.equal(frames.observe(score, now + 1000, first), null);
     frames.scanned(false, now + 1600);
+    assert.equal(frames.isCurrent(first), false, 'obsolete queued work is visible before running its OCR');
     if (!ocrBeforeBlank) assert.equal(frames.observe(score, now + 1000, first), null);
     const second = frames.scanned(true, now + 2200);
+    assert.equal(frames.isCurrent(second), true);
     assert.equal(frames.observe(score, now + 2200, second), null);
     const third = frames.scanned(true, now + 3400);
     assert.equal(frames.observe(score, now + 3400, third)?.score, 29740);

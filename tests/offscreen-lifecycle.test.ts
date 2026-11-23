@@ -563,8 +563,70 @@ async function blockedResultFixture() {
   await new Promise(resolve => setImmediate(resolve));
   scene.prompt = false; scene.receipt = true;
   await send(240); await entered.promise;
-  return { app, scene, send, release: () => released.resolve(), advance(delay: number) { now += delay; } };
+  return { app, scene, send, release: () => released.resolve(), ocrCalls: () => line, advance(delay: number) { now += delay; } };
 }
+
+test('a frame gap skips the stale result backlog without reusing its evidence to confirm a fresh result', async () => {
+  const run = await blockedResultFixture();
+  // Fill all four result slots while the first receipt is still being read.
+  for (let i = 0; i < 60; i++) await run.send();
+  assert.equal(run.app.evaluate('scoreQueue.length'), 4);
+  const obsolete = run.app.evaluate('scoreQueue.flatMap(candidate => [candidate.header, candidate.total, candidate.paid, candidate.profit])');
+  await run.send(320); // Every queued receipt predates this observation gap.
+  run.release(); await run.app.evaluate('processQueue()');
+  assert.equal(run.ocrCalls(), 4, 'the in-flight receipt is retained, but its four obsolete successors need no OCR');
+  assert.ok(obsolete.every((canvas: any) => canvas.width === 1), 'skipped candidates still release their crops');
+  const previous = run.app.evaluate('activeGame.lastResult');
+  assert.equal(previous.parsed.score, 29740); assert.ok(previous.evidence);
+  assert.equal((await db.getData()).sessions[0].score, undefined);
+  for (let i = 0; i < 15; i++) await run.send();
+  await run.app.evaluate('processQueue()');
+  assert.equal(run.ocrCalls(), 8);
+  assert.equal((await db.getData()).sessions[0].score, undefined, 'one new receipt cannot agree with pre-gap evidence');
+  for (let i = 0; i < 15; i++) await run.send();
+  await run.app.evaluate('processQueue()');
+  assert.equal(run.ocrCalls(), 12);
+  assert.equal((await db.getData()).sessions[0].score, 29740, 'two new independent receipts can still confirm the total');
+  assert.equal((await run.app.request('UCHI_OFF_STOP')).ok, true);
+});
+
+test('a wholly unread stale result preserves one review for its original game before skipping the rest', async () => {
+  let now = 1700000000000, sequence = 0, resultCalls = 0;
+  const scene = { prompt: true, receipt: false }, entered = deferred<void>(), released = deferred<void>();
+  let blockPrompt = true;
+  const jp = { async setParameters() {}, async terminate() {}, async recognize(image: any) {
+    let text = '?';
+    if (image.fixtureFrame === 'prompt') {
+      if (blockPrompt) { blockPrompt = false; entered.resolve(); await released.promise; }
+      text = image.fixtureCropY === 248 ? 'ぺあるっく' : 'ペアルック';
+    } else if (image.fixtureFrame === 'receipt' && image.fixtureCropY === 160) text = receiptLines[resultCalls++ % 4];
+    return { data: { text, confidence: 96 } };
+  } };
+  const roman = { async setParameters() {}, async terminate() {}, async recognize(image: any) {
+    return { data: { text: image.fixtureFrame === 'prompt' ? 'pearukku' : '?', confidence: 96 } };
+  } };
+  const app = await fixture(async () => [jp, roman], undefined, { scene, clock: () => now });
+  await app.start(canvasStart); await new Promise(resolve => setImmediate(resolve));
+  const send = async (delay = 80) => {
+    now += delay;
+    assert.equal((await app.request('UCHI_OFF_CANVAS_FRAME', { sessionId: 'startup-test', frame: frame(now, ++sequence) })).ok, true);
+  };
+  await send(); await send(); await entered.promise;
+  scene.prompt = false; scene.receipt = true;
+  for (let i = 0; i < 40; i++) await send();
+  assert.ok(app.evaluate('scoreQueue.length') >= 2);
+  assert.equal(app.evaluate('games[0].lastResult'), undefined);
+  scene.receipt = false; await send(320);
+  scene.prompt = true; await send(240); await send();
+  const nextId = app.evaluate('activeGame.session.id'); assert.notEqual(nextId, 'startup-test');
+  released.resolve(); await app.evaluate('processQueue()');
+  assert.equal(resultCalls, 4, 'the first unread old result still receives OCR for a review');
+  const data = await db.getData(), previous = data.sessions.find(session => session.id === 'startup-test')!;
+  assert.equal(previous.score, undefined); assert.equal(previous.scoreReview?.score, 29740);
+  assert.ok(previous.scoreReview?.evidence);
+  assert.equal(data.sessions.find(session => session.id === nextId)?.scoreReview, undefined);
+  assert.equal((await app.request('UCHI_OFF_STOP')).ok, true);
+});
 
 test('replay stores a single receipt for review before approving and starts no game until the next prompt', async () => {
   const run = await resultFixture(), app = run.app;

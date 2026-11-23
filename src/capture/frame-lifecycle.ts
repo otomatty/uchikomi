@@ -59,8 +59,9 @@ export class ResultFrameSequence {
     }
     return this.revision;
   }
+  isCurrent(revision: number): boolean { return revision === this.revision; }
   observe(parsed: ParsedScore, at: number, revision: number): ParsedScore | null {
-    if (revision !== this.revision) return null;
+    if (!this.isCurrent(revision)) return null;
     return this.reader.observe(parsed, at);
   }
 }

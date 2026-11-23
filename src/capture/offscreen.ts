@@ -543,6 +543,11 @@ async function acceptScore(game: CaptureGame, parsed: ParsedScore, at: number, e
 }
 async function recognizeResult(candidate: ResultCandidate) {
   if (!jpWorker || !romanWorker || candidate.game.scoreSaved) return;
+  // Gaps invalidate queued score agreement before OCR finishes. Once a game
+  // has retained a result/evidence for review, do not spend more worker time
+  // on candidates that can no longer confirm it. Keep the first unread one so
+  // a quick retry or stop does not discard that game's only review evidence.
+  if (!candidate.game.reader.isCurrent(candidate.revision) && candidate.game.lastResult) return;
   const numeric: { total?: NumericScoreText; paid?: NumericScoreText; profit?: NumericScoreText } = {};
   const amountLines: { total?: NumericScoreText; paid?: NumericScoreText; profit?: NumericScoreText } = {};
   const lines: string[] = [];
