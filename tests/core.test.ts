@@ -28,6 +28,16 @@ test('nasal n disambiguates vowels/y and supports explicit variants',()=>{
   const m=createMatcher('かんあい','kannai');for(const key of 'kan')m.feed(key);assert.equal(m.feed('a').accepted,false);
   type('ぱん','pann','pann');
 });
+test('a single nasal n cannot borrow the vowel branch of a following wu alternative',()=>{
+  const matcher=createMatcher('んう','nnu');
+  assert.equal(matcher.feed('n').accepted,true);
+  assert.equal(matcher.feed('u').accepted,false);
+  assert.equal(matcher.complete,false);assert.equal(matcher.typed,'n');
+  assert.equal(matcher.feed('n').accepted,true);assert.equal(matcher.feed('u').complete,true);
+  for(const spelling of ['nnu','nwu','nwhu',"n'u",'xnu'])type('んう','nnu',spelling);
+  for(const spelling of ['nkka','nltuka','nxtuka'])type('んっか','nkka',spelling);
+  const generated=kanaToRoman('んう');type('んう',generated,generated);
+});
 test('incorrect keys do not advance; display follows chosen spelling',()=>{
   const m=createMatcher('しつもん','shitsumonn');assert.equal(m.display,'shitsumonn');
   m.feed('s');assert.equal(m.feed('x').accepted,false);assert.equal(m.position,1);
@@ -80,6 +90,22 @@ test('targeted practice prefers a valid actual spelling without changing the cap
   assert.ok(createMatcher(queue[0].reading,queue[0].roman).display.includes('sh'));
   assert.equal(p.roman,'syasinn');assert.equal(p.source,'capture');assert.notEqual(queue[0],p);
   assert.deepEqual(choosePractice([{...p,verified:false}],[actual],3,'sh'),[]);
+});
+test('targeted practice completes a trusted terminal-miss prefix without changing the captured word',()=>{
+  const p={...phrase('syasinn','しゃしん'),text:'写真'};
+  const terminal=buildAttempt({phrase:p,strokes:[...'shq'].map((key,i)=>({key,at:now+(i+1)*100})),startedAt:now,endedAt:now+500,sessionId:'s',source:'capture',complete:false,reliable:true,endOnMistake:true});
+  assert.equal(terminal.typed,'sh');assert.equal(terminal.errorTerminated,true);assert.equal(terminal.reliable,true);
+  const queue=choosePractice([p],[terminal],5,'sh');
+  assert.equal(queue.length,5);assert.ok(queue.every(word=>word.id===p.id&&word.roman.startsWith('sh')));
+  type(queue[0].reading,queue[0].roman,queue[0].roman);
+  assert.equal(p.roman,'syasinn');assert.equal(terminal.typed,'sh');
+  for(const invalid of [{...terminal,errorTerminated:undefined},{...terminal,reliable:false},{...terminal,judgements:undefined}]){
+    assert.deepEqual(choosePractice([p],[invalid],5,'sh'),[]);
+  }
+  const salt={...phrase('sio','しお','salt'),text:'塩'};
+  const failedI=buildAttempt({phrase:salt,strokes:[...'shq'].map((key,i)=>({key,at:now+(i+1)*100})),startedAt:now,endedAt:now+500,sessionId:'s',source:'capture',complete:false,reliable:true,endOnMistake:true});
+  assert.deepEqual(choosePractice([salt],[failedI],1,'hi').map(word=>word.roman),['shio']);
+  assert.equal(salt.roman,'sio');
 });
 test('empty summary has no fabricated performance and score types stay separate',()=>{
   assert.equal(summarize(empty).best,null);assert.equal(summarize(empty).accuracy,null);assert.equal(summarize(empty).practiceCount,0);

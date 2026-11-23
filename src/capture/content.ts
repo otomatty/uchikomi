@@ -38,6 +38,9 @@
   }
   window.addEventListener('keydown', onKey, { capture: true });
   document.addEventListener('pointerdown', event => { if (canvasFor(event.target)) gameFocused = true; else endFocus(); }, { capture: true });
+  // Keyboard navigation can move focus without a pointer event (for example,
+  // Tab from the game to a page button). Stop treating those keys as gameplay.
+  document.addEventListener('focusin', event => { if (canvasFor(event.target) && !isEditable(event.target)) gameFocused = true; else endFocus(); }, { capture: true });
   window.addEventListener('blur', endFocus);
   let viewTimer: ReturnType<typeof setTimeout> | undefined;
   const viewChanged = () => {

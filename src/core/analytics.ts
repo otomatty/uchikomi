@@ -170,13 +170,17 @@ export function choosePractice(phrases:Phrase[],attempts:Attempt[],count:number,
   const now=Date.now(),wanted=normalizeRoman(pattern??'');
   const withRequestedSpelling=(phrase:Phrase):Phrase=>{
     if(!wanted||normalizeRoman(phrase.roman).includes(wanted))return phrase;
-    const actualSpellings=attempts.filter(a=>a.phraseId===phrase.id&&a.reliable&&a.complete&&(demoOnly||a.source!=='demo')&&normalizeRoman(a.typed).includes(wanted)).sort((a,b)=>b.endedAt-a.endedAt);
+    const actualSpellings=attempts.filter(a=>a.phraseId===phrase.id&&a.reliable&&(demoOnly||a.source!=='demo')&&
+      (a.complete?normalizeRoman(a.typed).includes(wanted):isErrorTerminatedAttempt(a))).sort((a,b)=>b.endedAt-a.endedAt);
     for(const attempt of actualSpellings){
-      const roman=normalizeRoman(attempt.typed),matcher=createMatcher(phrase.reading,phrase.roman);
+      const prefix=normalizeRoman(attempt.typed),matcher=createMatcher(phrase.reading,phrase.roman);
       let accepted=true;
-      for(const key of roman)if(!matcher.feed(key).accepted){accepted=false;break;}
+      for(const key of prefix)if(!matcher.feed(key).accepted){accepted=false;break;}
+      // A terminal miss preserves only its accepted prefix. Complete that same
+      // valid path for practice; never treat a partial string as the whole word.
+      const roman=matcher.display;
       // This is a queue-only preference. The original captured phrase remains unchanged.
-      if(accepted&&matcher.complete)return {...phrase,roman};
+      if(accepted&&(matcher.complete||isErrorTerminatedAttempt(attempt))&&roman.includes(wanted))return {...phrase,roman};
     }
     return phrase;
   };

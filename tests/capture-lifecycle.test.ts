@@ -161,3 +161,43 @@ test('background stop propagates offscreen save failure, cleans up, and permits 
   assert.equal(closeCount, 6);
   assert.equal(calls.filter(type => type === 'UCHI_OFF_STOP').length, 6);
 });
+
+test('initial status-read failure releases both start and stop transition locks', async t => {
+  const originalChrome = globalThis.chrome;
+  t.after(() => { (globalThis as any).chrome = originalChrome; });
+  for (const action of ['UCHI_START', 'UCHI_STOP']) {
+    let failStatusRead = true;
+    let handler: ((message: unknown, sender: unknown, sendResponse: (response: any) => void) => unknown) | undefined;
+    const origin = `chrome-extension://lock-${action.toLowerCase()}/`;
+    const id = `lock-${action.toLowerCase()}`;
+    const ignored = { addListener() {} };
+    (globalThis as any).chrome = {
+      runtime: {
+        id, getURL: (path: string) => origin + path,
+        onInstalled: ignored, onMessage: { addListener(listener: typeof handler) { handler = listener; } },
+        async getContexts() { return []; }, async sendMessage() { return { ok: true }; },
+      },
+      storage: { session: {
+        async get() {
+          if (failStatusRead) { failStatusRead = false; throw new Error('temporary session-storage failure'); }
+          return {};
+        },
+        async set() {},
+      } },
+      action: { onClicked: ignored, async setBadgeText() {}, async setBadgeBackgroundColor() {} },
+      tabs: { onRemoved: ignored, onUpdated: ignored, async query() { return []; } },
+      tabCapture: { onStatusChanged: ignored }, offscreen: { async closeDocument() {} },
+    };
+    // A separate service-worker module instance for each initial failure path.
+    await import(`../src/capture/background.ts?lock-test=${action}`);
+    const request = () => new Promise<any>(resolve => {
+      assert.equal(handler?.({ type: action }, { id, url: origin + 'sidepanel.html' }, resolve), true);
+    });
+    const first = await request();
+    assert.equal(first.ok, false);
+    assert.equal(first.error, 'temporary session-storage failure');
+    const retry = await request();
+    if (action === 'UCHI_START') assert.equal(retry.error, '寿司打のタブを開いて、拡張アイコンを押してください。');
+    else assert.equal(retry.ok, true);
+  }
+});

@@ -58,10 +58,10 @@ export async function savePhrase(value:Phrase):Promise<Phrase> {
 function spellingChanged(before:Phrase,after:Phrase):boolean {
   return normalizeRoman(before.roman)!==normalizeRoman(after.roman)||before.reading.normalize('NFKC')!==after.reading.normalize('NFKC');
 }
-async function invalidatePhraseAttempts(store:IDBObjectStore,phraseId:string):Promise<void> {
+async function invalidatePhraseAttempts(store:IDBObjectStore,phraseId:string,replacedIds?:ReadonlySet<string>):Promise<void> {
   const attempts=await request<Attempt[]>(store.index('phraseId').getAll(phraseId));
   // Preserve history but do not attribute old measurements to the newly corrected reading.
-  for(const attempt of attempts)if(attempt.reliable)store.put({...attempt,reliable:false});
+  for(const attempt of attempts)if(attempt.reliable&&!replacedIds?.has(attempt.id))store.put({...attempt,reliable:false});
 }
 export async function updatePhrase(id:string,patch:Partial<Phrase>):Promise<void> {
   const database=await db(),tx=database.transaction(['phrases','attempts'],'readwrite'),done=complete(tx),store=tx.objectStore('phrases');
@@ -164,7 +164,15 @@ export async function importData(value:unknown):Promise<void> {
   const [currentPhrases,currentSessions]=await Promise.all([request<Phrase[]>(tx.objectStore('phrases').getAll()),request<Session[]>(tx.objectStore('sessions').getAll())]);
   const phraseIds=new Set([...currentPhrases,...imported.phrases].map(p=>p.id)),sessionIds=new Set([...currentSessions,...imported.sessions].map(s=>s.id));
   if(imported.attempts.some(a=>!phraseIds.has(a.phraseId)||!sessionIds.has(a.sessionId))){tx.abort();await done.catch(()=>{});throw new Error('参照する語句・セッションが見つからないデータです。');}
-  for(const phrase of imported.phrases)tx.objectStore('phrases').put(phrase);
+  const previousPhrases=new Map(currentPhrases.map(phrase=>[phrase.id,phrase]));
+  const replacedAttemptIds=new Set(imported.attempts.map(attempt=>attempt.id));
+  for(const phrase of imported.phrases){
+    const previous=previousPhrases.get(phrase.id);
+    // A merge can change the reading while retaining older measurements. Only
+    // retained attempts need invalidation; imported replacements have new data.
+    if(previous&&spellingChanged(previous,phrase))await invalidatePhraseAttempts(tx.objectStore('attempts'),phrase.id,replacedAttemptIds);
+    tx.objectStore('phrases').put(phrase);
+  }
   for(const attempt of imported.attempts)tx.objectStore('attempts').put(attempt);
   for(const session of imported.sessions)tx.objectStore('sessions').put(session);
   tx.objectStore('settings').put(imported.settings,'main');await done;notify();

@@ -10,15 +10,16 @@
  * External screenshots are never copied into the repository or the report.
  * This is a Node image test; it does not verify tabCapture, browser CSP or live timing.
  */
-import { createWorker, PSM } from 'tesseract.js';
+import { PSM } from 'tesseract.js';
 import { PNG } from 'pngjs';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { detectPromptRegions } from '../src/capture/auto-region.ts';
 import { normalizeJapanese, normalizeOcrRoman, normalizeReading, pixelRect, preprocessOcrPixels } from '../src/capture/helpers.ts';
 import { resolveOcrReading } from '../src/capture/ocr-reading.ts';
+import { startCheckWorkers, finishOcrCheck } from './ocr-check-support.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const report = {
@@ -102,7 +103,13 @@ try {
   } else {
     cases=await Promise.all([false,true].map(async typedPrefix=>({name:typedPrefix?'independent-red-prefix':'independent-prompt',image:await independentFixture(typedPrefix),expected:{reading:'ぺあるっく',japanese:'ペアルック',roman:'pearukku'},scales:[1]})));
   }
-  [eng,jpn]=await Promise.all(['eng','jpn'].map(lang=>createWorker(lang,1,{langPath:path.join(root,'dist/vendor/lang'),gzip:true,cacheMethod:'none'})));
+  cases=cases.map(item=>{
+    const scales=item.scales===undefined?[1]:item.scales;
+    assert.ok(Array.isArray(scales)&&scales.length,'Scales must be a non-empty array');
+    assert.ok(scales.every(scale=>Number.isFinite(scale)&&scale>0&&scale<=4),'Scale must be within (0,4]');
+    return {...item,scales};
+  });
+  [eng,jpn]=await startCheckWorkers(root,report);
   await Promise.all([
     eng.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,tessedit_char_whitelist:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.,-'/():;[]",preserve_interword_spaces:'0'}),
     jpn.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,preserve_interword_spaces:'0'}),
@@ -110,8 +117,7 @@ try {
   let failed=0;
   for(const item of cases) {
     const original=item.image??PNG.sync.read(await readFile(item.file));
-    for(const scale of item.scales??[1]) {
-      assert.ok(Number.isFinite(scale)&&scale>0&&scale<=4,'Scale must be within (0,4]');
+    for(const scale of item.scales) {
       const frame=scale===1?original:resizeCrop(original,{x:0,y:0,width:original.width,height:original.height},Math.round(original.width*scale),Math.round(original.height*scale));
       // Runtime searches a viewport downscaled to at most 1280 px on its longer edge.
       const detectionScale=Math.min(1,1280/Math.max(frame.width,frame.height));
@@ -151,11 +157,10 @@ try {
   }
   report.passed=report.cases.filter(item=>item.ok).length;
   report.total=report.cases.length;
+  assert.ok(report.total>0,'No OCR cases were executed');
   assert.equal(failed,0,`${failed} image cases failed; inspect qa/auto-ocr-report.json`);
 } catch(error) {
   report.error=String(error.stack||error);process.exitCode=1;console.error(error.message||error);
 } finally {
-  await Promise.all([eng?.terminate(),jpn?.terminate()]);
-  await mkdir(path.join(root,'qa'),{recursive:true});
-  await writeFile(path.join(root,'qa/auto-ocr-report.json'),JSON.stringify(report,null,2));
+  await finishOcrCheck(root,'auto-ocr-report.json',report,[eng,jpn]);
 }

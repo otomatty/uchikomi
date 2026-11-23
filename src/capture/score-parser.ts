@@ -82,6 +82,9 @@ export function parseResultScore(input: ScoreText): ParsedScore {
     }
     result.confidence=Math.min(result.confidence,confidenceOf(numeric.profit!.confidence),confidenceOf(numeric.paid!.confidence),...(numeric.total?[confidenceOf(numeric.total.confidence)]:[]));
   } else {
+    // These amounts come from the body OCR, so a confident isolated label must
+    // not upgrade weak digits. The structured-numeric path above is independent.
+    result.confidence=Math.min(result.confidence,confidenceOf(input.bodyConfidence));
     if ([total,gain,loss,paid].some(item=>item.invalid||item.values.length>1) || (gain.values.length&&loss.values.length)) return review('金額の読み取りが一致しませんでした');
     if (!paid.values.length || paid.values[0]!==10000) return review('10,000円の支払額を確認できませんでした');
     totalValue=total.values[0];
@@ -89,6 +92,15 @@ export function parseResultScore(input: ScoreText): ParsedScore {
     if (totalValue===undefined && profitValue===undefined) return review('結果の金額を読み取れませんでした');
     if (totalValue===undefined) totalValue=profitValue!+10000;
     if (profitValue===undefined) profitValue=totalValue-10000;
+    // Even when the full numeric path is unavailable, any usable independent
+    // numeric crop must agree with the body. Loss crops contain unsigned digits.
+    for(const kind of ['total','paid','profit'] as const){
+      const observed=input.numeric?.[kind];
+      if(!observed||confidenceOf(observed.confidence)<85)continue;
+      const value=money(compact(observed.text));
+      const expected=kind==='total'?totalValue:kind==='paid'?10000:Math.abs(profitValue);
+      if(value!==null&&value!==expected)return review('2つの文字認識で金額が一致しませんでした');
+    }
   }
   if (totalValue<0 || totalValue-profitValue!==10000 || totalValue%20!==0 || profitValue%20!==0) return review('獲得額・支払額・お得額の計算が一致しませんでした');
   Object.assign(result, {

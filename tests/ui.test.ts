@@ -2,7 +2,7 @@
 import test, { before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { Window } from 'happy-dom';
-import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
+import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb';
 import type { Phrase } from '../src/core/types';
 import { buildAttempt } from '../src/core/analytics';
 
@@ -151,6 +151,41 @@ test('negative profit can be recorded and charted; changing score basis keeps hi
   const select=[...document.querySelectorAll<HTMLSelectElement>('[role="dialog"] select')].find(s=>[...s.options].some(o=>o.value==='total'))!;
   await input(select,'total');await click(button('保存する'));await settled(()=>!document.querySelector('[role="dialog"]'));
   assert.ok(document.querySelector('.chart-empty'));assert.equal((await db.getData()).sessions[0].scoreType,'profit');
+});
+
+test('score review initializes its amount and score basis from the same record',async()=>{
+  const backup=await db.exportData(),now=Date.now();
+  backup.sessions=[{id:'ui-mixed-review',startedAt:now,endedAt:now+1000,source:'capture',score:20000,scoreType:'total',course:10000,mode:'accuracy',phraseCount:0,correctKeys:0,mistakes:0,durationMs:1000,
+    scoreReview:{score:15000,scoreType:'profit',confidence:60,observedAt:now,reason:'読み取りの確認'}}];
+  await db.importData(backup);await mount();await click(query('[data-testid="nav-growth"]'));
+  await click(query('button[aria-label="20,000円の記録を編集"]'));
+  assert.equal(query<HTMLInputElement>('input[aria-label="スコア"]').value,'15000');
+  assert.equal(query('.segmented .active').textContent,'お得になった金額');
+  await click(button('スコアを保存'));await settled(()=>!document.querySelector('[role="dialog"]'));
+  const saved=(await db.getData()).sessions[0];
+  assert.equal(saved.score,15000);assert.equal(saved.scoreType,'profit');assert.equal(saved.scoreProfit,15000);assert.equal(saved.scoreTotal,25000);
+});
+
+test('failed practice saves keep results and retry controls until the full attempt is persisted',async()=>{
+  await db.savePhrase(phrase('ui-failed-practice'));await db.updateSettings({sessionLength:5});
+  await mount();await navigateWords();await click(query('[data-testid="nav-practice"]'));await click(query('[data-testid="practice-start"]'));
+  await settled(()=>!!document.querySelector('.roman-line .cursor'));
+  const original=IDBObjectStore.prototype.put;
+  IDBObjectStore.prototype.put=function(...args:Parameters<typeof original>){
+    if(this.name==='attempts')throw new DOMException('Test storage is full','QuotaExceededError');
+    return original.apply(this,args);
+  };
+  try {
+    await type('pearukku');await settled(()=>!!document.querySelector('[data-testid="practice-view"] [role="alert"]'));
+    await click(button('練習を終了'));await settled(()=>!!document.querySelector('[data-testid="practice-complete"]'));
+    assert.ok(button('保存を再試行'));assert.equal(button('成長を見る').disabled,true);assert.equal(button('もう1セット').disabled,true);
+    assert.equal((await db.getData()).attempts.length,0);
+    await click(query('[data-testid="nav-growth"]'));assert.ok(document.querySelector('[data-testid="practice-complete"]'));
+    IDBObjectStore.prototype.put=original;
+    await click(button('保存を再試行'));await settled(()=>!document.querySelector('[data-testid="practice-complete"] [role="alert"]'));
+    const attempts=(await db.getData()).attempts;assert.equal(attempts.length,1);assert.equal(attempts[0].typed,'pearukku');assert.ok(attempts[0].complete);
+    await click(button('練習を終了'));await settled(()=>!document.querySelector('[data-testid="practice-view"]'));
+  } finally {IDBObjectStore.prototype.put=original;}
 });
 
 test('the actual import form rejects malformed JSON without changing records',async()=>{

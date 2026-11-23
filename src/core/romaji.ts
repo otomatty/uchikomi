@@ -60,8 +60,10 @@ function choicesAt(text:string, at:number):Choice[] {
     const next=text[at+1];
     const choices:Choice[]=[{text:'nn',end:at+1},{text:"n'",end:at+1},{text:'xn',end:at+1}];
     if(next && next!=='ん') {
-      const nextChoices=next==='っ' ? [{text:'xtu',end:at+2}] : regularChoices(text,at+1);
-      if(nextChoices.some(x=>/^[^aiueoy]/.test(x.text))) choices.unshift({text:'n',end:at+1});
+      const nextChoices=next==='っ' ? choicesAt(text,at+1) : regularChoices(text,at+1);
+      // Bind a single n to the particular consonant-led continuation. An open
+      // edge to the next kana would also allow its vowel path (e.g. んう → nu).
+      choices.unshift(...nextChoices.filter(x=>/^[^aiueoy]/.test(x.text)).map(x=>({text:'n'+x.text,end:x.end})));
     }
     return choices;
   }

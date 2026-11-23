@@ -13,6 +13,16 @@
 3. 「パッケージ化されていない拡張機能を読み込む」で、展開した **`manifest.json` のあるフォルダー** を選択します。
 4. Chrome の拡張機能メニューから UCHIKOMI をピン留めします。
 
+### ZIP版を更新する
+
+1. 「設定 → 書き出す」で練習記録をバックアップし、記録と復習を終了します。
+2. 新しいZIPを展開し、現在Chromeに読み込ませているフォルダーの内容を置き換えます。
+3. `chrome://extensions` のUCHIKOMIで再読み込みを押し、バージョンと練習記録を確認します。
+
+同じフォルダーで更新し、拡張機能自体は削除しないでください。ZIPを「パッケージ化されていない拡張機能」として読み込む現在の配布方式には、自動ダウンロード・差し替え機能はありません。
+
+Chrome標準の自動更新を使う場合は、Chrome Web Storeへ登録して配布する構成に移行します。個人利用なら[非公開・Trusted testers](https://developer.chrome.com/docs/webstore/cws-dashboard-distribution)でインストール先を指定できます。非公開でも審査が必要です。[ストアAPI](https://developer.chrome.com/docs/webstore/using-api)による更新登録と、記録保存後の更新適用は今後の導入対象で、このZIP版には含まれません。
+
 ### ソースからビルドする
 
 ```bash

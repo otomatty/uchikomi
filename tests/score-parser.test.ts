@@ -98,6 +98,28 @@ test('structure, label and individual numeric confidence gates are independent',
   assert.equal(parseResultScore(boundary).kind,'score');
 });
 
+test('a confident result label cannot promote low-confidence amounts taken from the body text',()=>{
+  const input=labelled({labelText:'19,740円分お得でした！',labelConfidence:94,bodyConfidence:40});
+  const result=parseResultScore(input);assert.equal(result.kind,'review');assert.equal(result.confidence,40);
+  for(const bodyConfidence of [81,NaN])notSaved({...input,bodyConfidence});
+  const threshold=parseResultScore({...input,bodyConfidence:82});assert.equal(threshold.kind,'score');assert.equal(threshold.confidence,82);
+  assert.equal(parseResultScore(numeric({bodyConfidence:25})).kind,'score','separately verified numeric crops do not depend on body digits');
+});
+
+test('body-text fallback rejects usable contradictory numeric crops but still permits independent body-only results',()=>{
+  const input=labelled({labelText:'19,740円分お得でした！',labelConfidence:94,structureConfidence:.89});
+  for(const numeric of [
+    {total:{text:'29,760',confidence:95}},
+    {paid:{text:'5,000',confidence:95}},
+    {profit:{text:'19,760',confidence:95}},
+  ])assert.equal(parseResultScore({...input,numeric}).kind,'review');
+  assert.equal(parseResultScore(input).kind,'score');
+  assert.equal(parseResultScore({...input,numeric:numeric().numeric}).kind,'score');
+  assert.equal(parseResultScore({...input,numeric:{total:{text:'29,760',confidence:84}}}).kind,'score','weak optional digits cannot overrule the verified body');
+  const loss=parseResultScore(labelled({bodyText:'9,200円分のお寿司をゲット！10,000円払って800円分損でした！',structureConfidence:.89,numeric:{profit:{text:'800',confidence:95}}}));
+  assert.equal(loss.kind,'score');assert.equal(loss.profit,-800,'the numeric crop contains the loss magnitude, not a minus sign');
+});
+
 test('two genuinely separate agreeing result observations are required',()=>{
   const reader=new StableScoreReader(),score=parseResultScore(labelled());
   assert.equal(reader.observe(score,1000),null);

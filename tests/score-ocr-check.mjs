@@ -8,15 +8,16 @@
  * No images are bundled, uploaded or copied into the repository. This checks one
  * still image; it does not verify the two-independent-frame gate or live capture.
  */
-import { createWorker, PSM } from 'tesseract.js';
+import { PSM } from 'tesseract.js';
 import { PNG } from 'pngjs';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { detectResultRegions, findAmountRect, preprocessResultPixels } from '../src/capture/auto-result.ts';
 import { parseResultScore } from '../src/capture/score-parser.ts';
 import { pixelRect } from '../src/capture/helpers.ts';
+import { startCheckWorkers, finishOcrCheck } from './ocr-check-support.mjs';
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const report={scope:'Single PNG: automatic result regions, packaged offline OCR and score parsing. No live capture, persistence or two-frame stability claim.',createdAt:new Date().toISOString(),checks:[]};
@@ -60,7 +61,7 @@ try{
   }
   assert.ok(files.length,'Pass a local result PNG. Example: node --import tsx tests/score-ocr-check.mjs /path/result.png');
   assert.ok(!expectNone||(expectedScore===undefined&&expectedTotal===undefined),'--expect-none cannot be combined with expected money values');
-  [eng,jpn]=await Promise.all(['eng','jpn'].map(lang=>createWorker(lang,1,{langPath:path.join(root,'dist/vendor/lang'),gzip:true,cacheMethod:'none'})));
+  [eng,jpn]=await startCheckWorkers(root,report);
   await Promise.all([
     eng.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,tessedit_char_whitelist:'0123456789,.',preserve_interword_spaces:'0'}),
     jpn.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,preserve_interword_spaces:'0'}),
@@ -77,14 +78,14 @@ try{
     const header=(await jpn.recognize(prepare(crop(frame,regions.header,true),true))).data;
     check.header=summary(header);
     let label={text:'',confidence:0};
-    const body=[];
+    const body=[],bodyConfidences=[];
     for(const kind of ['total','paid','profit']){
       const line=crop(frame,regions[kind],true),numberRect=findAmountRect(line,kind);
       const [textResult,numberResult]=await Promise.all([
         jpn.recognize(prepare(line)),
         numberRect?eng.recognize(prepare(crop(line,numberRect))):Promise.resolve(null),
       ]);
-      check.lines[kind]={...summary(textResult.data),numberRect};body.push(textResult.data.text);
+      check.lines[kind]={...summary(textResult.data),numberRect};body.push(textResult.data.text);bodyConfidences.push(textResult.data.confidence);
       if(numberResult)check.numeric[kind]=summary(numberResult.data);
       if(kind==='profit'){
         label=summary(textResult.data);
@@ -95,7 +96,7 @@ try{
       }
     }
     check.label=label;
-    check.parsed=parseResultScore({headerText:header.text,headerConfidence:header.confidence,bodyText:body.join('\n'),bodyConfidence:label.confidence,labelText:label.text,labelConfidence:label.confidence,numeric:check.numeric,structureConfidence:regions.confidence,scoreType});
+    check.parsed=parseResultScore({headerText:header.text,headerConfidence:header.confidence,bodyText:body.join('\n'),bodyConfidence:Math.min(...bodyConfidences),labelText:label.text,labelConfidence:label.confidence,numeric:check.numeric,structureConfidence:regions.confidence,scoreType});
     check.durationMs=Math.round(performance.now()-started);
     check.ok=check.parsed.kind==='score'&&(expectedScore===undefined||check.parsed.score===expectedScore)&&(expectedTotal===undefined||check.parsed.total===expectedTotal);
     console.log(JSON.stringify(check));
@@ -106,7 +107,5 @@ try{
 }catch(error){
   report.error=String(error.stack||error);process.exitCode=1;console.error(error.message||error);
 }finally{
-  await Promise.all([eng?.terminate(),jpn?.terminate()]);
-  await mkdir(path.join(root,'qa'),{recursive:true});
-  await writeFile(path.join(root,'qa/score-ocr-report.json'),JSON.stringify(report,null,2));
+  await finishOcrCheck(root,'score-ocr-report.json',report,[eng,jpn]);
 }

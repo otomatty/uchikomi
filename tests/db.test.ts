@@ -91,6 +91,19 @@ test('valid merge preserves unrelated IDs and can refer to existing records',asy
   await seed();await importData({version:1,phrases:[phrase('p2','刺身','さしみ','sasimi')],attempts:[attempt('a2','p2','s1')],sessions:[],settings:{...DEFAULT_SETTINGS,targetScore:32000}});
   const data=await getData();assert.equal(data.phrases.length,2);assert.equal(data.attempts.length,2);assert.equal(data.sessions.length,1);assert.equal(data.settings.targetScore,32000);
 });
+test('merging a changed spelling invalidates only retained attempts while preserving imported replacements',async()=>{
+  await seed();await saveAttempt(attempt('replace'));
+  const unrelated=phrase('p2','刺身','さしみ','sasimi');await savePhrase(unrelated);await saveAttempt(attempt('other','p2'));
+  const revised={...phrase(),reading:'ぺあるく',roman:'pearuku'};
+  const replacement={...buildAttempt({phrase:revised,strokes:[...'pearuku'].map((key,i)=>({key,at:now+(i+1)*100})),startedAt:now,endedAt:now+1000,sessionId:'s1',source:'practice',complete:true,reliable:true}),id:'replace'};
+  await importData({version:1,phrases:[revised,{...unrelated,text:'刺身（確認済み）'}],attempts:[replacement],sessions:[],settings:DEFAULT_SETTINGS});
+  const data=await getData();assert.equal(data.attempts.length,3);
+  const retained=data.attempts.find(a=>a.id==='a1')!;
+  assert.equal(retained.reliable,false);assert.equal(retained.typed,'pearukku');
+  assert.deepEqual(data.attempts.find(a=>a.id==='replace'),replacement);
+  assert.equal(data.attempts.find(a=>a.id==='other')?.reliable,true);
+  assert.equal(data.phrases.find(p=>p.id==='p1')?.roman,'pearuku');
+});
 test('local and cross-context notifications each fire once without feedback loops',async()=>{
   let updates=0;const unsubscribe=subscribe(()=>{updates++;});await savePhrase(phrase());assert.equal(updates,1);
   const peer=new TestBroadcastChannel('uchikomi-changes');let echoes=0;peer.onmessage=()=>echoes++;peer.postMessage({changedAt:now});assert.equal(updates,2);assert.equal(echoes,0);

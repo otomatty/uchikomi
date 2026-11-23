@@ -1,22 +1,24 @@
-import { createWorker, PSM, type Worker as OcrWorker } from 'tesseract.js';
+import { PSM, type Worker as OcrWorker } from 'tesseract.js';
 import { saveAttempt, savePhrase, saveSession } from '../core/db';
 import type { Calibration, CaptureStatus, KeyStroke, Phrase, Rect, Session, Settings } from '../core/types';
 import { EMPTY_CAPTURE } from '../core/types';
-import { isCalibration, MAX_CANDIDATES, MAX_KEY_BUFFER, normalizeJapanese, normalizeOcrRoman, pixelRect, preprocessOcrPixels, SAMPLE_MS, signatureDistance, unionRects, validJapanese, validRoman } from './helpers';
+import { isCalibration, MAX_CANDIDATES, MAX_KEY_BUFFER, normalizeJapanese, normalizeOcrRoman, pixelRect, preprocessOcrPixels, SAMPLE_MS, unionRects, validJapanese, validRoman } from './helpers';
 import { detectPromptRegions, type AutoRegions } from './auto-region';
 import { resolveOcrReading } from './ocr-reading';
 import { detectResultRegions, findAmountRect, preprocessResultPixels } from './auto-result';
-import { parseResultScore, StableScoreReader, type NumericScoreText, type ParsedScore } from './score-parser';
+import { parseResultScore, type NumericScoreText, type ParsedScore } from './score-parser';
 import { createCompletionBoundary, replayCapturedPhrase, type CompletionBoundary } from './key-boundary';
 import { saveCaptureScore } from './score-persistence';
+import { closeObservedBoundary, PromptSignatureTracker, ResultFrameSequence } from './frame-lifecycle';
+import { startOcrWorkers } from './ocr-worker';
 
 interface CaptureGame {
   session: Session; writes: Promise<void>; observedPrompt: boolean; resultSeen: boolean; scoreSaved: boolean;
-  reader: StableScoreReader; lastResult?: { parsed: ParsedScore; at: number; evidence: string };
+  reader: ResultFrameSequence; lastResult?: { parsed: ParsedScore; at: number; evidence: string };
 }
 interface ResultCandidate {
   game: CaptureGame; at: number; header: HTMLCanvasElement; total: HTMLCanvasElement;
-  paid: HTMLCanvasElement; profit: HTMLCanvasElement; confidence: number; screenshot: string;
+  paid: HTMLCanvasElement; profit: HTMLCanvasElement; confidence: number; screenshot: string; revision: number;
 }
 
 interface Candidate {
@@ -38,6 +40,7 @@ let settings: Settings | null = null;
 let jpWorker: OcrWorker | null = null;
 let romanWorker: OcrWorker | null = null;
 let initializing: Promise<void> | null = null;
+let initializationController: AbortController | null = null;
 let sampleTimer: ReturnType<typeof setInterval> | undefined;
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 let keyBuffer: KeyStroke[] = [];
@@ -46,10 +49,7 @@ let queue: Candidate[] = [];
 let scoreQueue: ResultCandidate[] = [];
 let currentCandidate: Candidate | undefined;
 let processing: Promise<void> | null = null;
-let lastSignature: Uint8Array | null = null;
-let pendingSignature: Uint8Array | null = null;
-let pendingAt = 0;
-let pendingCount = 0;
+const promptSignatures = new PromptSignatureTracker();
 let sequence = 0;
 let generation = 0;
 let stopped = false;
@@ -85,7 +85,7 @@ function makeGame(at: number, id: string = crypto.randomUUID()): CaptureGame {
     id, captureId: status.sessionId, startedAt: at, source: 'capture', scoreType: settings!.scoreType,
     course: 10000, mode: 'accuracy', phraseCount: 0, correctKeys: 0, mistakes: 0, durationMs: 0,
   };
-  const game: CaptureGame = { session: data, writes: saveSession(data), observedPrompt: false, resultSeen: false, scoreSaved: false, reader: new StableScoreReader() };
+  const game: CaptureGame = { session: data, writes: saveSession(data), observedPrompt: false, resultSeen: false, scoreSaved: false, reader: new ResultFrameSequence(data.scoreType) };
   // Every queued OCR job keeps its own game, so a quick retry cannot attach an
   // old phrase or result to the next game in the same continuous recording.
   games.push(game); activeGame = game; session = data;
@@ -182,27 +182,24 @@ async function finalizeCandidate(candidate: Candidate) {
     if (candidate.reading) candidate.reading.width = 1;
   }
 }
-function endCurrent(at: number) {
-  if (!currentCandidate || currentCandidate.endedAt) return;
-  currentCandidate.endedAt = at;
+function endCurrent(at: number, observedExit = true) {
+  if (!currentCandidate || !closeObservedBoundary(currentCandidate, at, observedExit)) return;
   if (currentCandidate.processed) {
     const write = finalizeCandidate(currentCandidate).catch(reportError);
     pendingWrites.add(write);
     void write.finally(() => pendingWrites.delete(write));
   }
 }
-function resetAutoRegions(at: number, publish = true) {
-  // Losing the visible frame leaves the end of this attempt uncertain. Keep the
-  // observed phrase, but never include its partial timing in weakness rankings.
-  if (currentCandidate && !currentCandidate.endedAt) currentCandidate.reliableBoundary = false;
-  currentCandidate?.completionBoundary.settle(null);
-  endCurrent(at);
+function resetAutoRegions(at: number, publish = true, confirmedResult = false) {
+  // An unknown loss makes the attempt's end uncertain. A detected receipt is
+  // an observed game-end transition and retains the final phrase's boundary.
+  endCurrent(at, confirmedResult);
+  if (!confirmedResult) currentCandidate?.completionBoundary.settle(null);
   calibration = undefined;
   detectedRegions = null;
   manualRegions = false;
   lastRegionScan = 0;
-  lastSignature = pendingSignature = null;
-  pendingCount = 0;
+  promptSignatures.reset();
   if (publish) announce({ regionState: 'searching', regionConfidence: undefined, region: undefined, message: captureWarning ?? (status.ocrReady ? 'お題を探しています' : '文字認識を準備しています') });
 }
 function panelMoved(previous: Rect, next: Rect): boolean {
@@ -227,6 +224,9 @@ function scanRegions(now: number) {
   const frame = regionContext.getImageData(0, 0, width, height);
   const found = detectPromptRegions(frame);
   if (!found) {
+    // Check the same disappearance frame for a receipt before treating it as
+    // an unknown loss. A normal result transition must retain the final word.
+    if (collectResultFrame(now, Boolean(calibration), frame)) return;
     if (calibration || status.regionState !== 'searching') resetAutoRegions(now);
     return;
   }
@@ -275,26 +275,23 @@ function sampleFrame() {
   if (!status.ocrReady || !calibration) return;
   const { bytes, ink } = imageSignature(calibration.japanese);
   if (ink < .006 || ink > .85) {
+    if (collectResultFrame(now, true)) return;
     currentCandidate?.completionBoundary.settle(null);
-    if (currentCandidate && !currentCandidate.endedAt && now - currentCandidate.at > 200) endCurrent(now);
-    lastSignature = null; pendingSignature = null; pendingCount = 0;
+    endCurrent(now, false);
+    promptSignatures.reset();
     return;
   }
   if (manualRegions) observePrompt(now);
-  if (lastSignature && signatureDistance(bytes, lastSignature) < .018) { pendingSignature = null; pendingCount = 0; return; }
-  if (!pendingSignature || signatureDistance(bytes, pendingSignature) > .018) {
-    pendingSignature = bytes; pendingAt = now; pendingCount = 1; return;
-  }
-  pendingCount++;
-  if (pendingCount < 2) return;
+  const transition = promptSignatures.observe(bytes, now);
+  if (transition.interruptedAt !== undefined) endCurrent(transition.interruptedAt);
+  if (!transition.candidate) return;
   // The frame epoch is retained here. OCR completion never becomes a boundary.
   // The first phrase after start/reacquisition may already be partly typed.
   // Only an uninterrupted, observed transition establishes a reliable start.
-  const reliableBoundary = lastSignature !== null;
-  endCurrent(pendingAt);
-  const candidate = candidateFromFrame(pendingAt, bytes, reliableBoundary);
+  const { at, contiguous } = transition.candidate;
+  endCurrent(at);
+  const candidate = candidateFromFrame(at, bytes, contiguous);
   currentCandidate = candidate;
-  lastSignature = bytes; pendingSignature = null; pendingCount = 0;
   if (queue.length >= MAX_CANDIDATES) {
     queue.shift()?.completionBoundary.settle(null); candidate.reliableBoundary = false;
     captureWarning = '読み取りが混み合い、一部のお題を記録できませんでした。';
@@ -340,29 +337,35 @@ async function recognize(candidate: Candidate) {
   announce({ phraseCount: (status.phraseCount ?? 0) + 1, latestPhrase: phrase.text, lastFrameAt: candidate.at, message: captureWarning });
 }
 
-function collectResultFrame(now: number, force = false): boolean {
+function collectResultFrame(now: number, force = false, observedFrame?: ImageData): boolean {
   const game = activeGame;
   // Starting a recording on an old result must not create another score. A
   // genuine prompt has to have been visible during this recording first.
   if (!game?.observedPrompt || game.scoreSaved || !status.ocrReady || video.readyState < 2 || !video.videoWidth) return false;
   if (!force && now - lastResultScan < RESULT_SCAN_MS) return false;
   lastResultScan = now;
-  const scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));
-  regionCanvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-  regionCanvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-  regionContext.drawImage(video, 0, 0, regionCanvas.width, regionCanvas.height);
-  const regions = detectResultRegions(regionContext.getImageData(0, 0, regionCanvas.width, regionCanvas.height));
+  if (!observedFrame) {
+    const scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));
+    regionCanvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    regionCanvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    regionContext.drawImage(video, 0, 0, regionCanvas.width, regionCanvas.height);
+    observedFrame = regionContext.getImageData(0, 0, regionCanvas.width, regionCanvas.height);
+  }
+  const regions = detectResultRegions(observedFrame);
+  // A throttled call above is not a new observation. Only an actual missing
+  // receipt scan resets agreement and invalidates queued pre-gap observations.
+  const revision = game.reader.scanned(Boolean(regions), now);
   if (!regions) return false;
   if (!game.resultSeen) {
     game.resultSeen = true;
     game.session.endedAt = now;
     game.session.durationMs = Math.max(0, now - game.session.startedAt);
-    resetAutoRegions(now, false);
+    resetAutoRegions(now, false, true);
     void persistGame(game).catch(reportError);
   }
   if (scoreQueue.length >= 4) return true;
   scoreQueue.push({
-    game, at: now, header: crop(regions.header, true), total: crop(regions.total, true),
+    game, at: now, revision, header: crop(regions.header, true), total: crop(regions.total, true),
     paid: crop(regions.paid, true), profit: crop(regions.profit, true), confidence: regions.confidence,
     screenshot: crop(regions.panel).toDataURL('image/jpeg', .85),
   });
@@ -415,7 +418,7 @@ async function recognizeResult(candidate: ResultCandidate) {
   if (!jpWorker || !romanWorker || candidate.game.scoreSaved) return;
   const numeric: { total?: NumericScoreText; paid?: NumericScoreText; profit?: NumericScoreText } = {};
   const lines: string[] = [];
-  let labelText = '', labelConfidence = 0;
+  let labelText = '', labelConfidence = 0, bodyConfidence = 100;
   const header = (await jpWorker.recognize(resultCanvas(candidate.header, true))).data;
   await romanWorker.setParameters({ tessedit_char_whitelist: '0123456789,.' });
   try {
@@ -427,6 +430,7 @@ async function recognizeResult(candidate: ResultCandidate) {
         numberRect ? romanWorker.recognize(resultCanvas(sliceCanvas(canvas, numberRect))) : Promise.resolve(null),
       ]);
       lines.push(textResult.data.text);
+      bodyConfidence = Math.min(bodyConfidence, textResult.data.confidence);
       if (numberResult) numeric[kind] = { text: numberResult.data.text, confidence: numberResult.data.confidence };
       if (kind === 'profit') {
         labelText = textResult.data.text; labelConfidence = textResult.data.confidence;
@@ -443,12 +447,12 @@ async function recognizeResult(candidate: ResultCandidate) {
     await romanWorker.setParameters({ tessedit_char_whitelist: ROMAN_CHARACTERS });
   }
   let parsed = parseResultScore({
-    headerText: header.text, headerConfidence: header.confidence, bodyText: lines.join('\n'), bodyConfidence: labelConfidence,
+    headerText: header.text, headerConfidence: header.confidence, bodyText: lines.join('\n'), bodyConfidence,
     labelText, labelConfidence, numeric, structureConfidence: candidate.confidence, scoreType: candidate.game.session.scoreType,
   });
   if (parsed.kind === 'none') parsed = { ...parsed, kind: 'review', reason: '結果の文字を確認してください', fingerprint: `unreadable:${candidate.game.session.id}` };
   candidate.game.lastResult = { parsed, at: candidate.at, evidence: candidate.screenshot };
-  const stable = candidate.game.reader.observe(parsed, candidate.at);
+  const stable = candidate.game.reader.observe(parsed, candidate.at, candidate.revision);
   if (stable?.kind === 'score') await acceptScore(candidate.game, stable, candidate.at, candidate.screenshot);
   else if (stable) await reviewScore(candidate.game, stable, candidate.at, candidate.screenshot);
   else if (candidate.game !== activeGame) await reviewScore(candidate.game, parsed, candidate.at, candidate.screenshot,
@@ -477,7 +481,7 @@ async function processQueue() {
   return processing;
 }
 
-async function initializeWorkers(token: number) {
+async function initializeWorkers(token: number, signal: AbortSignal) {
   const options = {
     workerPath: chrome.runtime.getURL('vendor/worker.min.js'),
     corePath: chrome.runtime.getURL('vendor/core/'),
@@ -485,20 +489,30 @@ async function initializeWorkers(token: number) {
     workerBlobURL: false, gzip: true,
     errorHandler: (error: unknown) => { if (token === generation && !stopped) reportError(error); },
   };
-  const results = await Promise.allSettled([createWorker('jpn', 1, options), createWorker('eng', 1, options)]);
-  if (results.some(result => result.status === 'rejected')) {
-    await Promise.all(results.filter((result): result is PromiseFulfilledResult<OcrWorker> => result.status === 'fulfilled').map(result => result.value.terminate()));
-    throw new Error('Packaged OCR assets could not be loaded');
-  }
-  const workers = results.map(result => (result as PromiseFulfilledResult<OcrWorker>).value);
-  if (token !== generation || stopped) { await Promise.all(workers.map(worker => worker.terminate())); return; }
-  [jpWorker, romanWorker] = workers;
-  await Promise.all([
-    jpWorker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_LINE, preserve_interword_spaces: '0' }),
-    romanWorker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_LINE, tessedit_char_whitelist: ROMAN_CHARACTERS, preserve_interword_spaces: '0' }),
-  ]);
-  if (token !== generation || stopped) return;
-  announce({ ocrReady: true, message: captureWarning ?? (calibration ? 'お題を待っています' : 'お題を探しています') });
+  const workers = await startOcrWorkers(['jpn', 'eng'], options, { signal });
+  let transferred = false, disposed = false;
+  const dispose = () => {
+    if (transferred || disposed) return;
+    disposed = true;
+    for (const worker of workers) {
+      try { void Promise.resolve(worker.terminate()).catch(() => {}); } catch { /* Failed startup cleanup. */ }
+    }
+  };
+  // Keep ownership local until parameter setup completes. Stop can terminate
+  // these obtained workers immediately even if setParameters is still pending.
+  signal.addEventListener('abort', dispose, { once: true });
+  try {
+    if (signal.aborted || token !== generation || stopped) { dispose(); return; }
+    await Promise.all([
+      workers[0].setParameters({ tessedit_pageseg_mode: PSM.SINGLE_LINE, preserve_interword_spaces: '0' }),
+      workers[1].setParameters({ tessedit_pageseg_mode: PSM.SINGLE_LINE, tessedit_char_whitelist: ROMAN_CHARACTERS, preserve_interword_spaces: '0' }),
+    ]);
+    if (signal.aborted || token !== generation || stopped) { dispose(); return; }
+    [jpWorker, romanWorker] = workers;
+    transferred = true;
+    announce({ ocrReady: true, message: captureWarning ?? (calibration ? 'お題を待っています' : 'お題を探しています') });
+  } catch (error) { dispose(); throw error; }
+  finally { signal.removeEventListener('abort', dispose); }
 }
 async function start(message: { streamId: string; tabId: number; sessionId: string; startedAt: number; settings: Settings }) {
   if (stream) return { ok: false, error: '記録はすでに開始しています。' };
@@ -510,7 +524,7 @@ async function start(message: { streamId: string; tabId: number; sessionId: stri
   calibration = undefined; manualRegions = false; detectedRegions = null; lastRegionScan = 0;
   keyBuffer = []; focusGaps = []; queue = []; scoreQueue = []; currentCandidate = undefined;
   games = []; activeGame = null; session = null; lastResultScan = 0;
-  lastSignature = pendingSignature = null; pendingCount = 0; sequence = 0;
+  promptSignatures.reset(); sequence = 0;
   captureWarning = undefined; lastVideoWidth = lastVideoHeight = 0;
   status = { state: 'starting', tabId: message.tabId, sessionId: message.sessionId, startedAt: message.startedAt, phraseCount: 0, ocrReady: false, regionState: 'searching', scoreState: 'watching' };
   try {
@@ -533,10 +547,14 @@ async function start(message: { streamId: string; tabId: number; sessionId: stri
       if (status.startedAt && Date.now() - status.startedAt > 60 * 60 * 1000) { void stop(); return; }
       if (status.state === 'recording') announce();
     }, 15000);
-    initializing = initializeWorkers(token).catch(error => {
-      if (token === generation && !stopped) announce({ ocrReady: false, message: '文字認識を起動できませんでした。拡張を再読み込みしてください。' });
-      console.error('Local OCR initialization failed', error instanceof Error ? error.message : 'OCR error');
-    });
+    const controller = new AbortController();
+    initializationController = controller;
+    initializing = initializeWorkers(token, controller.signal).catch(error => {
+      if (token === generation && !stopped) {
+        announce({ ocrReady: false, message: '文字認識を起動できませんでした。拡張を再読み込みしてください。' });
+        console.error('Local OCR initialization failed', error instanceof Error ? error.message : 'OCR error');
+      }
+    }).finally(() => { if (initializationController === controller) initializationController = null; });
     return { ok: true, status };
   } catch (error) {
     stream?.getTracks().forEach(track => track.stop()); stream = null;
@@ -562,7 +580,12 @@ async function finishStop() {
   // Stop the media tracks immediately; only already-cropped text awaits OCR.
   stream?.getTracks().forEach(track => track.stop()); stream = null;
   video.srcObject = null;
-  await initializing;
+  // A Tesseract startup error can leave its underlying createWorker promise
+  // pending forever. Abort our startup ownership and do not await that promise;
+  // background closes this document after stop returns, releasing raw workers
+  // that Tesseract has not exposed through its public API.
+  initializationController?.abort(); initializationController = null;
+  initializing = null;
   if (!jpWorker || !romanWorker) {
     for (const candidate of queue) candidate.completionBoundary.settle(null);
     currentCandidate?.completionBoundary.settle(null);
@@ -632,7 +655,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       resetAutoRegions(Date.now(), false);
       calibration = message.calibration; manualRegions = true;
       lastVideoWidth = video.videoWidth; lastVideoHeight = video.videoHeight;
-      lastSignature = pendingSignature = null; pendingCount = 0;
+      promptSignatures.reset();
       announce({ regionState: 'manual', regionConfidence: undefined, region: undefined, message: captureWarning ?? (status.ocrReady ? '手動の範囲で読み取っています' : '文字認識を準備しています') });
       sendResponse({ ok: true }); return;
     default: return;

@@ -74,13 +74,14 @@ function conciseError(error: unknown, fallback = '記録を開始できません
 async function startCapture() {
   if (transitioning) return { ok: false, error: '記録の準備中です。' };
   transitioning = true;
-  const previous = await currentStatus(true);
-  if (previous.state === 'recording') { transitioning = false; return { ok: true, status: previous }; }
-  const tab = await findGameTab(true);
-  if (!tab?.id) { transitioning = false; return { ok: false, error: '寿司打のタブを開いて、拡張アイコンを押してください。' }; }
-  const sessionId = crypto.randomUUID();
-  const startedAt = Date.now();
+  let tab: chrome.tabs.Tab | null = null;
   try {
+    const previous = await currentStatus(true);
+    if (previous.state === 'recording') return { ok: true, status: previous };
+    tab = await findGameTab(true);
+    if (!tab?.id) return { ok: false, error: '寿司打のタブを開いて、拡張アイコンを押してください。' };
+    const sessionId = crypto.randomUUID();
+    const startedAt = Date.now();
     await publish({ state: 'starting', tabId: tab.id, sessionId, startedAt, phraseCount: 0, ocrReady: false, message: '記録を準備しています' });
     await ensureOffscreen();
     const { settings } = await getData();
@@ -98,7 +99,7 @@ async function startCapture() {
     await publish(response.status);
     return { ok: true, status: response.status };
   } catch (error) {
-    await chrome.tabs.sendMessage(tab.id, { type: 'UCHI_CAPTURE_DISABLE' }).catch(() => {});
+    if (tab?.id) await chrome.tabs.sendMessage(tab.id, { type: 'UCHI_CAPTURE_DISABLE' }).catch(() => {});
     if (await hasOffscreen()) {
       await offscreen('UCHI_OFF_STOP').catch(() => {});
       await chrome.offscreen.closeDocument().catch(() => {});
@@ -111,12 +112,12 @@ async function startCapture() {
 async function stopCapture(message?: string) {
   if (transitioning) return { ok: false, error: '記録の準備が終わってから停止してください。' };
   transitioning = true;
-  await loadStatus();
-  const ended = { ...status };
-  let finalWarning: string | undefined;
-  let stoppedSessionId = ended.activeSessionId ?? ended.sessionId;
-  let stoppedStatus: CaptureStatus | undefined;
   try {
+    await loadStatus();
+    const ended = { ...status };
+    let finalWarning: string | undefined;
+    let stoppedSessionId = ended.activeSessionId ?? ended.sessionId;
+    let stoppedStatus: CaptureStatus | undefined;
     if (ended.tabId) {
       await chrome.tabs.sendMessage(ended.tabId, { type: 'UCHI_CAPTURE_DISABLE' }).catch(() => {});
       // Let each permitted frame's final key batch reach the offscreen buffer.
