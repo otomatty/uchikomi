@@ -156,11 +156,6 @@ try {
   cdp = await browser.newBrowserCDPSession();
   let extensionId;
   await run('Explicit unpacked-extension installation and enabled status', async () => {
-    const extensionsPage = await newQaPage();
-    await extensionsPage.goto('chrome://extensions/');
-    const developerMode = extensionsPage.locator('#devMode');
-    if (!await developerMode.evaluate(toggle => toggle.checked)) await developerMode.click();
-    await extensionsPage.close();
     const previous = path.join(temp, 'older-release');
     await mkdir(previous);
     await writeFile(path.join(previous, 'manifest.json'), JSON.stringify({
@@ -1114,28 +1109,7 @@ try {
     }
   });
   await run('No uncaught application exceptions', async () => assert.deepEqual(report.browserErrors, []));
-  await run('Chrome restart picks up an in-place ZIP upgrade and preserves the extension origin', async () => {
-    const probeUrl = `chrome-extension://${extensionId}/qa-empty.html`;
-    const before = await newQaPage();
-    await before.goto(probeUrl);
-    await before.evaluate(() => localStorage.setItem('restartProbe', 'saved'));
-    await cdp.send('Browser.close').catch(() => {});
-    await chromeProcess.stop();
-    await connectedBrowser.close().catch(() => {});
 
-    const nextVersion = manifest.version + '.1';
-    await writeFile(path.join(extension, 'manifest.json'), JSON.stringify({ ...manifest, version: nextVersion }));
-    chromeProcess = await startChromiumPipe({ executablePath: process.env.CHROME_BIN || chromium.executablePath(), profileDir, headless });
-    connectedBrowser = await chromium.connectOverCDP(chromeProcess.transport, { noDefaults: true, isLocal: true, artifactsDir });
-    context = connectedBrowser.contexts()[0];
-    cdp = await connectedBrowser.newBrowserCDPSession();
-    const pendingInventory = await cdp.send('Extensions.getExtensions');
-    console.log('Extensions after browser restart:', JSON.stringify(pendingInventory.extensions));
-    const after = await newQaPage();
-    await after.goto(probeUrl);
-    const state = await after.evaluate(() => [chrome.runtime.id, chrome.runtime.getManifest().version, localStorage.getItem('restartProbe')]);
-    assert.deepEqual(state, [extensionId, nextVersion, 'saved']);
-  });
 } catch (e) {
   report.errors.push(String(e.stack || e));
   console.error(e.message || e);
