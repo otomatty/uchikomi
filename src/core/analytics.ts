@@ -212,9 +212,10 @@ export function summarize(data:AppData):{best:number|null;median:number|null;del
   const recent=usable.slice().sort((a,b)=>a.endedAt-b.endedAt).slice(-50),keys=recent.reduce((n,a)=>n+a.correctKeys,0),errors=recent.reduce((n,a)=>n+a.mistakes,0),duration=recent.reduce((n,a)=>n+a.durationMs,0);
   const practice=data.attempts.filter(a=>a.complete&&(a.source==='practice'||(demoOnly&&a.source==='demo')));
   const today=dateKey(Date.now()),days=new Set(data.sessions.filter(s=>s.endedAt&&(demoOnly||s.source!=='demo')).map(s=>dateKey(s.startedAt)));
+  const wholePrompts=practice.filter(attempt=>!attempt.clause);
   for(const a of practice)days.add(dateKey(a.startedAt));
   let streak=0,cursor=Date.now();if(!days.has(today))cursor-=86400000;
   while(days.has(dateKey(cursor))){streak++;cursor-=86400000;}
   return {best:scored.length?Math.max(...scored.map(s=>s.score!)):null,median:latestMedian,delta:latestMedian===null?null:latestMedian-data.settings.baselineScore,
-    accuracy:keys+errors?100*keys/(keys+errors):null,kps:duration?keys/(duration/1000):null,practiceCount:practice.length,streak,todayCount:practice.filter(a=>dateKey(a.startedAt)===today).length};
+    accuracy:keys+errors?100*keys/(keys+errors):null,kps:duration?keys/(duration/1000):null,practiceCount:wholePrompts.length,streak,todayCount:wholePrompts.filter(a=>dateKey(a.startedAt)===today).length};
 }

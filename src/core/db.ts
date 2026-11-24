@@ -2,7 +2,7 @@ import { DEFAULT_SETTINGS, MAX_SCORE } from './types';
 import type { AppData, Attempt, Calibration, DailyActivity, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
 import { normalizeRoman } from './romaji';
 import { isErrorTerminatedAttempt } from './analytics';
-import { compatibleAttemptWithPhrase, compatiblePhraseAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
+import { reconcileAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
 import { MAX_ACTIVITY_DAYS, MAX_ACTIVITY_KEYS, MAX_ACTIVITY_MS, MAX_ACTIVITY_PHRASES, mergeDailyActivity, validTrainingDate } from './activity';
 import { isReplayShortcut, type ReplayShortcut } from './shortcuts';
 const DB_NAME='uchikomi-v1', VERSION=3;
@@ -107,8 +107,9 @@ async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<s
       if(member.id===merged.id&&!spellingChanged(before,merged))continue;
       const history=await request<Attempt[]>(attempts.index('phraseId').getAll(member.id));
       for(const attempt of history){
-        const reliable=attempt.reliable&&(replacedAttemptIds?.has(attempt.id)||compatiblePhraseAttempt(before,merged,attempt));
-        if(attempt.phraseId!==merged.id||reliable!==attempt.reliable)attempts.put({...attempt,phraseId:merged.id,reliable});
+        if (replacedAttemptIds?.has(attempt.id)) continue;
+        const updated = reconcileAttempt(merged,attempt,before);
+        if (updated !== attempt) attempts.put(updated);
       }
     }
   }
@@ -154,8 +155,7 @@ export async function saveAttempt(value:Attempt):Promise<void> {
   const alias=await request<{phraseId:string}|undefined>(tx.objectStore('phraseAliases').get(attempt.phraseId));
   const phrase=await request<Phrase|undefined>(tx.objectStore('phrases').get(alias?.phraseId??attempt.phraseId));
   if(!phrase){tx.abort();await done.catch(()=>{});throw new Error('語句を保存してから練習結果を保存してください。');}
-  const compatible=attempt.judgements?compatibleAttemptWithPhrase(phrase,attempt):phrase.id===attempt.phraseId;
-  const result={...attempt,phraseId:phrase.id,reliable:attempt.reliable&&compatible};
+  const result = !attempt.judgements && phrase.id === attempt.phraseId ? attempt : reconcileAttempt(phrase,attempt);
   tx.objectStore('attempts').put(result);await done;notify();
 }
 export async function saveSession(value:Session):Promise<void> {
@@ -271,8 +271,7 @@ export async function importData(value:unknown):Promise<void> {
       // Only an incoming original definition describes the imported input.
       // A current row with the same ID may already have a corrected spelling.
       const before=importedPhrases.get(attempt.phraseId);
-      const reliable=attempt.reliable&&(before?compatiblePhraseAttempt(before,target,attempt):compatibleAttemptWithPhrase(target,attempt));
-      tx.objectStore('attempts').put({...attempt,phraseId:target.id,reliable});
+      tx.objectStore('attempts').put(reconcileAttempt(target,attempt,before));
     }
     const previousSessions=new Map(currentSessions.map(session=>[session.id,session]));
     for(const session of imported.sessions){

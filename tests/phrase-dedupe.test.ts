@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto';
 import test, { after, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { deletePhrase, exportData, getData, importData, saveAttempt, savePhrase, saveSession, updatePhrase } from '../src/core/db';
+import { clauseTarget } from '../src/core/clauses';
 import { analyzeWords, buildAttempt } from '../src/core/analytics';
 import { DEFAULT_SETTINGS } from '../src/core/types';
 import type { Attempt, Phrase, Session } from '../src/core/types';
@@ -242,4 +243,23 @@ test('delayed detailed input is rechecked against a corrected target even when t
   const legacyAttempt={...pending,id:'legacy-without-detail'};delete legacyAttempt.judgements;
   await importData({version:1,phrases:[],attempts:[legacyAttempt],sessions:[],settings:DEFAULT_SETTINGS});
   assert.deepEqual((await getData()).attempts.find(value=>value.id===legacyAttempt.id),{...legacyAttempt,reliable:false});
+});
+
+test('clause history follows a unique shifted clause through edits, late saves and backup replay', async () => {
+  const parent = await savePhrase(phrase('long',{text:'開いた口が塞がらない',reading:'あいたくちがふさがらない',roman:'aitakutigahusagaranai',verified:true}));
+  await saveSession(session());
+  const target = clauseTarget(parent,{text:'口が',reading:'くちが',start:3});
+  const drill = buildAttempt({phrase:target,strokes:[...'kuchiga'].map((key,i)=>({key,at:now+(i+1)*100})),
+    startedAt:now,endedAt:now+1000,sessionId:'game',source:'practice',complete:true,reliable:true});
+  await saveAttempt(drill);
+  await updatePhrase(parent.id,{reading:'ひらいたくちがふさがらない',roman:'hiraitakutigahusagaranai'});
+  await saveAttempt({...drill,id:'late'});
+  const backup = await exportData();
+  await importData({...backup,attempts:[{...drill,id:'from-backup'}]});
+  const rows = (await getData()).attempts;
+  assert.equal(rows.length,3);
+  assert.ok(rows.every(a=>a.reliable && a.clause?.start===4));
+  await updatePhrase(parent.id,{text:'口が開いた口が塞がらない',reading:'くちがあいたくちがふさがらない',roman:'kutigaaitakutigahusagaranai'});
+  const ambiguous = (await getData()).attempts;
+  assert.ok(ambiguous.every(a=>!a.reliable && a.clause?.start===4));
 });

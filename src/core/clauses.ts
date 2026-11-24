@@ -15,10 +15,11 @@ function boundaryOffsets(chunks:string[][], reading:string[]) {
   const boundaries = [reachable];
   for (const chunk of chunks) {
     for (const token of chunk) {
-      const next = new Uint8Array(reachable.length);
+      // Display punctuation may be silent or present in the typed reading.
+      const next = /^[、。,.!?]$/u.test(token) ? reachable.slice() : new Uint8Array(reachable.length);
       const variable = wildcard.test(token);
       for (let i = 1; i <= reading.length; i++) {
-        next[i] = variable
+        next[i] |= variable
           ? Number(kana.test(reading[i-1]) && !!(reachable[i-1] || next[i-1]))
           : Number(reading[i-1] === token && !!reachable[i-1]);
       }

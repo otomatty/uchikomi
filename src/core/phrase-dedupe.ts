@@ -1,5 +1,5 @@
 import type { Attempt, Phrase } from './types';
-import { sameClause, splitClauses } from './clauses';
+import { splitClauses } from './clauses';
 import { createMatcher, kanaToRoman, normalizeRoman } from './romaji';
 
 const label = (value: string) => value.normalize('NFKC').replace(/\s+/g, '');
@@ -76,20 +76,30 @@ export function mergePhraseGroup(group: readonly Phrase[], preferredId?: string,
   return result;
 }
 
-/** Preserve measurements only when the new target accepts the same input. */
-export function compatiblePhraseAttempt(before: Phrase, after: Phrase, attempt: Attempt): boolean {
-  if (attempt.clause) return compatibleAttemptWithPhrase(after, attempt);
-  const oldReading = reading(before.reading), newReading = reading(after.reading);
-  if (oldReading === newReading && (normalizeRoman(before.roman) === normalizeRoman(after.roman) || (oldReading && kanaToRoman(oldReading)))) return true;
-  return compatibleAttemptWithPhrase(after, attempt);
+/** Rebind a saved measurement to the canonical phrase, keeping its original
+ * evidence if the typed target disappeared or its new location is ambiguous. */
+export function reconcileAttempt(after:Phrase, attempt:Attempt, before?:Phrase):Attempt {
+  let clause = attempt.clause;
+  let reliable = attempt.reliable;
+  if (reliable && clause) {
+    const original = clause;
+    const matches = splitClauses(after).filter(part => part.text === original.text && part.reading === original.reading);
+    const target = matches.find(part => part.start === original.start) ?? (matches.length === 1 ? matches[0] : undefined);
+    reliable = !!target && matchesInput(attempt, target.reading, kanaToRoman(target.reading));
+    if (reliable && target && target.start !== original.start) clause = target;
+  } else if (reliable) {
+    const oldReading = before && reading(before.reading);
+    const sameInput = before && oldReading === reading(after.reading) &&
+      (normalizeRoman(before.roman) === normalizeRoman(after.roman) || (oldReading && kanaToRoman(oldReading)));
+    reliable = !!sameInput || matchesInput(attempt, after.reading, after.roman);
+  }
+  if (attempt.phraseId === after.id && reliable === attempt.reliable && clause === attempt.clause) return attempt;
+  return {...attempt, phraseId:after.id, reliable, ...(clause && {clause})};
 }
 
-/** Recheck detailed delayed input even when its canonical ID has not changed. */
-export function compatibleAttemptWithPhrase(after: Phrase, attempt: Attempt): boolean {
+function matchesInput(attempt:Attempt, kana:string, roman:string):boolean {
   if (!attempt.judgements?.length) return false;
-  const clause = attempt.clause;
-  if (clause && !splitClauses(after).some(part => sameClause(part,clause))) return false;
-  const matcher = clause ? createMatcher(clause.reading, kanaToRoman(clause.reading)) : createMatcher(after.reading, after.roman);
+  const matcher = createMatcher(kana, roman);
   for (const judgement of attempt.judgements) {
     if (matcher.position !== judgement.position || [...matcher.expectedKeys].sort().join('\0') !== [...judgement.expected].sort().join('\0')) return false;
     if (matcher.feed(judgement.actual).accepted !== judgement.accepted) return false;

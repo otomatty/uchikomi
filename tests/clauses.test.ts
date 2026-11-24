@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { analyzeWords, buildAttempt } from '../src/core/analytics';
+import { analyzeWords, buildAttempt, summarize } from '../src/core/analytics';
 import { analyzeClauses } from '../src/core/clause-stats';
 import { splitClauses, clauseTarget } from '../src/core/clauses';
 import { createKanaTrace } from '../src/core/romaji';
-import type { PracticePhrase } from '../src/core/types';
+import { DEFAULT_SETTINGS, type PracticePhrase } from '../src/core/types';
 
 const prompt:PracticePhrase = {id:'prompt',text:'開いた口が塞がらない',reading:'あいたくちがふさがらない',
   roman:'aitakutigahusagaranai',verified:true,source:'capture',confidence:99,capturedAt:1,lastSeenAt:1,seenCount:1};
@@ -74,4 +74,27 @@ test('a repeated clause counts once per attempt and combines with evidence from 
   assert.equal(weak.phrase.id,prompt.id);
   assert.deepEqual(weak.clause,middle);
   assert.equal(weak.mistakeAttempts,2);
+});
+
+test('punctuation on the prompt can be silent or typed without hiding other clauses', () => {
+  for (const suffix of ['', '。']) {
+    const target = {...prompt,text:'犬と散歩に行く。',reading:'いぬとさんぽにいく'+suffix,roman:'inutosanponiiku'+(suffix ? '.' : '')};
+    assert.deepEqual(splitClauses(target).slice(1), [
+      {text:'散歩に',reading:'さんぽに',start:3}, {text:'行く。',reading:'いく'+suffix,start:7},
+    ]);
+    const attempts = [1,2].map(i=>record('inutox',i,{target,stopOnMiss:true}));
+    assert.deepEqual(analyzeClauses(attempts,[target]).map(item=>item.clause.text), ['散歩に']);
+  }
+});
+
+test('a clause-only practice day contributes to the streak and excludes full-prompt completions', t => {
+  const at = Date.UTC(2026,10,24,1);
+  t.mock.method(Date,'now',()=>at);
+  const drill = record('kutiga',at/10000,{target:clauseTarget(prompt,middle)});
+  const data = {attempts:[drill], phrases:[prompt], sessions:[], settings:DEFAULT_SETTINGS};
+  const stats = summarize(data);
+  assert.equal(stats.todayCount,0); assert.equal(stats.practiceCount,0); assert.equal(stats.streak,1);
+  const full = record(prompt.roman,at/10000);
+  const mixed = summarize({...data,attempts:[drill,full]});
+  assert.equal(mixed.todayCount,1); assert.equal(mixed.practiceCount,1);
 });
