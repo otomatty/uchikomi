@@ -8,21 +8,37 @@
 
 ## インストール
 
-### GitHub Releases からインストールする
+### WindowsでZIP版を自動更新する（v1.6.0以降）
 
-1. 最新リリースの **Assets** から `uchikomi-extension-v<バージョン>.zip` をダウンロードし、展開します。[最新のリリース](https://github.com/otomatty/uchikomi/releases/latest)
-2. Chrome で `chrome://extensions` を開き、「デベロッパーモード」をオンにします。
-3. 「パッケージ化されていない拡張機能を読み込む」で、展開した **`manifest.json` のあるフォルダー** を選択します。
+1. **v1.5.0以前を使用中の場合**は、先に下の「旧版からの移行」を行います。
+2. 最新リリースの **Assets** から `uchikomi-extension-v<バージョン>.zip` をダウンロードします。WindowsでZIPの「プロパティ」に「許可する」が表示されていればチェックしてから展開します。[最新のリリース](https://github.com/otomatty/uchikomi/releases/latest)
+3. 展開した `manifest.json` のあるフォルダーでPowerShellを開き、次を1回実行します。更新ツールが公式リリースを取得し、現在のWindowsユーザーのタスクスケジューラに「UCHIKOMI ZIP Update」を登録します。
 
-### ZIP版を更新する
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File ".\Update-Uchikomi.ps1" -Mode Install
+   ```
 
-1. 記録を一時停止して復習を終了し、「設定 → 書き出す」で練習記録をバックアップします。
-2. 新しいZIPを展開し、現在Chromeに読み込ませているフォルダーの内容を置き換えます。
-3. `chrome://extensions` のUCHIKOMIで再読み込みを押し、バージョンと練習記録を確認します。
+4. Chromeで `chrome://extensions` を開き、デベロッパーモードをオンにします。「パッケージ化されていない拡張機能を読み込む」で、フォルダー選択欄に **`%LOCALAPPDATA%\UCHIKOMI\Extension`** を入力して開きます。
 
-同じフォルダーで更新し、拡張機能自体は削除しないでください。ZIPを「パッケージ化されていない拡張機能」として読み込む現在の配布方式には、自動ダウンロード・差し替え機能はありません。
+初回設定後はログオン時と15分間隔でタスクが起動します。配布元はこのリポジトリのGitHub Releasesです。Chromeが終了している間に、ZIPのSHA-256がGitHubの公開値と一致し、同梱されたマニフェストがUCHIKOMIの固定IDと対象バージョンに対応することを確かめてから、同じフォルダーを更新します。次回Chromeを開くと新版が読み込まれます。Chromeがバックグラウンドに残る環境では、Chromeのメニューから「終了」してください。次の版を手動でダウンロードする必要はありません。
 
-Chrome標準の自動更新を使う場合は、Chrome Web Storeへ登録して配布する構成に移行します。個人利用なら[非公開・Trusted testers](https://developer.chrome.com/docs/webstore/cws-dashboard-distribution)でインストール先を指定できます。非公開でも審査が必要です。[ストアAPI](https://developer.chrome.com/docs/webstore/using-api)による更新登録と、記録保存後の更新適用は今後の導入対象で、このZIP版には含まれません。
+自動更新を停止するには、PowerShellで次を実行します。拡張機能と練習記録は引き続き使えます。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "$env:LOCALAPPDATA\UCHIKOMI\Update-Uchikomi.ps1" -Mode Disable
+```
+
+### 旧版からの移行（初回のみ）
+
+v1.5.0以前のZIP版は、読み込んだフォルダーによって拡張機能IDが異なります。v1.6.0以降のZIP版は、同じChromeプロファイルで共通のID `maalmhkjpipklfhmkbkfjfnblmcchonc` を使用します。旧IDに保存された練習記録は、初回に次の手順で移します。
+
+1. 旧版で記録を一時停止し、復習を終えて「設定 → 書き出す」でJSONを保存します。すでに旧版が複数ある場合は、記録がある版ごとに保存します。
+2. `chrome://extensions` で旧版をオフにし、新版を上の手順で読み込みます。
+3. 新版の設定からJSONを読み込み、キーワードや練習履歴を確認してから、無効にした旧版を削除します。
+
+### ZIP版を手動で使う
+
+ZIPを固定のフォルダーに展開し、Chromeの「パッケージ化されていない拡張機能を読み込む」でそのフォルダーを選びます。更新時は練習記録をバックアップしてから同じフォルダーの内容を差し替え、`chrome://extensions` で再読み込みしてください。
 
 ### ソースからビルドする
 
@@ -37,7 +53,7 @@ npm run build
 
 ### 新しいバージョンを公開する
 
-`npm version 1.5.1 --no-git-tag-version` のように次の番号を指定し、`public/manifest.json` の `version` も同じ番号に更新します。変更を `main` にマージし、GitHub Actions の `verify` と `browser` が成功すると、検証したコミットに `v<バージョン>` タグが付き、拡張機能のZIPがGitHub Releasesに公開されます。公開済みのバージョンはスキップします。PRのビルドは、従来どおりActionsの成果物 `uchikomi-extension` から試せます。
+`npm version 1.6.1 --no-git-tag-version` のように次の番号を指定し、`public/manifest.json` の `version` も同じ番号に更新します。変更を `main` にマージし、GitHub Actions の `verify`、`browser`、`windows-updater` が成功すると、検証したコミットに `v<バージョン>` タグが付き、拡張機能のZIPがGitHub Releasesに公開されます。公開済みのバージョンはスキップします。PRのビルドは、従来どおりActionsの成果物 `uchikomi-extension` から試せます。
 
 ## 最初の1回
 
