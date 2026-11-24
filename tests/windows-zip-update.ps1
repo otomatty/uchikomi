@@ -22,6 +22,15 @@ $null = [IO.Directory]::CreateDirectory($root)
 $running = $false
 $downloads = 0
 
+& {
+    $processes = @([pscustomobject]@{ SessionId = 123; OwnerSid = 'S-1-5-19' })
+    function Get-CimInstance { $processes }
+    function Invoke-CimMethod($InputObject) { @{ Sid = $InputObject.OwnerSid } }
+    Assert-True (!(Test-ChromeRunning)) 'Another Windows user blocked updates'
+    $processes[0].OwnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Assert-True (Test-ChromeRunning) 'Missed own Chrome in another session'
+}
+
 function New-Fixture([string]$Version) {
     $manifest = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot '../public/manifest.json') | ConvertFrom-Json
     $manifest.version = $Version
@@ -81,6 +90,8 @@ try {
     New-Fixture '1.7.0'
     Update-Extension $root
     Assert-True ((Get-ExtensionVersion $active) -eq [version]'1.7.0') 'Update did not reuse install path'
+    $null = [IO.Directory]::CreateDirectory((Join-Path $root 'Previous'))
+    Update-Extension $root
     Assert-True (@(Get-ChildItem $root -Directory).Count -eq 1) 'Extra extension directories remained'
 
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value

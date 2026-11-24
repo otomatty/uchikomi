@@ -28,15 +28,22 @@ function Save-ReleaseZip([string]$Url, [string]$Destination) {
 }
 
 function Test-ChromeRunning {
-    return [bool](Get-Process -Name chrome -ErrorAction SilentlyContinue)
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    foreach ($process in Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'") {
+        $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+        if ($owner.Sid -eq $userSid) { return $true }
+        if (!$owner.Sid -and $process.SessionId -eq $sessionId) { return $true }
+    }
+    return $false
 }
 
 function Update-Extension([string]$Root) {
     $active = Join-Path $Root 'Extension'
     $previous = Join-Path $Root 'Previous'
     if (Test-Path -LiteralPath $previous) {
-        $null = Get-ExtensionVersion $previous
         if (!(Test-Path -LiteralPath $active)) {
+            $null = Get-ExtensionVersion $previous
             [IO.Directory]::Move($previous, $active)
         } else {
             $null = Get-ExtensionVersion $active

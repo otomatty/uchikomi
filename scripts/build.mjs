@@ -2,6 +2,7 @@ import { build as viteBuild } from 'vite';
 import { build as esbuild } from 'esbuild';
 import { mkdir, readdir, copyFile, writeFile } from 'node:fs/promises';
 await viteBuild();
+await copyFile('README.md','dist/README.md');
 await copyFile('THIRD_PARTY_NOTICES.txt','dist/THIRD_PARTY_NOTICES.txt');
 await esbuild({entryPoints:['src/capture/background.ts'],bundle:true,format:'esm',platform:'browser',target:'chrome116',outfile:'dist/background.js',minify:true});
 await esbuild({entryPoints:['src/capture/content.ts'],bundle:true,format:'iife',platform:'browser',target:'chrome116',outfile:'dist/content.js',minify:true});
