@@ -1,4 +1,4 @@
-import type { Attempt, Phrase } from './types';
+import type { Attempt, Clause, Phrase } from './types';
 import { splitClauses } from './clauses';
 import { createMatcher, kanaToRoman, normalizeRoman } from './romaji';
 
@@ -78,12 +78,17 @@ export function mergePhraseGroup(group: readonly Phrase[], preferredId?: string,
 
 /** Rebind a saved measurement to the canonical phrase, keeping its original
  * evidence if the typed target disappeared or its new location is ambiguous. */
-export function reconcileAttempt(after:Phrase, attempt:Attempt, before?:Phrase):Attempt {
+export function reconcileAttempt(after:Phrase, attempt:Attempt, before?:Phrase, clauseCache?:Map<Phrase,Clause[]>):Attempt {
   let clause = attempt.clause;
   let reliable = attempt.reliable;
   if (reliable && clause) {
     const original = clause;
-    const matches = splitClauses(after).filter(part => part.text === original.text && part.reading === original.reading);
+    let parts = clauseCache?.get(after);
+    if (!parts) {
+      parts = splitClauses(after);
+      clauseCache?.set(after, parts);
+    }
+    const matches = parts.filter(part => part.text === original.text && part.reading === original.reading);
     const target = matches.find(part => part.start === original.start) ?? (matches.length === 1 ? matches[0] : undefined);
     reliable = !!target && matchesInput(attempt, target.reading, kanaToRoman(target.reading));
     if (reliable && target && target.start !== original.start) clause = target;

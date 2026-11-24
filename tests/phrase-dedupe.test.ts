@@ -1,4 +1,5 @@
 import 'fake-indexeddb/auto';
+import { Parser } from 'budoux';
 import test, { after, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { deletePhrase, exportData, getData, importData, saveAttempt, savePhrase, saveSession, updatePhrase } from '../src/core/db';
@@ -245,19 +246,24 @@ test('delayed detailed input is rechecked against a corrected target even when t
   assert.deepEqual((await getData()).attempts.find(value=>value.id===legacyAttempt.id),{...legacyAttempt,reliable:false});
 });
 
-test('clause history follows a unique shifted clause through edits, late saves and backup replay', async () => {
+test('clause history follows a unique shifted clause through edits, late saves and backup replay', async t => {
   const parent = await savePhrase(phrase('long',{text:'開いた口が塞がらない',reading:'あいたくちがふさがらない',roman:'aitakutigahusagaranai',verified:true}));
   await saveSession(session());
   const target = clauseTarget(parent,{text:'口が',reading:'くちが',start:3});
   const drill = buildAttempt({phrase:target,strokes:[...'kuchiga'].map((key,i)=>({key,at:now+(i+1)*100})),
     startedAt:now,endedAt:now+1000,sessionId:'game',source:'practice',complete:true,reliable:true});
   await saveAttempt(drill);
+  await saveAttempt({...drill,id:'repeat'});
+  const parse = t.mock.method(Parser.prototype,'parse');
   await updatePhrase(parent.id,{reading:'ひらいたくちがふさがらない',roman:'hiraitakutigahusagaranai'});
+  assert.equal(parse.mock.callCount(),1,'edit splits the parent once for all of its drills');
   await saveAttempt({...drill,id:'late'});
   const backup = await exportData();
-  await importData({...backup,attempts:[{...drill,id:'from-backup'}]});
+  parse.mock.resetCalls();
+  await importData({...backup,attempts:[{...drill,id:'from-backup'},{...drill,id:'another-import'}]});
+  assert.equal(parse.mock.callCount(),1,'restore splits the shared target once');
   const rows = (await getData()).attempts;
-  assert.equal(rows.length,3);
+  assert.equal(rows.length,5);
   assert.ok(rows.every(a=>a.reliable && a.clause?.start===4));
   await updatePhrase(parent.id,{text:'口が開いた口が塞がらない',reading:'くちがあいたくちがふさがらない',roman:'kutigaaitakutigahusagaranai'});
   const ambiguous = (await getData()).attempts;

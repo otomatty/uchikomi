@@ -1,5 +1,5 @@
 import { DEFAULT_SETTINGS, MAX_SCORE } from './types';
-import type { AppData, Attempt, Calibration, DailyActivity, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
+import type { AppData, Attempt, Calibration, Clause, DailyActivity, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
 import { normalizeRoman } from './romaji';
 import { isErrorTerminatedAttempt } from './analytics';
 import { reconcileAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
@@ -80,7 +80,7 @@ export async function getSettings():Promise<Settings> {
   return {...DEFAULT_SETTINGS,...settings,replayShortcut:validateReplayShortcut(settings?.replayShortcut)};
 }
 interface Consolidation {phrases:Phrase[];bySource:Map<string,Phrase>;}
-async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<string,Phrase>,changedIds?:ReadonlySet<string>,replacedAttemptIds?:ReadonlySet<string>):Promise<Consolidation> {
+async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<string,Phrase>,changedIds?:ReadonlySet<string>,replacedAttemptIds?:ReadonlySet<string>,clauseCache=new Map<Phrase,Clause[]>()):Promise<Consolidation> {
   const groups=groupDuplicatePhrases(rows),phrases:Phrase[]=[],bySource=new Map<string,Phrase>();
   const plans=groups.map(group=>{
     // Existing IDs stay stable when a fresh capture or an older backup arrives.
@@ -108,7 +108,7 @@ async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<s
       const history=await request<Attempt[]>(attempts.index('phraseId').getAll(member.id));
       for(const attempt of history){
         if (replacedAttemptIds?.has(attempt.id)) continue;
-        const updated = reconcileAttempt(merged,attempt,before);
+        const updated = reconcileAttempt(merged,attempt,before,clauseCache);
         if (updated !== attempt) attempts.put(updated);
       }
     }
@@ -264,14 +264,15 @@ export async function importData(value:unknown):Promise<void> {
       working.set(next.id,next);changedIds.add(next.id);
       for(const source of phraseSeenSources(next))sourceOwners.set(source.id,next.id);
     }
-    const consolidated=await consolidatePhrases(tx,[...working.values()],previousPhrases,changedIds,replacedAttemptIds);
+    const clauseCache = new Map<Phrase,Clause[]>();
+    const consolidated=await consolidatePhrases(tx,[...working.values()],previousPhrases,changedIds,replacedAttemptIds,clauseCache);
     const importedPhrases=new Map(imported.phrases.map(phrase=>[phrase.id,phrase]));
     for(const attempt of imported.attempts){
       const target=consolidated.bySource.get(attempt.phraseId)!;
       // Only an incoming original definition describes the imported input.
       // A current row with the same ID may already have a corrected spelling.
       const before=importedPhrases.get(attempt.phraseId);
-      tx.objectStore('attempts').put(reconcileAttempt(target,attempt,before));
+      tx.objectStore('attempts').put(reconcileAttempt(target,attempt,before,clauseCache));
     }
     const previousSessions=new Map(currentSessions.map(session=>[session.id,session]));
     for(const session of imported.sessions){

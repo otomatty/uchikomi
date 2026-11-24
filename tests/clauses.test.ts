@@ -94,7 +94,9 @@ test('a clause-only practice day contributes to the streak and excludes full-pro
   const data = {attempts:[drill], phrases:[prompt], sessions:[], settings:DEFAULT_SETTINGS};
   const stats = summarize(data);
   assert.equal(stats.todayCount,0); assert.equal(stats.practiceCount,0); assert.equal(stats.streak,1);
-  const full = record(prompt.roman,at/10000);
+  assert.equal(stats.accuracy,null); assert.equal(stats.kps,null);
+  const full = record('x'+prompt.roman,at/10000,{gap:()=>200});
   const mixed = summarize({...data,attempts:[drill,full]});
   assert.equal(mixed.todayCount,1); assert.equal(mixed.practiceCount,1);
+  assert.equal(mixed.accuracy,full.accuracy); assert.equal(mixed.kps,full.kps);
 });

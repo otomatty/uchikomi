@@ -208,11 +208,11 @@ export function summarize(data:AppData):{best:number|null;median:number|null;del
   const demoOnly=data.sessions.length>0&&data.sessions.every(s=>s.source==='demo');
   const scored=data.sessions.filter(s=>s.course===10000&&s.mode==='accuracy'&&s.source!=='practice'&&s.scoreType==='total'&&Number.isFinite(s.score)&&(demoOnly||s.source!=='demo')).sort((a,b)=>a.startedAt-b.startedAt);
   const latestMedian=scored.length?median(scored.slice(-5).map(s=>s.score!)):null;
-  const usable=data.attempts.filter(a=>a.reliable&&a.complete&&(a.source==='practice'||(demoOnly&&a.source==='demo')));
-  const recent=usable.slice().sort((a,b)=>a.endedAt-b.endedAt).slice(-50),keys=recent.reduce((n,a)=>n+a.correctKeys,0),errors=recent.reduce((n,a)=>n+a.mistakes,0),duration=recent.reduce((n,a)=>n+a.durationMs,0);
   const practice=data.attempts.filter(a=>a.complete&&(a.source==='practice'||(demoOnly&&a.source==='demo')));
-  const today=dateKey(Date.now()),days=new Set(data.sessions.filter(s=>s.endedAt&&(demoOnly||s.source!=='demo')).map(s=>dateKey(s.startedAt)));
   const wholePrompts=practice.filter(attempt=>!attempt.clause);
+  const usable=wholePrompts.filter(attempt=>attempt.reliable);
+  const recent=usable.slice().sort((a,b)=>a.endedAt-b.endedAt).slice(-50),keys=recent.reduce((n,a)=>n+a.correctKeys,0),errors=recent.reduce((n,a)=>n+a.mistakes,0),duration=recent.reduce((n,a)=>n+a.durationMs,0);
+  const today=dateKey(Date.now()),days=new Set(data.sessions.filter(s=>s.endedAt&&(demoOnly||s.source!=='demo')).map(s=>dateKey(s.startedAt)));
   for(const a of practice)days.add(dateKey(a.startedAt));
   let streak=0,cursor=Date.now();if(!days.has(today))cursor-=86400000;
   while(days.has(dateKey(cursor))){streak++;cursor-=86400000;}
