@@ -128,7 +128,7 @@ export async function savePhrase(value:Phrase):Promise<Phrase> {
   }catch(error){try{tx.abort();}catch{}await done.catch(()=>{});throw error;}
 }
 function spellingChanged(before:Phrase,after:Phrase):boolean {
-  return normalizeRoman(before.roman)!==normalizeRoman(after.roman)||before.reading.normalize('NFKC')!==after.reading.normalize('NFKC');
+  return before.text!==after.text||normalizeRoman(before.roman)!==normalizeRoman(after.roman)||before.reading.normalize('NFKC')!==after.reading.normalize('NFKC');
 }
 export async function updatePhrase(id:string,patch:Partial<Phrase>):Promise<Phrase> {
   const database=await db(),tx=database.transaction(['phrases','attempts','phraseAliases'],'readwrite'),done=complete(tx),store=tx.objectStore('phrases');
@@ -333,6 +333,12 @@ function validateAttempt(value:unknown):Attempt {
       if(key.accepted)position++;at=key.at;
     }
     if(position!==result.correctKeys||result.judgements.length-position!==result.mistakes)throw new Error('打鍵の詳細と入力数が一致しません。');
+  }
+  if (a.clause !== undefined) {
+    const part = object(a.clause,'練習した文節');
+    const start = number(part.start,'文節の開始位置',0,500);
+    if (result.source !== 'practice' || !result.complete || !result.judgements?.length || !Number.isInteger(start)) throw new Error('文節の練習結果を確認してください。');
+    result.clause = {text:text(part.text,'文節',300), reading:text(part.reading,'文節の読み',500), start};
   }
   if(a.errorTerminated!==undefined){
     result.errorTerminated=bool(a.errorTerminated,'ミスによる終了状態');

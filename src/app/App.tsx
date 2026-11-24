@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowDownRight, ArrowRight, ArrowUpRight, AudioLines, BookOpen, CalendarDays, Check, ChevronRight, CircleDot, Crop, Crosshair, Download, ExternalLink, Flag, Focus, Gauge, History, Home, Keyboard, Layers, Maximize2, MoreHorizontal, Pause, Play, Plus, RefreshCw, ScanLine, Search, Settings2, Sparkles, Target, TrendingUp, X } from 'lucide-react';
-import type { PatternStat, Phrase, Session } from '../core/types';
+import type { PatternStat, Phrase, PracticePhrase, Session } from '../core/types';
+import { clauseTarget, splitClauses } from '../core/clauses';
 import { analyzePatterns, choosePractice, summarize } from '../core/analytics';
 import { Brand, day, EmptyState, extensionMessage, Eyebrow, fmt, Highlight, isExtension, isPanel, openGame, openWorkspace, SectionTitle, Spinner, time, useApp } from './shared';
 import { ProgressRing, ScoreChart } from './Chart';
@@ -18,20 +19,58 @@ export default function App(){
   const {data,loaded,status,error,notify}=useApp();
   const autoEnabled=data.settings.autoRecord&&status.autoRecordPaused!==true;
   const initial=location.hash.replace('#','');const [view,setView]=useState<View>(['words','growth'].includes(initial)?initial as View:'home');
-  const [dialog,setDialog]=useState<Dialog>(null),[filter,setFilter]=useState<string>(''),[queue,setQueue]=useState<Phrase[]>([]),[pattern,setPattern]=useState<string|undefined>();
+  const [dialog,setDialog]=useState<Dialog>(null),[filter,setFilter]=useState<string>(''),[queue,setQueue]=useState<PracticePhrase[]>([]),[pattern,setPattern]=useState<string|undefined>();
   const [practiceKey,setPracticeKey]=useState(0),[practiceUnsaved,setPracticeUnsaved]=useState(false);
   const stats=useMemo(()=>summarize(data),[data]);
   const patterns=useMemo(()=>analyzePatterns(data.attempts,data.phrases),[data]);
   const days=Math.max(0,Math.ceil((new Date(`${data.settings.targetDate}T23:59:59+09:00`).getTime()-Date.now())/86400000));
-  const navigate=(v:View,practiceSaved=false)=>{if(!practiceSaved&&view==='practice'&&practiceUnsaved&&v!=='practice'){notify('未保存の復習結果があります。保存を再試行してください。','error');return;}setView(v);if(!isPanel)history.replaceState(null,'',`#${v}`);window.scrollTo({top:0,behavior:'instant'});};
-  const startPractice=(pat?:string,phrase?:Phrase,pool?:Phrase[])=>{
+  const navigate=(v:View,practiceSaved=false,query='')=>{if(!practiceSaved&&view==='practice'&&practiceUnsaved&&v!=='practice'){notify('未保存の復習結果があります。保存を再試行してください。','error');return;}setView(v);if(!isPanel)history.replaceState(null,'',`#${v}${query}`);window.scrollTo({top:0,behavior:'instant'});};
+  const startPractice=(pat?:string,phrase?:PracticePhrase,pool?:Phrase[])=>{
     if(view==='practice'&&practiceUnsaved){notify('未保存の復習結果があります。保存を再試行してください。','error');return;}
-    if(isPanel){const params=new URLSearchParams();if(pat)params.set('pattern',pat);if(phrase)params.set('phrase',phrase.id);if(pool&&!phrase)params.set('ids',pool.filter(p=>p.verified).map(p=>p.id).join(','));openWorkspace(`#practice${params.size?'?'+params.toString():''}`);return;}
-    const next=phrase?choosePractice([phrase],data.attempts,5,pat):choosePractice((pool||data.phrases).filter(p=>p.verified),data.attempts,data.settings.sessionLength,pat);
+    const params = new URLSearchParams();
+    if (phrase?.clause) {
+      params.set('phrase',phrase.id);
+      params.set('clause',phrase.clause.text);
+      params.set('reading',phrase.clause.reading);
+      params.set('offset',String(phrase.clause.start));
+    }
+    if (isPanel) {
+      if (pat) params.set('pattern',pat);
+      if (phrase) params.set('phrase',phrase.id);
+      if (pool && !phrase) params.set('ids',pool.filter(p=>p.verified).map(p=>p.id).join(','));
+      openWorkspace(`#practice${params.size ? '?' + params : ''}`);
+      return;
+    }
+    let next:PracticePhrase[];
+    if (phrase?.clause) next = Array<PracticePhrase>(5).fill(phrase);
+    else if (phrase) next = choosePractice([phrase],data.attempts,5,pat);
+    else next = choosePractice((pool || data.phrases).filter(p=>p.verified),data.attempts,data.settings.sessionLength,pat);
     if(!next.length){setFilter('review');navigate('words');notify('読み取ったキーワードを確認すると、復習を始められます。');return;}
-    setQueue(next);setPattern(pat);setPracticeKey(k=>k+1);navigate('practice');
+    setQueue(next);setPattern(pat);setPracticeKey(k=>k+1);navigate('practice',false,params.size ? '?' + params : '');
   };
-  useEffect(()=>{if(!loaded)return;const [page,query='']=location.hash.slice(1).split('?');const params=new URLSearchParams(query);if(page==='calibration'){setDialog({type:'calibration'});}else if(page==='practice'){const selected=params.get('phrase');const ids=params.get('ids')?.split(',');startPractice(params.get('pattern')||undefined,selected?data.phrases.find(p=>p.id===selected&&p.verified):undefined,ids?data.phrases.filter(p=>ids.includes(p.id)):undefined);}else if(page==='words'){setView('words');if(params.get('pattern'))setFilter(params.get('pattern')!);}},[loaded]);
+  useEffect(()=>{
+    if (!loaded) return;
+    const [page,query=''] = location.hash.slice(1).split('?');
+    const params = new URLSearchParams(query);
+    if (page==='calibration') setDialog({type:'calibration'});
+    if (page==='words') {
+      setView('words');
+      if (params.has('pattern')) setFilter(params.get('pattern')!);
+    }
+    if (page!=='practice') return;
+    const phrase = data.phrases.find(p=>p.id===params.get('phrase') && p.verified);
+    if (params.has('clause')) {
+      const clause = phrase && splitClauses(phrase).find(part=>part.text===params.get('clause') && part.reading===params.get('reading') && String(part.start)===params.get('offset'));
+      if (phrase && clause) startPractice(undefined,clauseTarget(phrase,clause));
+      else {
+        setFilter('clauses'); navigate('words');
+        notify('元のお題が変更されたため、文節を選び直してください。');
+      }
+      return;
+    }
+    const ids = params.get('ids')?.split(',');
+    startPractice(params.get('pattern')||undefined,phrase,ids?data.phrases.filter(p=>ids.includes(p.id)):undefined);
+  },[loaded]);
   const open=async()=>{try{await openGame();}catch(e){notify((e as Error).message,'error');}};
   if(!loaded)return <div className="app-loading"><Brand/><Spinner size={22}/></div>;
   return <div className={`app-shell ${isPanel?'panel-shell':''}`} data-testid="app-shell">

@@ -1,4 +1,5 @@
 import type { Attempt, Phrase } from './types';
+import { sameClause, splitClauses } from './clauses';
 import { createMatcher, kanaToRoman, normalizeRoman } from './romaji';
 
 const label = (value: string) => value.normalize('NFKC').replace(/\s+/g, '');
@@ -77,6 +78,7 @@ export function mergePhraseGroup(group: readonly Phrase[], preferredId?: string,
 
 /** Preserve measurements only when the new target accepts the same input. */
 export function compatiblePhraseAttempt(before: Phrase, after: Phrase, attempt: Attempt): boolean {
+  if (attempt.clause) return compatibleAttemptWithPhrase(after, attempt);
   const oldReading = reading(before.reading), newReading = reading(after.reading);
   if (oldReading === newReading && (normalizeRoman(before.roman) === normalizeRoman(after.roman) || (oldReading && kanaToRoman(oldReading)))) return true;
   return compatibleAttemptWithPhrase(after, attempt);
@@ -85,7 +87,9 @@ export function compatiblePhraseAttempt(before: Phrase, after: Phrase, attempt: 
 /** Recheck detailed delayed input even when its canonical ID has not changed. */
 export function compatibleAttemptWithPhrase(after: Phrase, attempt: Attempt): boolean {
   if (!attempt.judgements?.length) return false;
-  const matcher = createMatcher(after.reading, after.roman);
+  const clause = attempt.clause;
+  if (clause && !splitClauses(after).some(part => sameClause(part,clause))) return false;
+  const matcher = clause ? createMatcher(clause.reading, kanaToRoman(clause.reading)) : createMatcher(after.reading, after.roman);
   for (const judgement of attempt.judgements) {
     if (matcher.position !== judgement.position || [...matcher.expectedKeys].sort().join('\0') !== [...judgement.expected].sort().join('\0')) return false;
     if (matcher.feed(judgement.actual).accepted !== judgement.accepted) return false;

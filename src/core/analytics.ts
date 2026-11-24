@@ -1,4 +1,4 @@
-import type { AppData, Attempt, KeyConfusion, KeyJudgement, KeyStroke, PatternStat, Phrase, Source, StrokeSample, WordStat } from './types';
+import type { AppData, Attempt, KeyConfusion, KeyJudgement, KeyStroke, PatternStat, Phrase, PracticePhrase, Source, StrokeSample, WordStat } from './types';
 import { createMatcher, normalizeRoman } from './romaji';
 const median=(values:number[]):number=>{
   if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b),i=Math.floor(sorted.length/2);return sorted.length%2?sorted[i]:(sorted[i-1]+sorted[i])/2;
@@ -24,10 +24,10 @@ export function isErrorTerminatedAttempt(attempt:Attempt):boolean {
   }
   return at===attempt.endedAt&&typed===attempt.typed&&attempt.samples.every(s=>s.at>=attempt.startedAt&&s.at<=attempt.endedAt);
 }
-function usableAttempts(attempts:Attempt[],phrases?:Phrase[]):Attempt[] {
+export function usableAttempts(attempts:Attempt[],phrases?:Phrase[],includeClauses=false):Attempt[] {
   const demoOnly=attempts.length>0&&attempts.every(a=>a.source==='demo');
   const known=phrases?new Set(phrases.map(p=>p.id)):null;
-  return attempts.filter(a=>a.reliable&&(a.complete||isErrorTerminatedAttempt(a))&&(demoOnly||a.source!=='demo')&&(!known||known.has(a.phraseId)));
+  return attempts.filter(a=>(includeClauses||!a.clause)&&a.reliable&&(a.complete||isErrorTerminatedAttempt(a))&&(demoOnly||a.source!=='demo')&&(!known||known.has(a.phraseId)));
 }
 /** Clean adjacent-key intervals only. Trigrams must never count the same transition twice. */
 function cleanTransitions(attempts:Attempt[]):StrokeSample[] {
@@ -39,7 +39,7 @@ export function typingBaseline(attempts:Attempt[],phrases?:Phrase[]):{meanMs:num
   return {meanMs,kps:meanMs===null?null:1000/meanMs,count:samples.length};
 }
 export interface AttemptInput {
-  phrase:Phrase;strokes:KeyStroke[];startedAt:number;endedAt:number;sessionId:string;source:Source;complete:boolean;reliable:boolean;endOnMistake?:boolean;
+  phrase:PracticePhrase;strokes:KeyStroke[];startedAt:number;endedAt:number;sessionId:string;source:Source;complete:boolean;reliable:boolean;endOnMistake?:boolean;
 }
 /** Replays captured physical input against the local accepted-romanization graph. */
 export function buildAttempt(input:AttemptInput):Attempt {
@@ -89,7 +89,7 @@ export function buildAttempt(input:AttemptInput):Attempt {
   }
   const durationMs=Math.max(0,finishedAt-startedAt),correctKeys=accepted.length,total=correctKeys+mistakes;
   const complete=input.complete&&matcher.complete&&correctKeys>0;
-  return {id:id(),phraseId:phrase.id,sessionId,source,startedAt,endedAt:Math.max(startedAt,finishedAt),durationMs,correctKeys,mistakes,
+  return {id:id(),phraseId:phrase.id,...(source==='practice'&&phrase.clause?{clause:phrase.clause}:{}),sessionId,source,startedAt,endedAt:Math.max(startedAt,finishedAt),durationMs,correctKeys,mistakes,
     accuracy:total?100*correctKeys/total:0,kps:durationMs?correctKeys/(durationMs/1000):0,samples,complete,
     reliable:input.reliable&&(complete||errorTerminated)&&ordered&&durationMs>0,typed:matcher.typed,judgements,...(errorTerminated?{errorTerminated:true}:{})};
 }
@@ -153,7 +153,7 @@ export function analyzeWords(attempts:Attempt[],phrases?:Phrase[]):WordStat[] {
     const clean=cleanTransitions(recent),timedCount=clean.length,meanMs=mean(clean.map(s=>s.intervalMs));
     const slowdownPct=meanMs!==null&&baseline.meanMs!==null?100*(meanMs/baseline.meanMs-1):null;
     const excess=meanMs!==null&&baseline.meanMs!==null?Math.max(0,meanMs-baseline.meanMs):0;
-    result.push({phraseId,attempts:recent.length,correctKeys,mistakes,errorRate:correctKeys+mistakes?100*mistakes/(correctKeys+mistakes):0,
+    result.push({phraseId,attempts:recent.length,mistakeAttempts:recent.filter(attempt=>attempt.mistakes>0).length,correctKeys,mistakes,errorRate:correctKeys+mistakes?100*mistakes/(correctKeys+mistakes):0,
       meanMs,timedCount,baselineMs:baseline.meanMs,baselineCount:baseline.count,slowdownPct,lostMs:excess*timedCount,
       slow:recent.length>=3&&timedCount>=5&&baseline.count>=20&&slowdownPct!==null&&slowdownPct>=20&&excess>=20,
       confusions:analyzeConfusions(recent,phraseId),slowPatterns:patterns.filter(p=>p.slow&&p.phraseIds.includes(phraseId)).map(p=>p.pattern)});
@@ -166,11 +166,11 @@ export function choosePractice(phrases:Phrase[],attempts:Attempt[],count:number,
   const stats=analyzePatterns(attempts,phrases),patternById=new Map<string,number>();
   for(const stat of stats)for(const phraseId of stat.phraseIds)patternById.set(phraseId,Math.max(patternById.get(phraseId)??0,stat.priority));
   const lastPractice=new Map<string,number>(),practiceCount=new Map<string,number>();
-  for(const a of attempts)if(a.source==='practice'||(demoOnly&&a.source==='demo')){lastPractice.set(a.phraseId,Math.max(lastPractice.get(a.phraseId)??0,a.endedAt));practiceCount.set(a.phraseId,(practiceCount.get(a.phraseId)??0)+1);}
+  for(const a of attempts)if(!a.clause&&(a.source==='practice'||(demoOnly&&a.source==='demo'))){lastPractice.set(a.phraseId,Math.max(lastPractice.get(a.phraseId)??0,a.endedAt));practiceCount.set(a.phraseId,(practiceCount.get(a.phraseId)??0)+1);}
   const now=Date.now(),wanted=normalizeRoman(pattern??'');
   const withRequestedSpelling=(phrase:Phrase):Phrase=>{
     if(!wanted||normalizeRoman(phrase.roman).includes(wanted))return phrase;
-    const actualSpellings=attempts.filter(a=>a.phraseId===phrase.id&&a.reliable&&(demoOnly||a.source!=='demo')&&
+    const actualSpellings=attempts.filter(a=>!a.clause&&a.phraseId===phrase.id&&a.reliable&&(demoOnly||a.source!=='demo')&&
       (a.complete?normalizeRoman(a.typed).includes(wanted):isErrorTerminatedAttempt(a))).sort((a,b)=>b.endedAt-a.endedAt);
     for(const attempt of actualSpellings){
       const prefix=normalizeRoman(attempt.typed),matcher=createMatcher(phrase.reading,phrase.roman);

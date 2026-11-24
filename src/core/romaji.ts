@@ -41,10 +41,15 @@ const TABLE: Record<string, string[]> = {
 export function normalizeRoman(value: string): string {
   return String(value ?? '').normalize('NFKC').replace(/[\u2018\u2019]/g, "'").toLowerCase().replace(/\s+/g,'');
 }
-function hiragana(value: string): string {
+export function hiragana(value: string): string {
   return String(value ?? '').normalize('NFKC').replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0)-0x60)).replace(/\s+/g,'');
 }
-interface Choice { text:string; end:number; }
+interface Choice { text:string; end:number; keyKana?:number[]; }
+// A single n or doubled consonant consumes the first kana of a multi-kana edge.
+function prependKana(at:number, key:string, next:Choice):Choice {
+  const following = next.keyKana ?? Array<number>(next.text.length).fill(at + 1);
+  return {text:key + next.text, end:next.end, keyKana:[at, ...following]};
+}
 function regularChoices(text:string, at:number):Choice[] {
   const choices:Choice[]=[];
   for (const length of [2,1]) {
@@ -63,15 +68,15 @@ function choicesAt(text:string, at:number):Choice[] {
       const nextChoices=next==='っ' ? choicesAt(text,at+1) : regularChoices(text,at+1);
       // Bind a single n to the particular consonant-led continuation. An open
       // edge to the next kana would also allow its vowel path (e.g. んう → nu).
-      choices.unshift(...nextChoices.filter(x=>/^[^aiueoy]/.test(x.text)).map(x=>({text:'n'+x.text,end:x.end})));
+      choices.unshift(...nextChoices.filter(x=>/^[^aiueoy]/.test(x.text)).map(x=>prependKana(at,'n',x)));
     }
     return choices;
   }
   if(char==='っ') {
     const choices:Choice[]=[];
     for(const next of regularChoices(text,at+1)) {
-      if(/^[bcdfghjklmpqrstvwxyz]/.test(next.text)) choices.push({text:next.text[0]+next.text,end:next.end});
-      if(next.text.startsWith('ch')) choices.push({text:'t'+next.text,end:next.end});
+      if(/^[bcdfghjklmpqrstvwxyz]/.test(next.text)) choices.push(prependKana(at,next.text[0],next));
+      if(next.text.startsWith('ch')) choices.push(prependKana(at,'t',next));
     }
     for(const text of ['xtu','ltu','xtsu','ltsu']) choices.push({text,end:at+1});
     return choices;
@@ -79,11 +84,12 @@ function choicesAt(text:string, at:number):Choice[] {
   return regularChoices(text,at);
 }
 type Node = Map<string,Set<number>>;
-function makeGraph(reading:string, fallback:string):{nodes:Node[];end:number;preferred:string} {
+function makeGraph(reading:string, fallback:string) {
   const kana=hiragana(reading);
   const usable=!!kana && [...kana].every((_,i)=>choicesAt(kana,i).length>0);
   const text=usable ? kana : fallback;
   const nodes:Node[]=Array.from({length:text.length+1},()=>new Map());
+  const kanaAt = Array.from({length:nodes.length}, (_, index) => index);
   const edge=(from:number,key:string,to:number)=>{const set=nodes[from].get(key)??new Set<number>();set.add(to);nodes[from].set(key,set);};
   for(let i=0;i<text.length;i++) {
     const choices=usable?choicesAt(text,i):[{text:text[i],end:i+1}];
@@ -91,11 +97,12 @@ function makeGraph(reading:string, fallback:string):{nodes:Node[];end:number;pre
       let previous=i;
       for(let j=0;j<choice.text.length;j++) {
         const next=j===choice.text.length-1?choice.end:nodes.push(new Map())-1;
+        if (j + 1 < choice.text.length) kanaAt[next] = choice.keyKana?.[j+1] ?? i;
         edge(previous,choice.text[j],next); previous=next;
       }
     }
   }
-  return {nodes,end:text.length,preferred:fallback};
+  return {nodes,end:text.length,kanaAt,usable};
 }
 export interface MatchResult { accepted:boolean; complete:boolean; position:number; display:string; }
 export interface RomanMatcher {
@@ -148,4 +155,28 @@ export function kanaToRoman(kana:string):string {
   if([...text].some((_,i)=>!choicesAt(text,i).length))return '';
   let result='';for(let i=0;i<text.length;){const choice=choicesAt(text,i)[0];result+=choice.text;i=choice.end;}
   return result;
+}
+
+/** Attribute actual accepted paths (including alternate spellings) to kana offsets.
+ * A miss leaves every live path in place. Ambiguous offsets are returned together. */
+export function createKanaTrace(reading:string) {
+  const {nodes, end, kanaAt, usable} = makeGraph(reading, '');
+  let active = new Set([0]);
+  return {
+    step(actual:string, accepted:boolean):number[] | null {
+      if (!usable || active.has(end)) return null;
+      const next = new Set<number>(), offsets = new Set<number>();
+      const key = normalizeRoman(actual);
+      for (const state of active) {
+        const edges = nodes[state].get(key);
+        if (!accepted || edges) offsets.add(kanaAt[state]);
+        if (edges) for (const target of edges) next.add(target);
+      }
+      if (accepted !== (next.size > 0)) return null;
+      if (accepted) active = next;
+      return [...offsets];
+    },
+    get complete() { return usable && active.has(end); },
+    reset() { active = new Set([0]); },
+  };
 }

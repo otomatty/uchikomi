@@ -19,6 +19,7 @@ core/db.ts exports:
 core/analytics.ts exports:
 - analyzePatterns(attempts:Attempt[], phrases?:Phrase[]):PatternStat[] (only reliable + not demo unless all demo)
 - typingBaseline(attempts:Attempt[], phrases?:Phrase[]):{meanMs:number|null;kps:number|null;count:number}
+- analyzeClauses(attempts:Attempt[], phrases:Phrase[]):WeakClause[] groups detailed reliable input by clause spelling and reading. A clause drill keeps its parent phraseId and records its target in Attempt.clause (text, reading, normalized kana start). It contributes to clause statistics and training activity. Whole-prompt statistics use whole-prompt attempts.
 - analyzeWords(attempts:Attempt[], phrases?:Phrase[]):WordStat[] (reliable complete records or explicitly validated terminal-miss captures; most mistakes first; up to the latest 50 attempts per word)
 - analyzeConfusions(attempts:Attempt[], phraseId?:string):KeyConfusion[] (actual key, valid expected alternatives, error count; old records without judgements do not produce invented confusion pairs)
 - choosePractice(phrases:Phrase[], attempts:Attempt[], count:number, pattern?:string):Phrase[] (verified/captured eligible, exclude unverified unless UI selected)

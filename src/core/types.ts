@@ -19,7 +19,11 @@ export interface Phrase {
  /** Per-original-ID counts make consolidation and backup replay idempotent. */
  seenSources?: {id:string;count:number}[];
 }
+/** Start is an offset in the normalized reading of the original prompt. */
+export interface Clause { text:string; reading:string; start:number; }
+export type PracticePhrase = Phrase & {clause?:Clause};
 export interface Attempt {
+ clause?:Clause;
  id: string; phraseId: string; sessionId: string; source: Source; startedAt: number; endedAt: number;
  durationMs: number; correctKeys: number; mistakes: number; accuracy: number; kps: number;
  samples: StrokeSample[]; complete: boolean; reliable: boolean; typed: string; judgements?:KeyJudgement[];
@@ -49,7 +53,7 @@ export interface PatternStat {
  meanMs:number|null; timedCount:number; baselineMs:number|null; baselineCount:number; slowdownPct:number|null; lostMs:number; slow:boolean;
 }
 export interface WordStat {
- phraseId:string; attempts:number; correctKeys:number; mistakes:number; errorRate:number;
+ phraseId:string; attempts:number; mistakeAttempts:number; correctKeys:number; mistakes:number; errorRate:number;
  meanMs:number|null; timedCount:number; baselineMs:number|null; baselineCount:number; slowdownPct:number|null; lostMs:number; slow:boolean;
  confusions:KeyConfusion[]; slowPatterns:string[];
 }
