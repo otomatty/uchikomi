@@ -52,6 +52,11 @@ try {
   await xdotool('key', '--clearmodifiers', 'ctrl+l');
   await xdotool('type', '--clearmodifiers', extension);
   await xdotool('key', 'Return');
+  // GTK may first enter the typed directory and leave the picker open.
+  await new Promise(resolve => setTimeout(resolve, 500));
+  const dialog = stdout.trim().split('\n').at(-1);
+  const focus = await xdotool('getwindowfocus');
+  if (focus.stdout.trim() === dialog) await xdotool('key', 'Return');
   await waitForVersion(manifest.version);
   const probeUrl = 'chrome-extension://' + id + '/probe.html';
   await page.goto(probeUrl);
@@ -66,6 +71,10 @@ try {
   assert.deepEqual(await next.evaluate(() => [chrome.runtime.id, chrome.runtime.getManifest().version, localStorage.getItem('zipUpgrade')]),
     [id, nextVersion, 'saved']);
   console.log('Normal unpacked install picked up the new version after restart and retained origin data.');
+} catch (error) {
+  const windows = await promisify(execFile)('xwininfo', ['-root', '-tree']).catch(() => null);
+  if (windows) console.error(windows.stdout.split('\n').filter(line => line.includes('"')).slice(0, 30).join('\n'));
+  throw error;
 } finally {
   await close();
   await rm(temp, { recursive: true, force: true });

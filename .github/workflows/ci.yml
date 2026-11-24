@@ -63,9 +63,7 @@ jobs:
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - name: Install the Japanese fixture font and native file picker test tool
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk xdotool
+        run: sudo apt-get install -y fonts-noto-cjk xdotool
       - name: Verify a normal unpacked install updates on browser restart
         run: xvfb-run -a node tests/zip-restart-check.mjs
         env:
