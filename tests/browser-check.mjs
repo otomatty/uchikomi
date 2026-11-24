@@ -156,13 +156,26 @@ try {
   cdp = await browser.newBrowserCDPSession();
   let extensionId;
   await run('Explicit unpacked-extension installation and enabled status', async () => {
+    const previous = path.join(temp, 'older-release');
+    await mkdir(previous);
+    await writeFile(path.join(previous, 'manifest.json'), JSON.stringify({
+      name: manifest.name, manifest_version: 3, key: manifest.key, version: '0.0.1', permissions: ['storage'],
+    }));
+    await writeFile(path.join(previous, 'probe.html'), '<title>Upgrade fixture</title>');
+    const older = await cdp.send('Extensions.loadUnpacked', { path: previous });
+    assert.equal(older.id, 'maalmhkjpipklfhmkbkfjfnblmcchonc');
+    const oldPage = await newQaPage();
+    await oldPage.goto(`chrome-extension://${older.id}/probe.html`);
+    await oldPage.evaluate(() => chrome.storage.local.set({ updateProbe: 'saved before upgrade' }));
+    await oldPage.close();
     // A direct install returns the ID or the actual manifest/install error. We do
     // not infer installation success from the arrival of a serviceworker event.
     const installed = await cdp.send('Extensions.loadUnpacked', { path: extension });
     extensionId = installed.id;
-    assert.match(extensionId, /^[a-p]{32}$/, 'Chrome did not return a valid extension ID');
+    assert.equal(extensionId, older.id, 'A different version and directory must keep the same ID');
     const inventory = await cdp.send('Extensions.getExtensions');
     report.extensions = inventory.extensions;
+    assert.equal(inventory.extensions.filter(item => item.name === manifest.name).length, 1);
     const loaded = inventory.extensions.find(item => item.id === extensionId);
     assert.ok(loaded, 'Installed extension is missing from Chrome extension inventory');
     assert.equal(loaded.enabled, true, 'Chrome installed the extension in a disabled state');
@@ -170,6 +183,7 @@ try {
   });
   app = await newQaPage();
   await app.goto(`chrome-extension://${extensionId}/index.html`);
+  assert.equal(await app.evaluate(async () => (await chrome.storage.local.get('updateProbe')).updateProbe), 'saved before upgrade');
   await run('Extension service worker responds through its real runtime message handler', async () => {
     const reply = await app.evaluate(() => Promise.race([
       chrome.runtime.sendMessage({ type: 'UCHI_STATUS' }),
@@ -1095,6 +1109,26 @@ try {
     }
   });
   await run('No uncaught application exceptions', async () => assert.deepEqual(report.browserErrors, []));
+  await run('Chrome restart picks up an in-place ZIP upgrade and preserves the extension origin', async () => {
+    const probeUrl = `chrome-extension://${extensionId}/qa-empty.html`;
+    const before = await newQaPage();
+    await before.goto(probeUrl);
+    await before.evaluate(() => localStorage.setItem('restartProbe', 'saved'));
+    await cdp.send('Browser.close').catch(() => {});
+    await chromeProcess.stop();
+    await connectedBrowser.close().catch(() => {});
+
+    const nextVersion = manifest.version + '.1';
+    await writeFile(path.join(extension, 'manifest.json'), JSON.stringify({ ...manifest, version: nextVersion }));
+    chromeProcess = await startChromiumPipe({ executablePath: process.env.CHROME_BIN || chromium.executablePath(), profileDir, headless });
+    connectedBrowser = await chromium.connectOverCDP(chromeProcess.transport, { noDefaults: true, isLocal: true, artifactsDir });
+    context = connectedBrowser.contexts()[0];
+    cdp = await connectedBrowser.newBrowserCDPSession();
+    const after = await newQaPage();
+    await after.goto(probeUrl);
+    const state = await after.evaluate(() => [chrome.runtime.id, chrome.runtime.getManifest().version, localStorage.getItem('restartProbe')]);
+    assert.deepEqual(state, [extensionId, nextVersion, 'saved']);
+  });
 } catch (e) {
   report.errors.push(String(e.stack || e));
   console.error(e.message || e);

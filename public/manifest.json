@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "UCHIKOMI — 寿司打トレーナー",
-  "version": "1.5.0",
+  "version": "1.6.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwpYNkDtoqKAM/H0Kn297dZwds39sLqDyqhm/x584gQOCmHRX8H21Lq6s+5wEQS0Q0Lb5Q7slzv5yz6CUjv4Mk5M9NIair6rU9IMr6lbxS7SevWtSVzhl0BIpPAOXcOxwV0fByL9A5AKtHFnJvCq+m3yW1ayKj3hGLPqZSOOD7tUdoKlbuK7+8hEhIVJ3gCBCWRqpNXFUcguiIUV1u2dOcLDKNpz+HffVp591kPgsvCfhwuL/ZpDsYnqJrThUVajFUUhbQ7yZXy1LjyQXP0tafJhzIhP5t7yC+E92MDy9uBBBIWDTuR0wNNFkiGS+4JslutkzIMn1BitEkeCrCCAxZQIDAQAB",
   "description": "プレイ画面から出題を記録。苦手な文字の組み合わせを、実際のお題で復習。",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "tabCapture", "offscreen", "sidePanel", "storage", "scripting"],

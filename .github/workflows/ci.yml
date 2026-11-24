@@ -79,8 +79,19 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  windows-updater:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify ZIP upgrades and the Windows scheduled task
+        shell: powershell
+        run: ./tests/windows-zip-update.ps1
+
   release:
-    needs: [verify, browser]
+    needs: [verify, browser, windows-updater]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 10
