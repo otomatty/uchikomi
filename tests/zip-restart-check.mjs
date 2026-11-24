@@ -46,25 +46,7 @@ try {
   const devMode = page.locator('#devMode');
   if (!await devMode.evaluate(toggle => toggle.checked)) await devMode.click();
   await page.locator('#loadUnpacked').click();
-  // The native GTK directory picker is outside the page's DOM.
-  const { stdout } = await xdotool('search', '--sync', '--onlyvisible', '--name', '[Ss]elect.*(directory|[Ff]older)');
-  const dialog = stdout.trim().split('\n').at(-1);
-  console.log('Folder picker:', (await xdotool('getwindowname', dialog)).stdout.trim());
-  await xdotool('windowfocus', '--sync', dialog);
-  await xdotool('key', '--clearmodifiers', 'ctrl+l');
-  await new Promise(resolve => setTimeout(resolve, 300));
-  await xdotool('type', '--clearmodifiers', extension);
-  await new Promise(resolve => setTimeout(resolve, 400));
-  await xdotool('key', 'Return');
-  // GTK may first enter the typed directory. Confirm the selected location
-  // if the same picker is still open, even when its child owns keyboard focus.
-  for (let i = 0; i < 3; i++) {
-    await new Promise(resolve => setTimeout(resolve, 700));
-    const dialogs = await xdotool('search', '--onlyvisible', '--name', '[Ss]elect.*(directory|[Ff]older)').catch(() => null);
-    if (!dialogs?.stdout.trim().split('\n').includes(dialog)) break;
-    console.log('Confirming the open folder picker');
-    await xdotool('key', '--clearmodifiers', i === 0 ? 'Return' : 'alt+o');
-  }
+  await promisify(execFile)('/usr/bin/python3', ['tests/choose-extension-directory.py', extension], { timeout: 40000 });
   await waitForVersion(manifest.version);
   const probeUrl = 'chrome-extension://' + id + '/probe.html';
   await page.goto(probeUrl);
