@@ -13,7 +13,7 @@ const temp = await mkdtemp(path.join(os.tmpdir(), 'uchikomi-zip-restart-'));
 const extension = path.join(temp, 'managed extension');
 const id = 'maalmhkjpipklfhmkbkfjfnblmcchonc';
 const xdotool = (...args) => promisify(execFile)('xdotool', args, { timeout: 15000 });
-let processHandle, browser, cdp;
+let processHandle, browser, cdp, page;
 
 async function start() {
   processHandle = startChromiumPipe({ executablePath: process.env.CHROME_BIN || chromium.executablePath(), profileDir: path.join(temp, 'profile') });
@@ -41,22 +41,30 @@ try {
   await writeFile(path.join(extension, 'probe.html'), '<title>ZIP upgrade fixture</title>');
   const manifestPath = path.join(extension, 'manifest.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-  const page = await start();
+  page = await start();
   await page.goto('chrome://extensions/');
   const devMode = page.locator('#devMode');
   if (!await devMode.evaluate(toggle => toggle.checked)) await devMode.click();
   await page.locator('#loadUnpacked').click();
   // The native GTK directory picker is outside the page's DOM.
   const { stdout } = await xdotool('search', '--sync', '--onlyvisible', '--name', '[Ss]elect.*(directory|[Ff]older)');
-  await xdotool('windowfocus', '--sync', stdout.trim().split('\n').at(-1));
-  await xdotool('key', '--clearmodifiers', 'ctrl+l');
-  await xdotool('type', '--clearmodifiers', extension);
-  await xdotool('key', 'Return');
-  // GTK may first enter the typed directory and leave the picker open.
-  await new Promise(resolve => setTimeout(resolve, 500));
   const dialog = stdout.trim().split('\n').at(-1);
-  const focus = await xdotool('getwindowfocus');
-  if (focus.stdout.trim() === dialog) await xdotool('key', 'Return');
+  console.log('Folder picker:', (await xdotool('getwindowname', dialog)).stdout.trim());
+  await xdotool('windowfocus', '--sync', dialog);
+  await xdotool('key', '--clearmodifiers', 'ctrl+l');
+  await new Promise(resolve => setTimeout(resolve, 300));
+  await xdotool('type', '--clearmodifiers', extension);
+  await new Promise(resolve => setTimeout(resolve, 400));
+  await xdotool('key', 'Return');
+  // GTK may first enter the typed directory. Confirm the selected location
+  // if the same picker is still open, even when its child owns keyboard focus.
+  for (let i = 0; i < 3; i++) {
+    await new Promise(resolve => setTimeout(resolve, 700));
+    const dialogs = await xdotool('search', '--onlyvisible', '--name', '[Ss]elect.*(directory|[Ff]older)').catch(() => null);
+    if (!dialogs?.stdout.trim().split('\n').includes(dialog)) break;
+    console.log('Confirming the open folder picker');
+    await xdotool('key', '--clearmodifiers', i === 0 ? 'Return' : 'alt+o');
+  }
   await waitForVersion(manifest.version);
   const probeUrl = 'chrome-extension://' + id + '/probe.html';
   await page.goto(probeUrl);
@@ -72,8 +80,10 @@ try {
     [id, nextVersion, 'saved']);
   console.log('Normal unpacked install picked up the new version after restart and retained origin data.');
 } catch (error) {
-  const windows = await promisify(execFile)('xwininfo', ['-root', '-tree']).catch(() => null);
-  if (windows) console.error(windows.stdout.split('\n').filter(line => line.includes('"')).slice(0, 30).join('\n'));
+  if (page && !page.isClosed()) console.error('Extensions page:', await page.locator('body').ariaSnapshot({ timeout: 3000 }).catch(String));
+  const windows = await xdotool('search', '--onlyvisible', '--name', '.', 'getwindowname', '%@').catch(() => null);
+  if (windows) console.error('Visible windows:', windows.stdout);
+  console.error(processHandle?.diagnostics().stderr?.slice(-3500));
   throw error;
 } finally {
   await close();
