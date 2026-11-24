@@ -95,6 +95,102 @@ test('UI first run contains no invented history or vocabulary',async()=>{
   assert.equal(data.phrases.length,0);assert.equal(data.sessions.length,0);assert.equal(data.attempts.length,0);
   assert.match(document.body.textContent??'',/30,000/);assert.match(document.body.textContent??'',/開始時の目安/);
   await navigateWords();assert.equal(document.querySelectorAll('[data-testid="phrase-row"]').length,0);
+  await click(button('苦手な単語'));
+  assert.match(query('.words-empty').textContent??'',/苦手な単語はまだありません/);
+  assert.equal(document.querySelector('[data-testid="nav-practice"]'),null);
+});
+
+test('weak word practice selects verified whole words with repeated misses or consistently slow input', async () => {
+  const missed = phrase('missed', '赤', 'あか', 'aka');
+  const slow = phrase('slow', '坂', 'さか', 'saka');
+  const fast = phrase('fast', '魚', 'さかな', 'sakana');
+  const unchecked = { ...phrase('unchecked', '傘', 'かさ', 'kasa'), verified: false };
+  const observations = [
+    { word: missed, keys: 'xaka', repeats: 2, gap: 80 },
+    { word: slow, keys: 'saka', repeats: 3, gap: 300 },
+    { word: fast, keys: 'sakana', repeats: 8, gap: 80 },
+    { word: fast, keys: 'xxsakana', repeats: 1, gap: 80 },
+    { word: fast, keys: 'xsakana', repeats: 1, gap: 80, reliable: false },
+    { word: unchecked, keys: 'xkasa', repeats: 2, gap: 80 },
+  ];
+  for (const word of [missed, slow, fast, unchecked]) await db.savePhrase(word);
+  let startedAt = Date.now() - 120000;
+  for (const { word, keys, repeats, gap, reliable = true } of observations) {
+    for (let i = 0; i < repeats; i++) {
+      const strokes = [...keys].map((key, index) => ({ key, at: startedAt + (index + 1) * gap }));
+      await db.saveAttempt(buildAttempt({ phrase: word, strokes, startedAt, endedAt: strokes.at(-1)!.at,
+        sessionId: 'observed', source: 'practice', complete: true, reliable }));
+      startedAt += 2000;
+    }
+  }
+  await db.updateSettings({ sessionLength: 5 });
+  await mount(); await navigateWords(); await click(button('苦手な単語'));
+  const rows = [...document.querySelectorAll('[data-testid="phrase-row"]')];
+  assert.deepEqual(rows.map(row => row.querySelector('strong')?.textContent), ['赤', '坂']);
+  assert.match(rows[0].textContent ?? '', /入力2回中2回でミス/);
+  assert.match(rows[1].textContent ?? '', /打鍵間隔が平均より/);
+  await click(query('button[aria-label="坂を復習"]'));
+  assert.equal(query('.typing-phrase h1').textContent, '坂');
+  assert.deepEqual([...document.querySelectorAll('.practice-queue > span')].slice(1, 4).map(el => el.textContent), ['坂', '坂', '坂']);
+
+  await navigateWords(); await click(button('苦手な単語')); await click(button('苦手な単語を練習'));
+  await click(query('[data-testid="practice-start"]'));
+  for (let i = 0; i < 5; i++) {
+    await settled(() => Number(document.querySelector('.practice-count > span')?.textContent) === i + 1 && !!document.querySelector('.roman-line .cursor'));
+    await type(query('.roman-line').textContent!);
+  }
+  await settled(() => !!document.querySelector('[data-testid="practice-complete"]'));
+  const practiced = (await db.getData()).attempts.filter(attempt => attempt.sessionId !== 'observed');
+  assert.equal(practiced.length, 5);
+  assert.deepEqual(new Set(practiced.map(attempt => attempt.phraseId)), new Set([missed.id, slow.id]));
+});
+
+test('practice a weak clause alone, retain its parent on backup restore, and reopen the same drill from the panel link', async () => {
+  const p = phrase('long-prompt','開いた口が塞がらない','あいたくちがふさがらない','aitakutigahusagaranai');
+  await db.savePhrase(p);
+  const at = Date.now()-60000;
+  await db.saveSession({id:'game', startedAt:at, endedAt:at+10000, source:'capture',scoreType:'total',course:10000,mode:'accuracy',phraseCount:2,correctKeys:12,mistakes:2,durationMs:10000});
+  for (let i=0; i<2; i++) {
+    const startedAt = at+i*2000;
+    const strokes = [...'aitakux'].map((key,n)=>({key,at:startedAt+(n+1)*80}));
+    await db.saveAttempt(buildAttempt({phrase:p,strokes,sessionId:'game',startedAt,endedAt:startedAt+1000,
+      source:'capture',complete:false,reliable:true,endOnMistake:true}));
+  }
+  await mount(); await navigateWords(); await click(button('苦手な文節'));
+  assert.equal(document.querySelectorAll('.clause-list li').length,1);
+  assert.match(query('.clause-list').textContent??'',/口が.*くちが.*開いた口が塞がらない.*2回中2回でミス/);
+  await click(query('button[aria-label="「口が」だけを5回練習"]'));
+  await click(query('[data-testid="practice-start"]'));
+  for (let i=0; i<5; i++) {
+    await settled(()=>Number(document.querySelector('.practice-count > span')?.textContent)===i+1 && !!document.querySelector('.roman-line .cursor'));
+    assert.equal(query('.typing-phrase h1').textContent,'口が');
+    await type(i%2 ? 'kuchiga' : 'kutiga');
+  }
+  await settled(()=>!!document.querySelector('[data-testid="practice-complete"]'));
+  const backup = await db.exportData();
+  await unmount(); await db.clearData(); await db.importData(backup);
+  const restored = await db.getData();
+  assert.equal(restored.phrases.length,1);
+  const drills = restored.attempts.filter(a=>a.clause);
+  assert.equal(drills.length,5);
+  assert.ok(drills.every(a=>a.phraseId===p.id && a.reliable && a.complete));
+  assert.deepEqual(drills[0].clause,{text:'口が',reading:'くちが',start:3});
+  const params = new URLSearchParams({phrase:p.id,clause:'口が',reading:'くちが',offset:'3'});
+  browserWindow.history.replaceState(null,'','/index.html#practice?'+params);
+  root=createRoot(container); await mount();
+  assert.equal(query('.typing-phrase h1').textContent,'口が');
+  await unmount();
+  params.set('offset','0');
+  browserWindow.history.replaceState(null,'','/index.html#practice?'+params);
+  root=createRoot(container); await mount();
+  assert.equal(document.querySelector('.typing-phrase'),null);
+  assert.ok(document.querySelector('.clause-list'));
+  await unmount();
+  // A homophone correction retains the original drill history under its own wording.
+  await db.updatePhrase(p.id,{text:'開いた朽ちが塞がらない'});
+  const history = (await db.getData()).attempts.filter(a=>a.clause);
+  assert.equal(history.length,5);
+  assert.ok(history.every(a=>a.clause?.text==='口が' && !a.reliable));
 });
 
 test('daily training shows real per-day volume, zero days, older estimates and source breakdowns',async(t)=>{

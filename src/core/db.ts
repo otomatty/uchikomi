@@ -1,8 +1,8 @@
 import { DEFAULT_SETTINGS, MAX_SCORE } from './types';
-import type { AppData, Attempt, Calibration, DailyActivity, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
+import type { AppData, Attempt, Calibration, Clause, DailyActivity, KeyJudgement, Phrase, Rect, ScoreReview, Session, Settings, Source, StrokeSample } from './types';
 import { normalizeRoman } from './romaji';
 import { isErrorTerminatedAttempt } from './analytics';
-import { compatibleAttemptWithPhrase, compatiblePhraseAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
+import { reconcileAttempt, groupDuplicatePhrases, mergePhraseGroup, phraseSeenSources, phraseSnapshot } from './phrase-dedupe';
 import { MAX_ACTIVITY_DAYS, MAX_ACTIVITY_KEYS, MAX_ACTIVITY_MS, MAX_ACTIVITY_PHRASES, mergeDailyActivity, validTrainingDate } from './activity';
 import { isReplayShortcut, type ReplayShortcut } from './shortcuts';
 const DB_NAME='uchikomi-v1', VERSION=3;
@@ -80,7 +80,7 @@ export async function getSettings():Promise<Settings> {
   return {...DEFAULT_SETTINGS,...settings,replayShortcut:validateReplayShortcut(settings?.replayShortcut)};
 }
 interface Consolidation {phrases:Phrase[];bySource:Map<string,Phrase>;}
-async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<string,Phrase>,changedIds?:ReadonlySet<string>,replacedAttemptIds?:ReadonlySet<string>):Promise<Consolidation> {
+async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<string,Phrase>,changedIds?:ReadonlySet<string>,replacedAttemptIds?:ReadonlySet<string>,clauseCache=new Map<Phrase,Clause[]>()):Promise<Consolidation> {
   const groups=groupDuplicatePhrases(rows),phrases:Phrase[]=[],bySource=new Map<string,Phrase>();
   const plans=groups.map(group=>{
     // Existing IDs stay stable when a fresh capture or an older backup arrives.
@@ -107,8 +107,9 @@ async function consolidatePhrases(tx:IDBTransaction,rows:Phrase[],previous:Map<s
       if(member.id===merged.id&&!spellingChanged(before,merged))continue;
       const history=await request<Attempt[]>(attempts.index('phraseId').getAll(member.id));
       for(const attempt of history){
-        const reliable=attempt.reliable&&(replacedAttemptIds?.has(attempt.id)||compatiblePhraseAttempt(before,merged,attempt));
-        if(attempt.phraseId!==merged.id||reliable!==attempt.reliable)attempts.put({...attempt,phraseId:merged.id,reliable});
+        if (replacedAttemptIds?.has(attempt.id)) continue;
+        const updated = reconcileAttempt(merged,attempt,before,clauseCache);
+        if (updated !== attempt) attempts.put(updated);
       }
     }
   }
@@ -128,7 +129,7 @@ export async function savePhrase(value:Phrase):Promise<Phrase> {
   }catch(error){try{tx.abort();}catch{}await done.catch(()=>{});throw error;}
 }
 function spellingChanged(before:Phrase,after:Phrase):boolean {
-  return normalizeRoman(before.roman)!==normalizeRoman(after.roman)||before.reading.normalize('NFKC')!==after.reading.normalize('NFKC');
+  return before.text!==after.text||normalizeRoman(before.roman)!==normalizeRoman(after.roman)||before.reading.normalize('NFKC')!==after.reading.normalize('NFKC');
 }
 export async function updatePhrase(id:string,patch:Partial<Phrase>):Promise<Phrase> {
   const database=await db(),tx=database.transaction(['phrases','attempts','phraseAliases'],'readwrite'),done=complete(tx),store=tx.objectStore('phrases');
@@ -154,8 +155,7 @@ export async function saveAttempt(value:Attempt):Promise<void> {
   const alias=await request<{phraseId:string}|undefined>(tx.objectStore('phraseAliases').get(attempt.phraseId));
   const phrase=await request<Phrase|undefined>(tx.objectStore('phrases').get(alias?.phraseId??attempt.phraseId));
   if(!phrase){tx.abort();await done.catch(()=>{});throw new Error('語句を保存してから練習結果を保存してください。');}
-  const compatible=attempt.judgements?compatibleAttemptWithPhrase(phrase,attempt):phrase.id===attempt.phraseId;
-  const result={...attempt,phraseId:phrase.id,reliable:attempt.reliable&&compatible};
+  const result = !attempt.judgements && phrase.id === attempt.phraseId ? attempt : reconcileAttempt(phrase,attempt);
   tx.objectStore('attempts').put(result);await done;notify();
 }
 export async function saveSession(value:Session):Promise<void> {
@@ -264,15 +264,15 @@ export async function importData(value:unknown):Promise<void> {
       working.set(next.id,next);changedIds.add(next.id);
       for(const source of phraseSeenSources(next))sourceOwners.set(source.id,next.id);
     }
-    const consolidated=await consolidatePhrases(tx,[...working.values()],previousPhrases,changedIds,replacedAttemptIds);
+    const clauseCache = new Map<Phrase,Clause[]>();
+    const consolidated=await consolidatePhrases(tx,[...working.values()],previousPhrases,changedIds,replacedAttemptIds,clauseCache);
     const importedPhrases=new Map(imported.phrases.map(phrase=>[phrase.id,phrase]));
     for(const attempt of imported.attempts){
       const target=consolidated.bySource.get(attempt.phraseId)!;
       // Only an incoming original definition describes the imported input.
       // A current row with the same ID may already have a corrected spelling.
       const before=importedPhrases.get(attempt.phraseId);
-      const reliable=attempt.reliable&&(before?compatiblePhraseAttempt(before,target,attempt):compatibleAttemptWithPhrase(target,attempt));
-      tx.objectStore('attempts').put({...attempt,phraseId:target.id,reliable});
+      tx.objectStore('attempts').put(reconcileAttempt(target,attempt,before,clauseCache));
     }
     const previousSessions=new Map(currentSessions.map(session=>[session.id,session]));
     for(const session of imported.sessions){
@@ -333,6 +333,12 @@ function validateAttempt(value:unknown):Attempt {
       if(key.accepted)position++;at=key.at;
     }
     if(position!==result.correctKeys||result.judgements.length-position!==result.mistakes)throw new Error('打鍵の詳細と入力数が一致しません。');
+  }
+  if (a.clause !== undefined) {
+    const part = object(a.clause,'練習した文節');
+    const start = number(part.start,'文節の開始位置',0,500);
+    if (result.source !== 'practice' || !result.complete || !result.judgements?.length || !Number.isInteger(start)) throw new Error('文節の練習結果を確認してください。');
+    result.clause = {text:text(part.text,'文節',300), reading:text(part.reading,'文節の読み',500), start};
   }
   if(a.errorTerminated!==undefined){
     result.errorTerminated=bool(a.errorTerminated,'ミスによる終了状態');

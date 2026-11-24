@@ -33,6 +33,8 @@
 .slow-text { color: #526d3d !important; }
 .slow-mark, .mini-pattern.slow-pattern-chip { background: #e8eedc; color: #455f31; }
 .word-info .slow-mark { box-shadow: 0 2px 0 #9aad7e; padding: 0 2px; }
+.word-weakness { display: block; margin-top: 4px; color: var(--ink); font-size: 11px; }
+.word-tabs { flex-wrap: wrap; }
 .phrase-performance { border-top: 1px solid #e5e6da; margin: 25px 0 21px; padding-top: 21px; }
 .phrase-performance h3 { display: flex; align-items: center; gap: 7px; font-size: 13px; letter-spacing: 0; }
 .phrase-metrics { display: grid; grid-template-columns: 1fr 1.2fr 1.1fr; gap: 10px; margin: 16px 0; }
@@ -79,3 +81,10 @@
 .score-source { display: inline-flex; align-items: center; gap: 3px; font-size: 9px; color: #586e45; }
 @media (max-width: 1050px) { .insight-card { padding: 16px 14px; gap: 9px; } .insight-copy small { font-size: 9px; } .slow-pattern-grid { grid-template-columns: repeat(3,1fr); } }
 @media (max-width: 600px) { .insight-grid { grid-template-columns: 1fr; gap: 9px; } .insight-card { padding: 13px 14px; } .insight-copy strong { font-size: 12px; } .insight-count { font-size: 24px; } .baseline-strip { gap: 10px; padding-bottom: 13px; } .baseline-strip .baseline-detail { width: 100%; margin-left: 0; font-size: 10px; } .slow-pattern-grid { grid-template-columns: repeat(2,1fr); } .slow-pattern { padding: 11px; } .phrase-metrics strong { font-size: 21px; } }
+
+.clause-list { list-style:none; margin:0; padding:0; background:var(--paper); border:1px solid var(--line); border-radius:10px; }
+.clause-list li { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px; }
+.clause-list li + li { border-top:1px solid var(--line); }
+.clause-list li > div { min-width:0; overflow-wrap:anywhere; }
+.clause-list li span, .clause-list li p { color:var(--ink); font-size:12px; }
+.clause-list li p { margin:4px 0; }

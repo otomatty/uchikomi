@@ -49,7 +49,7 @@ export function PhrasePerformance({phraseId}:{phraseId:string}){
   const {data}=useApp();
   const word=useMemo(()=>analyzeWords(data.attempts,data.phrases).find(value=>value.phraseId===phraseId),[data,phraseId]);
   const confusions=word?.confusions??[];
-  const observed=data.attempts.filter(attempt=>attempt.phraseId===phraseId&&attempt.judgements?.length).sort((a,b)=>b.endedAt-a.endedAt);
+  const observed=data.attempts.filter(attempt=>!attempt.clause&&attempt.phraseId===phraseId&&attempt.judgements?.length).sort((a,b)=>b.endedAt-a.endedAt);
   const attempts=observed.slice(0,3);
   const latestMistake=observed.find(attempt=>attempt.judgements!.some(key=>!key.accepted));
   if(latestMistake&&!attempts.some(attempt=>attempt.id===latestMistake.id))attempts.push(latestMistake);

@@ -26,6 +26,9 @@ core/analytics.ts exports:
 - buildAttempt({phrase,strokes,startedAt,endedAt,sessionId,source,complete,reliable,endOnMistake?}):Attempt
 - isErrorTerminatedAttempt(attempt:Attempt):boolean (checks explicit terminal-miss evidence; does not establish capture-boundary reliability)
 
+core/clause-stats.ts exports:
+- analyzeClauses(attempts:Attempt[], phrases:Phrase[]):WeakClause[] groups detailed reliable input by clause spelling and reading. A clause drill keeps its parent phraseId and records its target in Attempt.clause (text, reading, normalized kana start). It contributes to clause statistics and training activity. Whole-prompt statistics use whole-prompt attempts.
+
 core/romaji.ts exports:
 - normalizeRoman(s:string):string
 - createMatcher(reading:string, fallbackRoman:string): {feed(key:string):{accepted:boolean;complete:boolean;position:number;display:string}; reset():void; readonly typed:string; readonly display:string; readonly complete:boolean; readonly position:number; readonly expectedKeys:string[]}
