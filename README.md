@@ -4,13 +4,13 @@
 
 高級10,000円コース・正確重視の個人練習に向けた、非公式のChrome拡張です。お題、正誤、打鍵間隔、結果の金額を記録し、実際に出会った言葉から復習します。スコアは **食べた金額の合計**。初期目標は2026年12月25日、30,000円です。目標は設定から変更できます。
 
-v1.4.0では、**寿司打のゲーム画面を表示するだけで自動記録**します。記録開始ボタンやサイドパネルの操作は不要です。寿司打とUCHIKOMIでの復習量も日ごとに残し、「成長」で振り返れます。
+寿司打のゲーム画面を表示すると、自動で記録を開始します。v1.5.0では、打鍵履歴から苦手な単語や文節を選んで復習できます。たとえば「開いた口が塞がらない」のうち「塞がらない」でミスが多ければ、その部分だけを繰り返し練習できます。
 
 ## インストール
 
-### GitHub Actions のビルドを使う
+### GitHub Releases からインストールする
 
-1. このリポジトリの **Actions → 成功した CI → `uchikomi-extension`** から ZIP をダウンロードし、展開します。
+1. 最新リリースの **Assets** から `uchikomi-extension-v<バージョン>.zip` をダウンロードし、展開します。[最新のリリース](https://github.com/otomatty/uchikomi/releases/latest)
 2. Chrome で `chrome://extensions` を開き、「デベロッパーモード」をオンにします。
 3. 「パッケージ化されていない拡張機能を読み込む」で、展開した **`manifest.json` のあるフォルダー** を選択します。
 
@@ -27,13 +27,17 @@ Chrome標準の自動更新を使う場合は、Chrome Web Storeへ登録して�
 ### ソースからビルドする
 
 ```bash
-git clone --branch codex/total-score https://github.com/otomatty/uchikomi.git
+git clone https://github.com/otomatty/uchikomi.git
 cd uchikomi
 npm ci
 npm run build
 ```
 
 上の Chrome の手順で **`dist`** フォルダーを選択します。PR の変更を試す場合は、ビルド前に対象のブランチへ切り替えてください。API キーは不要です。Chrome 116 以上を対象としています。
+
+### 新しいバージョンを公開する
+
+`npm version 1.5.1 --no-git-tag-version` のように次の番号を指定し、`public/manifest.json` の `version` も同じ番号に更新します。変更を `main` にマージし、GitHub Actions の `verify` と `browser` が成功すると、検証したコミットに `v<バージョン>` タグが付き、拡張機能のZIPがGitHub Releasesに公開されます。公開済みのバージョンはスキップします。PRのビルドは、従来どおりActionsの成果物 `uchikomi-extension` から試せます。
 
 ## 最初の1回
 
