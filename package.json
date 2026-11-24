@@ -1,6 +1,6 @@
 {
   "name": "uchikomi",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
   "description": "寿司打の出題を記録し、苦手な組み合わせを復習する個人用Chrome拡張",

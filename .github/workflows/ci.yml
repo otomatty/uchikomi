@@ -11,12 +11,15 @@ permissions:
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.extension.outputs.artifact-id }}
+      artifact-digest: ${{ steps.extension.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,9 +34,8 @@ jobs:
       - run: npm run build
       - run: npm run test:ocr
       - run: npm run test:auto-ocr
-      - name: Include third-party notices
-        run: cp THIRD_PARTY_NOTICES.txt dist/THIRD_PARTY_NOTICES.txt
-      - uses: actions/upload-artifact@v7
+      - id: extension
+        uses: actions/upload-artifact@v7
         with:
           name: uchikomi-extension
           path: dist/
@@ -76,3 +78,22 @@ jobs:
           path: qa/
           if-no-files-found: warn
           retention-days: 14
+
+  release:
+    needs: [verify, browser]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Publish the verified extension ZIP
+        run: bash scripts/release.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.verify.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact-digest }}

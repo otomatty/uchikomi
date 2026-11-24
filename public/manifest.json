@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "UCHIKOMI — 寿司打トレーナー",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "プレイ画面から出題を記録。苦手な文字の組み合わせを、実際のお題で復習。",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "tabCapture", "offscreen", "sidePanel", "storage", "scripting"],
